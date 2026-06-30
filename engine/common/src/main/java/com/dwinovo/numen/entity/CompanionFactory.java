@@ -57,7 +57,7 @@ public final class CompanionFactory {
         // An explicit pos (fresh summon) overrides the restored position; a respawn
         // from dormancy passes null to keep exactly what the .dat restored.
         if (pos != null) {
-            player.teleportTo(level, pos.x, pos.y, pos.z, Set.of(), player.getYRot(), player.getXRot());
+            player.teleportTo(level, pos.x, pos.y, pos.z, Set.of(), player.getYRot(), player.getXRot(), false);
         }
         return player;
     }

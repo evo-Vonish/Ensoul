@@ -7,7 +7,7 @@ import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.neoforge.client.event.RegisterClientReloadListenersEvent;
+import net.neoforged.neoforge.client.event.AddClientReloadListenersEvent;
 import net.neoforged.neoforge.common.NeoForge;
 
 import java.nio.file.Path;
@@ -68,15 +68,18 @@ public class NumenNeoForgeClient {
                 (g, delta) -> com.dwinovo.numen.client.hud.NumenToasts.render(g));
     }
 
-    static void registerReloadListeners(RegisterClientReloadListenersEvent event) {
-        // 1.21.1 uses RegisterClientReloadListenersEvent.registerReloadListener(listener) — no
-        // ResourceLocation key (that's the 1.21.4 AddClientReloadListenersEvent API).
+    static void registerReloadListeners(AddClientReloadListenersEvent event) {
+        // 1.21.4 uses AddClientReloadListenersEvent.addListener(ResourceLocation, listener) —
+        // the keyed API (1.21.1 was RegisterClientReloadListenersEvent.registerReloadListener,
+        // no key).
         Path numenConfigRoot = Minecraft.getInstance().gameDirectory.toPath()
                 .resolve("config").resolve(Constants.MOD_ID);
         Path skillsDir = numenConfigRoot.resolve("skills");
 
-        event.registerReloadListener((ResourceManagerReloadListener) rm -> {
-            SkillRegistry.instance().scan(skillsDir);
-        });
+        event.addListener(
+                ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "skill_loader"),
+                (ResourceManagerReloadListener) rm -> {
+                    SkillRegistry.instance().scan(skillsDir);
+                });
     }
 }

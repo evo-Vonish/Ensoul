@@ -1,7 +1,7 @@
 package com.dwinovo.numen.client.screen;
 
 import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.network.chat.Component;
 
 import java.util.List;
@@ -52,7 +52,7 @@ public final class ProviderDropdown {
         return options.isEmpty() ? selectedId : options.get(0).displayName();
     }
 
-    public void render(GuiGraphics g, Font font, int mouseX, int mouseY) {
+    public void render(GuiGraphicsExtractor g, Font font, int mouseX, int mouseY) {
         UiTheme th = UiTheme.current();
         g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, FRAME, x, y, w, h);
         int ty = y + (h - 8) / 2;

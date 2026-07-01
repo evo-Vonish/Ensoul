@@ -59,7 +59,7 @@ public final class CompanionRegistry extends SavedData {
     // 1.21.5 codec-based SavedDataType: name + supplier + CODEC + datafix type. The storage layer
     // drives (de)serialization through CODEC, so no save()/load() overrides are needed.
     private static final SavedDataType<CompanionRegistry> TYPE = new SavedDataType<>(
-            "numen_companions",
+            net.minecraft.resources.Identifier.fromNamespaceAndPath("numen", "companions"),
             CompanionRegistry::new, CODEC,
             net.minecraft.util.datafix.DataFixTypes.SAVED_DATA_RANDOM_SEQUENCES);
 

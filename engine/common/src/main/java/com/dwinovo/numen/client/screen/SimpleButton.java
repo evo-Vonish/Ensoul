@@ -3,7 +3,7 @@ package com.dwinovo.numen.client.screen;
 import com.dwinovo.numen.Constants;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -39,7 +39,7 @@ public final class SimpleButton extends Button {
     }
 
     @Override
-    protected void renderContents(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+    protected void extractContents(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
         int x = getX(), y = getY(), w = getWidth(), h = getHeight();
         boolean hovered = active && isHoveredOrFocused();
         Identifier sprite = !active ? DISABLED : (hovered ? HOVER : IDLE);

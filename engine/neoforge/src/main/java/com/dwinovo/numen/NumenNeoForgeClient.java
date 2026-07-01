@@ -44,7 +44,7 @@ public class NumenNeoForgeClient {
         com.dwinovo.numen.client.agent.AgentLoopRegistry.tickAll();
     }
 
-    static void onRenderLevel(net.neoforged.neoforge.client.event.RenderLevelStageEvent.AfterTranslucentBlocks event) {
+    static void onRenderLevel(net.neoforged.neoforge.client.event.RenderLevelStageEvent.AfterTranslucentFeatures event) {
         // 1.21.8: the per-stage AfterTranslucentBlocks event subclass replaces the Stage enum gate.
         // In-world path overlay for every companion (Baritone PathRenderer port).
         com.dwinovo.numen.client.path.PathVizRenderer.render(event.getPoseStack());

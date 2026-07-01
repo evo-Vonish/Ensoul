@@ -21,11 +21,11 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
-import net.minecraft.client.gui.components.PlayerFaceRenderer;
+import net.minecraft.client.gui.components.PlayerFaceExtractor;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.resources.DefaultPlayerSkin;
 import net.minecraft.world.entity.player.PlayerSkin;
@@ -303,14 +303,14 @@ public final class NumenScreen extends Screen {
     // Shadowless text — BlockFrame is flat, and a drop shadow on DARK text over a LIGHT ground makes
     // the glyph merge with its own shadow ("smudged"). This build's shadowless path ignores the colour
     // PARAM, so we bake the colour into the text's Style instead.
-    private void txt(GuiGraphics g, Component c, int x, int y, int color) {
-        g.drawString(font, c.copy().withStyle(s -> s.withColor(
+    private void txt(GuiGraphicsExtractor g, Component c, int x, int y, int color) {
+        g.text(font, c.copy().withStyle(s -> s.withColor(
                 net.minecraft.network.chat.TextColor.fromRgb(color & 0xFFFFFF))), x, y, -1, false);
     }
 
     /** The FormattedCharSequence must already carry its colour (see {@link #colored}). */
-    private void txt(GuiGraphics g, FormattedCharSequence c, int x, int y, int color) {
-        g.drawString(font, c, x, y, -1, false);
+    private void txt(GuiGraphicsExtractor g, FormattedCharSequence c, int x, int y, int color) {
+        g.text(font, c, x, y, -1, false);
     }
 
     /** A coloured text Component (colour in the Style, so shadowless rendering keeps it). */
@@ -457,7 +457,7 @@ public final class NumenScreen extends Screen {
     }
 
     /** Shadowless placeholder for an empty, unfocused field — the EditBox's own hint renders with a shadow. */
-    private void placeholder(GuiGraphics g, EditBox f, String text) {
+    private void placeholder(GuiGraphicsExtractor g, EditBox f, String text) {
         if (f != null && f.getValue().isEmpty() && !f.isFocused() && text != null && !text.isEmpty()) {
             txt(g, Component.literal(text), f.getX(), f.getY(), TXT_FAINT);
         }
@@ -510,7 +510,7 @@ public final class NumenScreen extends Screen {
         savedFlashUntil = System.currentTimeMillis() + 1500;
     }
 
-    private void renderSettings(GuiGraphics g, int mouseX, int mouseY) {
+    private void renderSettings(GuiGraphicsExtractor g, int mouseX, int mouseY) {
         int x = left + PAD;
         int y0 = top + HEADER_H + 8;
         if (addingSite) {
@@ -696,8 +696,8 @@ public final class NumenScreen extends Screen {
     // ---- render ----
 
     @Override
-    public void render(GuiGraphics g, int mouseX, int mouseY, float partial) {
-        super.render(g, mouseX, mouseY, partial);
+    public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partial) {
+        super.extractRenderState(g, mouseX, mouseY, partial);
 
         // ONE merged Cottage sprite: left rail column + panel, continuous header, no gap.
         g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, 
@@ -748,7 +748,7 @@ public final class NumenScreen extends Screen {
             }
         }
         for (AbstractWidget w : overlay) {
-            w.render(g, mouseX, mouseY, partial);
+            w.extractRenderState(g, mouseX, mouseY, partial);
         }
         // Base URL / Proxy placeholders, drawn shadowless by us (the EditBox hint renders with a shadow).
         if (tab == Tab.SETTINGS) {
@@ -781,7 +781,7 @@ public final class NumenScreen extends Screen {
 
     /** The folded-in roster (on the merged sprite's rail column): one avatar head per companion below the
      *  green header, active one framed gold, a status dot each, + tile at the bottom. */
-    private void renderRail(GuiGraphics g, int mouseX, int mouseY) {
+    private void renderRail(GuiGraphicsExtractor g, int mouseX, int mouseY) {
         List<NumenRoster.Entry> entries = NumenRoster.instance().entries();
         int ax = railX + (RAIL_W - RAIL_AV) / 2;
         railScroll = Math.clamp(railScroll, 0, maxRailScroll());     // keep valid as the roster grows/shrinks
@@ -794,7 +794,7 @@ public final class NumenScreen extends Screen {
             boolean active = e.uuid().equals(uuid);
             // textured socket behind the head (gold-bordered when active), then the avatar, then a status LED
             g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, active ? AVATAR_FRAME_ACTIVE : AVATAR_FRAME, ax - 2, ay - 2, RAIL_AV + 4, RAIL_AV + 4);
-            PlayerFaceRenderer.draw(g, skinFor(e.uuid()), ax, ay, RAIL_AV);
+            PlayerFaceExtractor.extractRenderState(g, skinFor(e.uuid()), ax, ay, RAIL_AV);
             if (ClientDeaths.isDead(e.uuid())) {                      // dead — dim veil + respawn countdown
                 g.fill(ax, ay, ax + RAIL_AV, ay + RAIL_AV, 0xB0101010);
                 long rem = ClientDeaths.remainingMs(e.uuid());
@@ -830,7 +830,7 @@ public final class NumenScreen extends Screen {
 
     /** Scroll-affordance chevron sprite (amber pixel-art triangle, up = more above / down = more below).
      *  Blitted at its native 11×6 so the pixels stay crisp (no scaling, no AA). */
-    private void chevron(GuiGraphics g, int cx, int y, boolean up) {
+    private void chevron(GuiGraphicsExtractor g, int cx, int y, boolean up) {
         g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, 
                 up ? CHEVRON_UP : CHEVRON_DOWN, cx - 5, y, 11, 6);
     }
@@ -911,12 +911,12 @@ public final class NumenScreen extends Screen {
         return -1;
     }
 
-    private void emptyHint(GuiGraphics g) {
+    private void emptyHint(GuiGraphicsExtractor g) {
         txt(g, Component.literal("No companions. Click + to summon one."),
                 left + PAD, top + HEADER_H + 10, TXT_FAINT);
     }
 
-    private void renderTabs(GuiGraphics g, int mouseX, int mouseY) {
+    private void renderTabs(GuiGraphicsExtractor g, int mouseX, int mouseY) {
         String[] labels = {"Chat", "Items", "Settings"};
         for (int i = 0; i < 3; i++) {
             boolean active = tab == Tab.values()[i];
@@ -935,7 +935,7 @@ public final class NumenScreen extends Screen {
 
     /** A row of segmented icons for a 0..max stat (2 units per icon): empty sockets first, then
      *  full / half overlaid. Used for hearts (HP) and drumsticks (hunger). */
-    private void renderStatRow(GuiGraphics g, int x, int y, float value, float max,
+    private void renderStatRow(GuiGraphicsExtractor g, int x, int y, float value, float max,
                                net.minecraft.resources.Identifier full,
                                net.minecraft.resources.Identifier half,
                                net.minecraft.resources.Identifier empty) {
@@ -951,31 +951,31 @@ public final class NumenScreen extends Screen {
 
     /** Live mouse-following 3D portrait of the companion — the body IS a client player entity, so the
      *  vanilla player renderer draws it for free. Sits in a recessed socket (slot_alt stretched). */
-    private void renderPortrait(GuiGraphics g, AbstractClientPlayer e,
+    private void renderPortrait(GuiGraphicsExtractor g, AbstractClientPlayer e,
                                 int x, int y, int w, int h, int mouseX, int mouseY) {
         g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, SLOT_ALT, x, y, w, h);
         if (e == null) return;
         int scale = (int) (h * 0.45f);
-        net.minecraft.client.gui.screens.inventory.InventoryScreen.renderEntityInInventoryFollowsMouse(
+        net.minecraft.client.gui.screens.inventory.InventoryScreen.extractEntityInInventoryFollowsMouse(
                 g, x + 2, y + 2, x + w - 2, y + h - 2, scale, 0.0625f,
                 (float) mouseX, (float) mouseY, e);
     }
 
-    private void slotBg(GuiGraphics g, net.minecraft.resources.Identifier sprite, int x, int y) {
+    private void slotBg(GuiGraphicsExtractor g, net.minecraft.resources.Identifier sprite, int x, int y) {
         g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, sprite, x, y, 16, 16);
     }
 
-    private void stackOn(GuiGraphics g, ItemStack st, int x, int y, int mouseX, int mouseY) {
+    private void stackOn(GuiGraphicsExtractor g, ItemStack st, int x, int y, int mouseX, int mouseY) {
         if (st == null || st.isEmpty()) return;
-        g.renderItem(st, x, y);
-        g.renderItemDecorations(font, st, x, y);
+        g.item(st, x, y);
+        g.itemDecorations(font, st, x, y);
         if (mouseX >= x && mouseX < x + 16 && mouseY >= y && mouseY < y + 16) {
             g.setTooltipForNextFrame(font, st, mouseX, mouseY);
         }
     }
 
     /** One equipment/armor socket, read off the live client entity (equipment IS client-synced). */
-    private void drawEquip(GuiGraphics g, AbstractClientPlayer e, EquipmentSlot slot,
+    private void drawEquip(GuiGraphicsExtractor g, AbstractClientPlayer e, EquipmentSlot slot,
                            int x, int y, int mouseX, int mouseY) {
         slotBg(g, SLOT_SPRITE, x, y);
         if (e != null) stackOn(g, e.getItemBySlot(slot), x, y, mouseX, mouseY);
@@ -983,7 +983,7 @@ public final class NumenScreen extends Screen {
 
     // ---- chat transcript + plan ----
 
-    private void renderChat(GuiGraphics g) {
+    private void renderChat(GuiGraphicsExtractor g) {
         int bodyY = top + HEADER_H + 4;
         int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6;
         int transX = left + PAD;
@@ -1159,7 +1159,7 @@ public final class NumenScreen extends Screen {
     }
 
     /** Right-side PLAN panel: the companion's latest {@code todowrite}, with status glyphs. */
-    private void renderPlan(GuiGraphics g, int x, int y, int bottom) {
+    private void renderPlan(GuiGraphicsExtractor g, int x, int y, int bottom) {
         txt(g, Component.literal("PLAN"), x, y, TXT_MUTED);
         int ly = y + 13;
         JsonArray todos = latestPlan();
@@ -1220,7 +1220,7 @@ public final class NumenScreen extends Screen {
      *  mouse-following portrait, the synced 2×2 craft grid + result, segmented heart/drumstick vitals,
      *  and the read-only checkerboard 3×9 storage + hotbar. Body data is fetched on demand via
      *  RequestInventoryPayload (backpack + craft + food); HP + equipment come off the live client entity. */
-    private void renderItems(GuiGraphics g, int mouseX, int mouseY) {
+    private void renderItems(GuiGraphicsExtractor g, int mouseX, int mouseY) {
         var snap = ClientNumenInventory.get(uuid).orElse(null);
         AbstractClientPlayer e = ClientNumenLookup.resolve(uuid);
         List<ItemStack> craft = snap != null ? snap.craft() : List.of();

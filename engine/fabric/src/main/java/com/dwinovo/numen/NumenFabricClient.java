@@ -2,7 +2,7 @@ package com.dwinovo.numen;
 
 import com.dwinovo.numen.agent.skill.SkillRegistry;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.resource.ResourceManagerHelper;
 import net.fabricmc.fabric.api.resource.SimpleSynchronousResourceReloadListener;
 import net.minecraft.client.Minecraft;
@@ -40,7 +40,7 @@ public class NumenFabricClient implements ClientModInitializer {
                 });
 
         // G → companion roster panel (chat entry + settings/reset live in there).
-        KeyBindingHelper.registerKeyBinding(com.dwinovo.numen.client.NumenKeys.OPEN_ROSTER);
+        KeyMappingHelper.registerKeyMapping(com.dwinovo.numen.client.NumenKeys.OPEN_ROSTER);
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents.END_CLIENT_TICK
                 .register(client -> {
                     com.dwinovo.numen.client.NumenKeys.tick();
@@ -49,14 +49,15 @@ public class NumenFabricClient implements ClientModInitializer {
                 });
 
         // HUD: advancement-style activity toasts (top-right) when not watching a panel.
-        // 1.21.5 predates the HudElementRegistry layer API; use the classic HudRenderCallback.
-        net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.register(
+        // 26.1 replaced HudRenderCallback with the keyed HudElementRegistry.
+        net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry.addLast(
+                net.minecraft.resources.Identifier.fromNamespaceAndPath(Constants.MOD_ID, "numen_toasts"),
                 (g, delta) -> com.dwinovo.numen.client.hud.NumenToasts.render(g));
 
         // In-world path overlay for every companion (Baritone PathRenderer port),
         // drawn after translucent terrain so it sits over the world.
-        net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents.AFTER_ENTITIES
-                .register(ctx -> com.dwinovo.numen.client.path.PathVizRenderer.render(ctx.matrices()));
+        net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents.AFTER_TRANSLUCENT_FEATURES
+                .register(ctx -> com.dwinovo.numen.client.path.PathVizRenderer.render(ctx.poseStack()));
 
         // Drop every path overlay on disconnect so a frozen path can't survive a
         // relog (the server can't send a clear to a player who's already gone).

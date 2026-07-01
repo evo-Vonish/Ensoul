@@ -2,7 +2,7 @@ package com.dwinovo.numen.client.screen;
 
 import com.dwinovo.numen.Constants;
 import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
@@ -57,7 +57,7 @@ public class FlatEditBox extends EditBox {
     }
 
     @Override
-    public void renderWidget(GuiGraphics g, int mouseX, int mouseY, float partial) {
+    public void extractWidgetRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partial) {
         if (!isVisible()) return;
 
         String value = getValue();
@@ -71,7 +71,7 @@ public class FlatEditBox extends EditBox {
         // later screen-side draw did. The hint shows even when focused (the chat input is
         // focus-by-default); its colour comes from the hint Component's own Style.
         if (value.isEmpty()) {
-            if (hint != null) g.drawString(font, hint, textX, textY, color, false);
+            if (hint != null) g.text(font, hint, textX, textY, color, false);
             caret(g, textX, textY);
             return;
         }
@@ -101,7 +101,7 @@ public class FlatEditBox extends EditBox {
 
         // The text, through the box's formatter, drawn flat (dropShadow = false).
         if (!visible.isEmpty()) {
-            g.drawString(font, fmt.format(visible, scroll), textX, textY, color, false);
+            g.text(font, fmt.format(visible, scroll), textX, textY, color, false);
         }
 
         // Caret on top of the text.
@@ -112,7 +112,7 @@ public class FlatEditBox extends EditBox {
 
     /** The Cottage pixel-art caret sprite (no "_" glyph → no shadow), blinking on focus, drawn LAST
      *  so it sits on top of the text/placeholder; centred on column x, native 3x10 (crisp, no scale). */
-    private void caret(GuiGraphics g, int x, int textY) {
+    private void caret(GuiGraphicsExtractor g, int x, int textY) {
         if (isFocused() && ((System.currentTimeMillis() - focusTime) / BLINK_MS) % 2 == 0) {
             g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, CARET, x - 1, textY - 1, CARET_W, CARET_H);
         }

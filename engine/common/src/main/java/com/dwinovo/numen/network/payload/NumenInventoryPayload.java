@@ -7,7 +7,7 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.List;
@@ -24,7 +24,7 @@ public record NumenInventoryPayload(UUID uuid, boolean loaded, List<ItemStack> i
         implements CustomPacketPayload {
 
     public static final Type<NumenInventoryPayload> TYPE = new Type<>(
-            ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "numen_inventory"));
+            Identifier.fromNamespaceAndPath(Constants.MOD_ID, "numen_inventory"));
 
     public static final StreamCodec<RegistryFriendlyByteBuf, NumenInventoryPayload> STREAM_CODEC =
             StreamCodec.composite(

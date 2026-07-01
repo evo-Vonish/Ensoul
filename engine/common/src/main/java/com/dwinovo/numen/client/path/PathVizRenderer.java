@@ -4,9 +4,9 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
-import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.core.BlockPos;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3f;
 
@@ -44,10 +44,10 @@ public final class PathVizRenderer {
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return;
-        ResourceLocation here = mc.level.dimension().location();
+        Identifier here = mc.level.dimension().identifier();
         Vec3 cam = mc.gameRenderer.getMainCamera().position();
         MultiBufferSource.BufferSource buffers = mc.renderBuffers().bufferSource();
-        VertexConsumer vc = buffers.getBuffer(RenderType.lines());
+        VertexConsumer vc = buffers.getBuffer(RenderTypes.lines());
         PoseStack.Pose pose = poseStack.last();
 
         for (ClientPathViz.Viz v : active) {
@@ -64,7 +64,7 @@ public final class PathVizRenderer {
         }
         // Flush only our line batch (not endLastBatch, which could flush a foreign
         // open batch in the shared buffer source at this render stage).
-        buffers.endBatch(RenderType.lines());
+        buffers.endBatch(RenderTypes.lines());
     }
 
     /**

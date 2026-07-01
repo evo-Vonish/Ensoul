@@ -181,7 +181,7 @@ public final class Companions {
      * spending a fresh LLM call just to note the move. Called from each loader's dimension-change hook.
      */
     public static void onDimensionChanged(NumenPlayer body) {
-        String dim = body.level().dimension().location().toString();
+        String dim = body.level().dimension().identifier().toString();
         emitEvent(body, "<event kind=\"dimension_change\" to=\"" + dim + "\">你进入了 " + dim
                 + "。留意这个维度的环境和危险。</event>", false);
     }

@@ -4,10 +4,9 @@ import com.dwinovo.numen.Constants;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.EditBox;
-import net.minecraft.client.renderer.RenderType;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.Style;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
 
@@ -28,7 +27,7 @@ import net.minecraft.util.Mth;
 public class FlatEditBox extends EditBox {
 
     /** Cottage-style caret sprite (brown-capped amber bar, HyperFrames pixel art, native 3x10). */
-    private static final ResourceLocation CARET = ResourceLocation.fromNamespaceAndPath(Constants.MOD_ID, "caret");
+    private static final Identifier CARET = Identifier.fromNamespaceAndPath(Constants.MOD_ID, "caret");
     private static final int CARET_W = 3, CARET_H = 10;
     private static final int SELECT_COLOR = 0x804E7480;   // translucent reply-teal
     private static final long BLINK_MS = 300L;

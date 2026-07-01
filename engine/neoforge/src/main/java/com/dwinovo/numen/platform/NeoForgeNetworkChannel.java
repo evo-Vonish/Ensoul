@@ -50,9 +50,9 @@ public final class NeoForgeNetworkChannel implements INetworkChannel {
 
     @Override
     public void sendToServer(CustomPacketPayload payload) {
-        // 1.21.5: the dedicated client ClientPacketDistributor doesn't exist yet;
-        // the common PacketDistributor.sendToServer routes through the client connection.
-        net.neoforged.neoforge.network.PacketDistributor.sendToServer(payload);
+        // 1.21.8: client-only ClientPacketDistributor. Lazy class-load — the server JVM
+        // never reaches this call site (sendToServer is inherently client-side).
+        net.neoforged.neoforge.client.network.ClientPacketDistributor.sendToServer(payload);
     }
 
     @Override

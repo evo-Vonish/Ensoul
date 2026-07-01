@@ -179,7 +179,7 @@ public final class NumenToasts {
 
     private static void drawAvatar(GuiGraphics g, UUID uuid, int x, int y, UiTheme th) {
         // textured socket behind the head (same sprite as the panel rail), face on top covering the centre
-        g.blitSprite(net.minecraft.client.renderer.RenderType::guiTextured, 
+        g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, 
                 AVATAR_FRAME, x - 2, y - 2, AVATAR + 4, AVATAR + 4);
         PlayerFaceRenderer.draw(g, skinFor(uuid), x, y, AVATAR);
     }
@@ -190,8 +190,8 @@ public final class NumenToasts {
         int targetX = ax + AVATAR + BUBBLE_GAP;
         int bx = targetX - slideOut(now - s.bubbleBornMs, AVATAR + BUBBLE_GAP);
         int by = ay + AVATAR / 2 - h / 2;
-        g.blitSprite(net.minecraft.client.renderer.RenderType::guiTextured, TIP_SPRITE, bx - TIP_W + 1, ay + AVATAR / 2 - TIP_H / 2, TIP_W, TIP_H);
-        g.blitSprite(net.minecraft.client.renderer.RenderType::guiTextured, BUBBLE_SPRITE, bx, by, W, h);
+        g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, TIP_SPRITE, bx - TIP_W + 1, ay + AVATAR / 2 - TIP_H / 2, TIP_W, TIP_H);
+        g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, BUBBLE_SPRITE, bx, by, W, h);
         int ly = by + PADV;
         for (Line line : s.lines) {
             Nb.text(g, font, line.text(), bx + 7, ly, line.color());

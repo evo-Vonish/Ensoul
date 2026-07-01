@@ -5,6 +5,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
 
@@ -70,9 +71,9 @@ public final class CompanionFactory {
      * {@code loadPlayerData}. No-op on first summon (no file yet).
      */
     private static void loadPlayerData(MinecraftServer server, NumenPlayer player) {
-        // 1.21.5: PlayerList.load(player) returns Optional<CompoundTag> (predates the
-        // ValueInput IO refactor); Entity.load(CompoundTag) consumes it directly.
-        server.getPlayerList().load(player)
+        // 1.21.6+ ValueInput IO refactor: PlayerList.load(player, reporter) returns the
+        // restored ValueInput (tag→ValueInput wrapping is internal); Entity.load consumes it.
+        server.getPlayerList().load(player, ProblemReporter.DISCARDING)
                 .ifPresent(player::load);
     }
 

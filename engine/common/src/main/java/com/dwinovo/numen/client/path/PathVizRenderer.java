@@ -45,7 +45,7 @@ public final class PathVizRenderer {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null) return;
         ResourceLocation here = mc.level.dimension().location();
-        Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
+        Vec3 cam = mc.gameRenderer.getMainCamera().position();
         MultiBufferSource.BufferSource buffers = mc.renderBuffers().bufferSource();
         VertexConsumer vc = buffers.getBuffer(RenderType.lines());
         PoseStack.Pose pose = poseStack.last();

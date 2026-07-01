@@ -17,7 +17,7 @@ public final class NumenKeys {
     public static final KeyMapping OPEN_ROSTER = new KeyMapping(
             com.dwinovo.numen.data.ModLanguageData.Keys.KEY_OPEN_ROSTER,
             InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G,
-            "key.categories.misc");
+            KeyMapping.Category.MISC);
 
     private NumenKeys() {}
 

@@ -11,8 +11,6 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
 
-import java.util.function.BiFunction;
-
 /**
  * A borderless {@link EditBox} that paints its text WITHOUT the vanilla drop shadow,
  * and draws the caret as a thin fill bar instead of the shadowed {@code "_"}, to match
@@ -38,7 +36,7 @@ public class FlatEditBox extends EditBox {
     private final Font font;
     private int color = 0xE0E0E0;                          // captured from setTextColor
     private Component hint;                                // captured from setHint
-    private BiFunction<String, Integer, FormattedCharSequence> fmt =
+    private EditBox.TextFormatter fmt =
             (s, off) -> FormattedCharSequence.forward(s, Style.EMPTY);
     private long focusTime;
     private int scroll;                                    // our own displayPos (left scroll offset)
@@ -50,8 +48,8 @@ public class FlatEditBox extends EditBox {
 
     @Override public void setTextColor(int c) { super.setTextColor(c); this.color = c; }
     @Override public void setHint(Component c) { super.setHint(c); this.hint = c; }
-    @Override public void setFormatter(BiFunction<String, Integer, FormattedCharSequence> f) {
-        super.setFormatter(f);
+    @Override public void addFormatter(EditBox.TextFormatter f) {
+        super.addFormatter(f);
         this.fmt = f;
     }
     @Override public void setFocused(boolean f) {
@@ -104,7 +102,7 @@ public class FlatEditBox extends EditBox {
 
         // The text, through the box's formatter, drawn flat (dropShadow = false).
         if (!visible.isEmpty()) {
-            g.drawString(font, fmt.apply(visible, scroll), textX, textY, color, false);
+            g.drawString(font, fmt.format(visible, scroll), textX, textY, color, false);
         }
 
         // Caret on top of the text.

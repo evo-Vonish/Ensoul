@@ -18,6 +18,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -26,7 +28,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.components.PlayerFaceRenderer;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.resources.DefaultPlayerSkin;
-import net.minecraft.client.resources.PlayerSkin;
+import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -415,7 +417,7 @@ public final class NumenScreen extends Screen {
     private void buildApiKeyRow(int x, int y, int w) {
         int eyeW = 22;
         apiKeyInput = field(x, y, w - eyeW - 2, 512, wApiKey);
-        apiKeyInput.setFormatter((text, idx) -> showKey
+        apiKeyInput.addFormatter((text, idx) -> showKey
                 ? FormattedCharSequence.forward(text, net.minecraft.network.chat.Style.EMPTY)
                 : FormattedCharSequence.forward("•".repeat(text.length()), net.minecraft.network.chat.Style.EMPTY));
         // Eye icon instead of a 见/隐 glyph: open eye when masked (click to show), slashed when shown.
@@ -562,22 +564,22 @@ public final class NumenScreen extends Screen {
     // ---- input ----
 
     @Override
-    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        int k = keyCode;
+    public boolean keyPressed(KeyEvent event) {
+        int k = event.key();
         if (dismissPending != null) {
             if (k == 256) { dismissPending = null; rebuild(); return true; }   // Esc cancels the confirm
-            return super.keyPressed(keyCode, scanCode, modifiers);
+            return super.keyPressed(event);
         }
         if (summoning) {
             if (k == 257 || k == 335) { doSummon(); return true; }    // Enter
             if (k == 256) { summoning = false; rebuild(); return true; } // Esc cancels (doesn't close panel)
-            return super.keyPressed(keyCode, scanCode, modifiers);
+            return super.keyPressed(event);
         }
         if ((k == 257 || k == 335) && input != null && input.isFocused()) {
             onSend();
             return true;
         }
-        return super.keyPressed(keyCode, scanCode, modifiers);
+        return super.keyPressed(event);
     }
 
     private void doSummon() {
@@ -589,9 +591,11 @@ public final class NumenScreen extends Screen {
     }
 
     @Override
-    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+    public boolean mouseClicked(MouseButtonEvent event, boolean dbl) {
+        double mouseX = event.x(), mouseY = event.y();
+        int button = event.button();
         if (dismissPending != null) {
-            return super.mouseClicked(mouseX, mouseY, button);   // modal confirm — let its Cancel/Delete buttons handle it
+            return super.mouseClicked(event, dbl);   // modal confirm — let its Cancel/Delete buttons handle it
         }
         if (button == 0) {
             UUID close = railCloseAt((int) mouseX, (int) mouseY);
@@ -655,7 +659,7 @@ public final class NumenScreen extends Screen {
             }
             if (tab == Tab.CHAT && toggleFoldAt((int) mouseX, my)) return true;
         }
-        return super.mouseClicked(mouseX, mouseY, button);
+        return super.mouseClicked(event, dbl);
     }
 
     /** If a chat fold-toggle row sits under (mx,my), flip its expanded state. Mirrors renderChat geometry. */

@@ -103,11 +103,11 @@ public final class SettingsScreen extends Screen {
     }
 
     @Override
-    public boolean mouseClicked(double mouseX, double mouseY, int button) {
-        if (button == 0 && provider != null && provider.mouseClicked(mouseX, mouseY)) {
+    public boolean mouseClicked(net.minecraft.client.input.MouseButtonEvent event, boolean dbl) {
+        if (event.button() == 0 && provider != null && provider.mouseClicked(event.x(), event.y())) {
             return true;
         }
-        return super.mouseClicked(mouseX, mouseY, button);
+        return super.mouseClicked(event, dbl);
     }
 
     private void onSave() {

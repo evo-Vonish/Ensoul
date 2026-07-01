@@ -55,8 +55,8 @@ public class NumenFabricClient implements ClientModInitializer {
 
         // In-world path overlay for every companion (Baritone PathRenderer port),
         // drawn after translucent terrain so it sits over the world.
-        net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents.AFTER_ENTITIES
-                .register(ctx -> com.dwinovo.numen.client.path.PathVizRenderer.render(ctx.matrixStack()));
+        net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents.AFTER_ENTITIES
+                .register(ctx -> com.dwinovo.numen.client.path.PathVizRenderer.render(ctx.matrices()));
 
         // Drop every path overlay on disconnect so a frozen path can't survive a
         // relog (the server can't send a clear to a player who's already gone).

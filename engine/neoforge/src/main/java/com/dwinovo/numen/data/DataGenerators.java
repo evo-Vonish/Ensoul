@@ -20,7 +20,7 @@ public final class DataGenerators {
     private DataGenerators() {}
 
     @SubscribeEvent
-    public static void gatherData(GatherDataEvent event) {
+    public static void gatherData(GatherDataEvent.Client event) {
         PackOutput output = event.getGenerator().getPackOutput();
         event.getGenerator().addProvider(true, new ModLanguageProvider(output, "en_us"));
         event.getGenerator().addProvider(true, new ModLanguageProvider(output, "zh_cn"));

@@ -60,16 +60,11 @@ Works on remote servers. Numen MCP is client-only and drives through Numen's exi
 
 Early. Action tools are currently **blocking** (a `tools/call` holds until the body finishes the task); a non-blocking start/poll model and a Groovy skill-writing layer are planned.
 
+## Ecosystem
+
+- **[Numen](https://github.com/Dwinovo/minecraft-numen)** — the mod. AI companions for Minecraft.
+- **[numen-api](https://github.com/Dwinovo/numen-api)** — the engine. Numen MCP drives companions through its `NumenActuator`.
+- **[numen-qq-mcp](https://github.com/Dwinovo/numen-qq-mcp)** — sibling addon. A QQ bridge for Numen.
+- **[numen-maven](https://github.com/Dwinovo/numen-maven)** — Maven repository hosting numen-api.
+
 MIT licensed.
-
----
-
-## 中文简介
-
-把你的 [Numen](https://github.com/Dwinovo/minecraft-numen) 同伴变成外部 AI 能直接操控的工具。Numen MCP 在你的游戏客户端里跑一个小型 MCP 服务器,让 Claude 这样的智能体列出你的同伴、接管其中一个、直接调用它的工具——**Claude 当大脑,同伴当手和眼**。
-
-和普通 Numen 同伴的区别:普通同伴用自己内置的大模型思考;Numen MCP 让外部大脑绕过那个 LLM,Claude 通过感知工具读世界、自己做每一个决策。这个模式**不需要 Numen 自己的 API Key**。每次调用指定一个同伴,每具身体独立跑任务,所以一个 Claude 能**并行指挥一支同伴舰队**。暴露的工具就是内置脑子用的那批(挖、走、放、合成),凭空造物做不到。
-
-需要 **Numen 0.0.4+**(内含带 `NumenActuator` 的引擎),客户端安装。首次启动写入 `config/numen/mcp_server.json`,连接方式见上方。多人服照常——纯客户端,走 Numen 现成的客户端→服务端协议;服务器只需装 Numen、会对每个动作做归属校验,你只能驱动自己的同伴。
-
-MIT 协议。

@@ -44,6 +44,12 @@
 | `release_companion` | 把同伴交还给它的内置大脑 |
 | *(引擎工具)* | 每一个 Numen 身体/感知工具(`get_self_status`、`scan_blocks`、`auto_mine`、`move_to`、`place_block` …),每个都接收一个 `companion` 参数 |
 
+## 教你的智能体
+
+连接时,服务器会给智能体一段简报(MCP 的 `instructions` 字段)——Numen 是什么、`接管 → 感知 → 行动 → 交还` 的循环——所以任何 MCP 客户端都开箱即用。
+
+想在 **Claude Code** 里有一份更完整、常驻的技能,可以装上仓库自带的那份:把 [`agent-skill/numen`](agent-skill/numen/SKILL.md) 复制进你的技能目录(`~/.claude/skills/numen/`,或项目里的 `.claude/skills/numen/`)。之后你一让 Claude 玩 Minecraft,它就会自动用上。
+
 ## 多人联机
 
 在远程服务器上照常工作。Numen MCP 纯客户端,通过 Numen 现成的客户端→服务端协议驱动——用的就是内置大脑用的那批数据包。服务器需要装 Numen(它本来就得装,同伴才存在),但**不需要**装 Numen MCP。服务器会对每个动作做归属校验,你只能驱动自己拥有的同伴。

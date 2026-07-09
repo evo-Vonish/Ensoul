@@ -44,6 +44,12 @@ A Numen companion normally thinks with its own built-in LLM. Numen MCP lets an *
 | `release_companion` | Hand the companion back to its built-in brain |
 | *(engine tools)* | Every Numen body/perception tool (`get_self_status`, `scan_blocks`, `auto_mine`, `move_to`, `place_block`, …), each taking a `companion` argument |
 
+## Teaching your agent
+
+On connect, the server hands the agent a short briefing (MCP's `instructions`) — what Numen is and the `acquire → perceive → act → release` loop — so any MCP client works out of the box.
+
+For a richer, always-on skill in **Claude Code**, install the bundled one: copy [`agent-skill/numen`](agent-skill/numen/SKILL.md) into your skills directory (`~/.claude/skills/numen/`, or your project's `.claude/skills/numen/`). Claude then picks it up whenever you ask it to play in Minecraft.
+
 ## Multiplayer
 
 Works on remote servers. Numen MCP is client-only and drives through Numen's existing client→server protocol — the same packets the built-in brain uses. The server needs Numen installed (as it already does for companions to exist); it does **not** need Numen MCP. The server owner-checks every action, so you can only drive companions you own.

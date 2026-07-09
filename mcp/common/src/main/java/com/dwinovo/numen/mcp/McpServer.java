@@ -50,6 +50,28 @@ public final class McpServer {
     /** Roster / acquire / release are fast; only tool actions use the config timeout. */
     private static final int CONTROL_TIMEOUT_SECONDS = 10;
 
+    /**
+     * Sent to the connecting agent in the {@code initialize} handshake (MCP's
+     * {@code instructions} field) — what Numen is and how to drive it, so any
+     * client gets the essentials without a separately-installed skill.
+     */
+    private static final String INSTRUCTIONS = """
+            Numen companions are AI-controlled, player-like characters inside a live Minecraft game. \
+            Through this server you take control of a companion's body and play the game as it — perceive, \
+            move, mine, build, craft, fight. You are the brain; the companion is your hands and eyes, and \
+            its own built-in AI steps aside while you drive.
+
+            Loop: (1) list_companions to see who is live; (2) acquire_companion (by name or id) to take \
+            control — this pauses its built-in AI and frees its body; (3) perceive with get_self_status / \
+            scan_blocks / scan_nearby_entities, then act with move_to / auto_mine / place_block / craft / \
+            equip_item / hunt / etc.; (4) release_companion when done. Every tool takes a 'companion' \
+            argument, so each call targets one companion.
+
+            Rules: survival mode — the tools do only what a real player can (mine to get stone; there is no \
+            give or setblock). You are blind between calls, so perceive before and after acting. Action \
+            tools return only when the task finishes or times out. You can acquire several companions and \
+            drive them in parallel. Modded blocks, items, and GUIs (Create, AE2, Mekanism) work natively.""";
+
     private final McpConfig config;
     private final Gson gson = new Gson();
     private HttpServer http;
@@ -182,6 +204,7 @@ public final class McpServer {
         info.addProperty("name", "numen-mcp");
         info.addProperty("version", SERVER_VERSION);
         result.add("serverInfo", info);
+        result.addProperty("instructions", INSTRUCTIONS);
         return result;
     }
 

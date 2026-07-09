@@ -8,10 +8,10 @@ displayName = "${mod_name}" #mandatory
 authors = "${mod_author}" #optional
 description = '''${description}''' #mandatory (Supports multiline text)
 [[dependencies.${mod_id}]]
-modId = "numen_api" #mandatory — the bridge feeds the numen-api engine's message queue
+modId = "numen_api" #mandatory — this mod drives companions through numen-api's NumenActuator
 type="required"
 versionRange = "[0.0,)"
-ordering = "AFTER" # load after the engine so NumenGateway and ToolRegistry exist
+ordering = "AFTER" # load after the engine so NumenActuator and ToolRegistry exist
 side = "CLIENT"
 [[dependencies.${mod_id}]]
 modId = "neoforge"

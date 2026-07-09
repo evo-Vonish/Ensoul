@@ -62,9 +62,13 @@
 
 ## 生态
 
-- **[Numen](https://github.com/Dwinovo/minecraft-numen)** —— 本体 mod。Minecraft 的 AI 同伴。
-- **[numen-api](https://github.com/Dwinovo/numen-api)** —— 引擎。Numen MCP 通过它的 `NumenActuator` 驱动同伴。
-- **[numen-qq-mcp](https://github.com/Dwinovo/numen-qq-mcp)** —— 姊妹插件。Numen 的 QQ 桥接。
-- **[numen-maven](https://github.com/Dwinovo/numen-maven)** —— 托管 numen-api 的 Maven 仓库。
+**Numen**（[minecraft-numen](https://github.com/Dwinovo/minecraft-numen)）是那个 mod——AI 同伴本体,跑在 **[numen-api](https://github.com/Dwinovo/numen-api)** 引擎上(经 **[numen-maven](https://github.com/Dwinovo/numen-maven)** 发布),引擎对外开放一套小巧的公共 API。两类东西建在它之上:
+
+**扩展一个同伴**——同伴自己的大脑仍然做主:
+- **桥(Bridge)** 把一个外部渠道接进同伴:消息进来,同伴自己决定怎么做。基于 `NumenGateway`。→ **[numen-qq-bridge](https://github.com/Dwinovo/numen-qq-bridge)**(QQ),后续还有更多。
+- **技能(Skill)** 教同伴怎么做事——markdown 注入它的上下文。随 Numen 内置,或社区编写。
+
+**把 Numen 暴露出去**——把操控权交给外部大脑:
+- **[numen-mcp](https://github.com/Dwinovo/numen-mcp)** 是一个 Model Context Protocol 服务器:任意外部智能体(比如 Claude)直接驱动同伴。基于 `NumenActuator`。 *(本仓库)*
 
 MIT 协议。

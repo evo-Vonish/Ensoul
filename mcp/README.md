@@ -62,9 +62,13 @@ Early. Action tools are currently **blocking** (a `tools/call` holds until the b
 
 ## Ecosystem
 
-- **[Numen](https://github.com/Dwinovo/minecraft-numen)** — the mod. AI companions for Minecraft.
-- **[numen-api](https://github.com/Dwinovo/numen-api)** — the engine. Numen MCP drives companions through its `NumenActuator`.
-- **[numen-qq-mcp](https://github.com/Dwinovo/numen-qq-mcp)** — sibling addon. A QQ bridge for Numen.
-- **[numen-maven](https://github.com/Dwinovo/numen-maven)** — Maven repository hosting numen-api.
+**Numen** ([minecraft-numen](https://github.com/Dwinovo/minecraft-numen)) is the mod — the AI companion. It runs on the **[numen-api](https://github.com/Dwinovo/numen-api)** engine (published through **[numen-maven](https://github.com/Dwinovo/numen-maven)**), which exposes a small public API. Two things build on it:
+
+**Extend a companion** — its own brain stays in charge:
+- **Bridges** carry an outside channel into a companion: a message arrives, and the companion decides what to do. Built on `NumenGateway`. → **[numen-qq-bridge](https://github.com/Dwinovo/numen-qq-bridge)** (QQ), with more to come.
+- **Skills** teach a companion how to behave — markdown loaded into its context. Bundled with Numen, or community-written.
+
+**Expose Numen** — hand the controls to an outside brain:
+- **[numen-mcp](https://github.com/Dwinovo/numen-mcp)** is a Model Context Protocol server: any external agent (like Claude) drives companions directly. Built on `NumenActuator`. *(this repo)*
 
 MIT licensed.

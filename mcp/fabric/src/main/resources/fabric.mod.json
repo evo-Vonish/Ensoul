@@ -12,6 +12,7 @@
         "sources": "https://github.com/Dwinovo/numen-mcp"
     },
     "license": "${license}",
+    "icon": "numen_mcp.png",
     "environment": "client",
     "entrypoints": {
         "client": [

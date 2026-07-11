@@ -67,11 +67,12 @@ jobs:
             echo "neoforge_version=${mod_version}-${channel}-neoforge-${minecraft_version}"
           } >> "$GITHUB_OUTPUT"
 
-      # CurseForge publishing is intentionally omitted until a dedicated
-      # numen-mcp CurseForge project exists — add `curseforge-id` +
-      # `curseforge-token` back to each step to re-enable it. For now a version
-      # tag produces a GitHub Release with both loader jars attached.
-      - name: Publish Fabric to GitHub Release
+      # On a version tag: attach both loader jars to a GitHub Release and, when
+      # the CURSEFORGE_TOKEN repo secret is set, publish to the numen-mcp
+      # CurseForge project (id 1605815). mc-publish skips any platform whose
+      # token is absent, so without the secret only the GitHub Release is made.
+      # Set the dependency on Numen and the page copy in the CurseForge web UI.
+      - name: Publish Fabric to GitHub Release and CurseForge
         continue-on-error: true
         uses: Kira-NT/mc-publish@v3.3.0
         with:
@@ -83,9 +84,15 @@ jobs:
           game-version-filter: none
           version-type: ${{ steps.meta.outputs.version_type }}
           github-prerelease: ${{ steps.meta.outputs.github_prerelease }}
+
+          # numen-mcp CurseForge project (delete these two lines to skip CF).
+          curseforge-id: 1605815
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish NeoForge to GitHub Release
+      - name: Publish NeoForge to GitHub Release and CurseForge
+        continue-on-error: true
         uses: Kira-NT/mc-publish@v3.3.0
         with:
           files: ${{ steps.meta.outputs.neoforge_file }}
@@ -96,4 +103,9 @@ jobs:
           game-version-filter: none
           version-type: ${{ steps.meta.outputs.version_type }}
           github-prerelease: ${{ steps.meta.outputs.github_prerelease }}
+
+          # numen-mcp CurseForge project (delete these two lines to skip CF).
+          curseforge-id: 1605815
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
           github-token: ${{ secrets.GITHUB_TOKEN }}

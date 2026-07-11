@@ -5,6 +5,7 @@ license = "${license}"
 modId = "${mod_id}" #mandatory
 version = "${version}" #mandatory
 displayName = "${mod_name}" #mandatory
+logoFile = "numen_mcp.png" #optional
 authors = "${mod_author}" #optional
 description = '''${description}''' #mandatory (Supports multiline text)
 [[dependencies.${mod_id}]]

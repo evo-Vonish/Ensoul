@@ -1,5 +1,7 @@
 # Numen MCP
 
+[English](README_EN.md) | 简体中文
+
 把你的 [Numen](https://github.com/Dwinovo/minecraft-numen) 同伴变成外部 AI 能直接操控的工具。Numen MCP 在你的游戏客户端里跑一个小型 [Model Context Protocol](https://modelcontextprotocol.io) 服务器,让 Claude 这样的智能体列出你的同伴、接管其中一个、直接调用它的工具——**Claude 当大脑,同伴当手和眼**。
 
 多加载器(Fabric + NeoForge),Minecraft 1.21.1。

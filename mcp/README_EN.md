@@ -1,5 +1,7 @@
 # Numen MCP
 
+English | [简体中文](README.md)
+
 Turn your [Numen](https://github.com/Dwinovo/minecraft-numen) companions into tools an external AI can drive. Numen MCP runs a small [Model Context Protocol](https://modelcontextprotocol.io) server inside your game client, so an agent like **Claude** can list your companions, take control of one, and call its tools directly — Claude becomes the brain, the companion is its hands and eyes.
 
 Multi-loader (Fabric + NeoForge), Minecraft 1.21.1.

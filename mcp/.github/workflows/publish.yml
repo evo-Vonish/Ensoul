@@ -89,6 +89,11 @@ jobs:
           curseforge-id: 1605815
           curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
 
+          # Numen (numen-core, CF project 1581109) is required at runtime — this
+          # attaches it as a required dependency so CurseForge shows "Requires Numen".
+          dependencies: |
+            numen(required){curseforge:1581109}
+
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish NeoForge to GitHub Release and CurseForge
@@ -107,5 +112,10 @@ jobs:
           # numen-mcp CurseForge project (delete these two lines to skip CF).
           curseforge-id: 1605815
           curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
+          # Numen (numen-core, CF project 1581109) is required at runtime — this
+          # attaches it as a required dependency so CurseForge shows "Requires Numen".
+          dependencies: |
+            numen(required){curseforge:1581109}
 
           github-token: ${{ secrets.GITHUB_TOKEN }}

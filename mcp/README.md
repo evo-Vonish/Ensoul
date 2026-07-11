@@ -1,80 +1,80 @@
 # Numen MCP
 
-Turn your [Numen](https://github.com/Dwinovo/minecraft-numen) companions into tools an external AI can drive. Numen MCP runs a small [Model Context Protocol](https://modelcontextprotocol.io) server inside your game client, so an agent like **Claude** can list your companions, take control of one, and call its tools directly — Claude becomes the brain, the companion is its hands and eyes.
+把你的 [Numen](https://github.com/Dwinovo/minecraft-numen) 同伴变成外部 AI 能直接操控的工具。Numen MCP 在你的游戏客户端里跑一个小型 [Model Context Protocol](https://modelcontextprotocol.io) 服务器,让 Claude 这样的智能体列出你的同伴、接管其中一个、直接调用它的工具——**Claude 当大脑,同伴当手和眼**。
 
-Multi-loader (Fabric + NeoForge), Minecraft 1.21.1.
+多加载器(Fabric + NeoForge),Minecraft 1.21.1。
 
-## How it differs from a normal Numen companion
+## 与普通 Numen 同伴的区别
 
-A Numen companion normally thinks with its own built-in LLM. Numen MCP lets an **outside** brain skip that LLM entirely:
+普通 Numen 同伴用自己内置的 LLM 思考。Numen MCP 让**外部**大脑完全绕过那个 LLM:
 
-- **Claude is the player.** It reads the world through perception tools (`get_self_status`, `scan_blocks`, …) and decides every action itself.
-- **No Numen API key needed** for this mode — Claude does the reasoning; the companion just executes tools.
-- **Parallel fleets.** Every call is addressed to one companion, and each body runs its tasks independently, so one agent can drive several companions at once.
-- **Survival-legitimate.** The exposed tools are the same ones the built-in brain uses — mine, move, place, craft. Nothing conjures items from nothing.
+- **Claude 就是玩家。** 它通过感知工具(`get_self_status`、`scan_blocks` …)读取世界,自己决定每一个动作。
+- **这个模式无需 Numen API Key**——Claude 负责推理,同伴只负责执行工具。
+- **并行舰队。** 每次调用都指定一个同伴,每具身体独立跑自己的任务,一个智能体可以同时驱动多个同伴。
+- **合乎生存规则。** 暴露出来的工具就是内置大脑用的那批——挖矿、移动、放置、合成。凭空造物做不到。
 
-## Requirements
+## 环境要求
 
-- **[Numen](https://github.com/Dwinovo/minecraft-numen) 0.0.4+** (bundles the numen-api engine with `NumenActuator`)
-- Client-side — companions and their tool registry live in the owner's game client
-- An MCP client: Claude Code (native HTTP) or Claude Desktop (via `mcp-remote`)
+- **[Numen](https://github.com/Dwinovo/minecraft-numen) 0.0.4+**(内含带 `NumenActuator` 的 numen-api 引擎)
+- 客户端安装——同伴和它们的工具注册表都活在拥有者的游戏客户端里
+- 一个 MCP 客户端:Claude Code(原生 HTTP)或 Claude Desktop(通过 `mcp-remote`)
 
-## Setup
+## 配置步骤
 
-1. Install Numen + Numen MCP in your client. Launch once; it writes `config/numen/mcp_server.json`. The log prints `MCP server up on http://127.0.0.1:8765/mcp` when it's listening.
+1. 在客户端里安装 Numen + Numen MCP。启动一次,它会写入 `config/numen/mcp_server.json`。开始监听时日志会打印 `MCP server up on http://127.0.0.1:8765/mcp`。
 
-2. Point your MCP client at it:
-   - **Claude Code** — `.mcp.json` in your project:
+2. 把你的 MCP 客户端指向它:
+   - **Claude Code** —— 在项目里的 `.mcp.json`:
      ```json
      { "mcpServers": { "numen": { "type": "http", "url": "http://127.0.0.1:8765/mcp" } } }
      ```
-   - **Claude Desktop** — `claude_desktop_config.json` (needs Node/npx):
+   - **Claude Desktop** —— `claude_desktop_config.json`(需要 Node/npx):
      ```json
      { "mcpServers": { "numen": { "command": "npx", "args": ["mcp-remote", "http://127.0.0.1:8765/mcp"] } } }
      ```
 
-3. Summon a companion in-game, then in your agent: `list_companions` → `acquire_companion` → drive it. The MCP server only listens while the game is running.
+3. 在游戏里召唤一个同伴,然后在你的智能体里:`list_companions` → `acquire_companion` → 开始驱动。MCP 服务器只在游戏运行时监听。
 
-## Tools
+## 工具
 
-| Tool | What it does |
+| 工具 | 作用 |
 |---|---|
-| `list_companions` | List your live companions (name + id) |
-| `acquire_companion` | Take control — pauses the built-in brain, frees the body |
-| `release_companion` | Hand the companion back to its built-in brain |
-| *(engine tools)* | Every Numen body/perception tool (`get_self_status`, `scan_blocks`, `auto_mine`, `move_to`, `place_block`, …), each taking a `companion` argument |
+| `list_companions` | 列出你当前在线的同伴(名字 + id) |
+| `acquire_companion` | 接管——暂停内置大脑,释放身体 |
+| `release_companion` | 把同伴交还给它的内置大脑 |
+| *(引擎工具)* | 每一个 Numen 身体/感知工具(`get_self_status`、`scan_blocks`、`auto_mine`、`move_to`、`place_block` …),每个都接收一个 `companion` 参数 |
 
-## Teaching your agent
+## 教你的智能体
 
-On connect, the server hands the agent a short briefing (MCP's `instructions`) — what Numen is and the `acquire → perceive → act → release` loop — so any MCP client works out of the box.
+连接时,服务器会给智能体一段简报(MCP 的 `instructions` 字段)——Numen 是什么、`接管 → 感知 → 行动 → 交还` 的循环——所以任何 MCP 客户端都开箱即用。
 
-For a richer, always-on skill in **Claude Code**, install the bundled one: copy [`agent-skill/numen`](agent-skill/numen/SKILL.md) into your skills directory (`~/.claude/skills/numen/`, or your project's `.claude/skills/numen/`). Claude then picks it up whenever you ask it to play in Minecraft.
+想在 **Claude Code** 里有一份更完整、常驻的技能,可以装上仓库自带的那份:把 [`agent-skill/numen`](agent-skill/numen/SKILL.md) 复制进你的技能目录(`~/.claude/skills/numen/`,或项目里的 `.claude/skills/numen/`)。之后你一让 Claude 玩 Minecraft,它就会自动用上。
 
-## Multiplayer
+## 多人联机
 
-Works on remote servers. Numen MCP is client-only and drives through Numen's existing client→server protocol — the same packets the built-in brain uses. The server needs Numen installed (as it already does for companions to exist); it does **not** need Numen MCP. The server owner-checks every action, so you can only drive companions you own.
+在远程服务器上照常工作。Numen MCP 纯客户端,通过 Numen 现成的客户端→服务端协议驱动——用的就是内置大脑用的那批数据包。服务器需要装 Numen(它本来就得装,同伴才存在),但**不需要**装 Numen MCP。服务器会对每个动作做归属校验,你只能驱动自己拥有的同伴。
 
-## Config reference — `config/numen/mcp_server.json`
+## 配置参考 —— `config/numen/mcp_server.json`
 
-- `enabled` — master switch.
-- `host` / `port` — where the HTTP endpoint binds (loopback by default).
-- `token` — optional bearer token; when set, requests must present it (`Authorization: Bearer <token>` or `?token=`).
-- `call_timeout_seconds` — how long a `tools/call` waits for a body action before reporting a timeout.
-- `hidden_tools` — engine tools NOT exposed to the external agent (agent-internal bookkeeping).
+- `enabled` —— 总开关。
+- `host` / `port` —— HTTP 端点绑定的地址(默认走本地回环)。
+- `token` —— 可选的 bearer token;设置后请求必须带上它(`Authorization: Bearer <token>` 或 `?token=`)。
+- `call_timeout_seconds` —— 一次 `tools/call` 等待身体动作多久后报超时。
+- `hidden_tools` —— 不向外部智能体暴露的引擎工具(智能体内部的记账用途)。
 
-## Status
+## 状态
 
-Early. Action tools are currently **blocking** (a `tools/call` holds until the body finishes the task); a non-blocking start/poll model and a Groovy skill-writing layer are planned.
+早期阶段。动作工具目前是**阻塞式**的(一次 `tools/call` 会一直挂住,直到身体完成任务);非阻塞的 start/poll 模型和一个 Groovy 技能编写层已在规划中。
 
-## Ecosystem
+## 生态
 
-**Numen** ([minecraft-numen](https://github.com/Dwinovo/minecraft-numen)) is the mod — the AI companion. It runs on the **[numen-api](https://github.com/Dwinovo/numen-api)** engine (published through **[numen-maven](https://github.com/Dwinovo/numen-maven)**), which exposes a small public API. Two things build on it:
+**Numen**（[minecraft-numen](https://github.com/Dwinovo/minecraft-numen)）是那个 mod——AI 同伴本体,跑在 **[numen-api](https://github.com/Dwinovo/numen-api)** 引擎上(经 **[numen-maven](https://github.com/Dwinovo/numen-maven)** 发布),引擎对外开放一套小巧的公共 API。两类东西建在它之上:
 
-**Extend a companion** — its own brain stays in charge:
-- **Bridges** carry an outside channel into a companion: a message arrives, and the companion decides what to do. Built on `NumenGateway`. → **[numen-qq-bridge](https://github.com/Dwinovo/numen-qq-bridge)** (QQ), with more to come.
-- **Skills** teach a companion how to behave — markdown loaded into its context. Bundled with Numen, or community-written.
+**扩展一个同伴**——同伴自己的大脑仍然做主:
+- **桥(Bridge)** 把一个外部渠道接进同伴:消息进来,同伴自己决定怎么做。基于 `NumenGateway`。→ **[numen-qq-bridge](https://github.com/Dwinovo/numen-qq-bridge)**(QQ),后续还有更多。
+- **技能(Skill)** 教同伴怎么做事——markdown 注入它的上下文。随 Numen 内置,或社区编写。
 
-**Expose Numen** — hand the controls to an outside brain:
-- **[numen-mcp](https://github.com/Dwinovo/numen-mcp)** is a Model Context Protocol server: any external agent (like Claude) drives companions directly. Built on `NumenActuator`. *(this repo)*
+**把 Numen 暴露出去**——把操控权交给外部大脑:
+- **[numen-mcp](https://github.com/Dwinovo/numen-mcp)** 是一个 Model Context Protocol 服务器:任意外部智能体(比如 Claude)直接驱动同伴。基于 `NumenActuator`。 *(本仓库)*
 
-MIT licensed.
+MIT 协议。

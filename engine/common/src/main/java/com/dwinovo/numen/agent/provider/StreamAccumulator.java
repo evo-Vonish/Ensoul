@@ -42,6 +42,16 @@ public final class StreamAccumulator {
     public final Map<Integer, ToolCallBuilder> toolCalls = new LinkedHashMap<>();
     public final Map<String, StringBuilder> extraBuffers = new LinkedHashMap<>();
 
+    /**
+     * Display-only running transcript of the model's reasoning stream
+     * (DeepSeek's {@code reasoning_content}, GLM's {@code reasoning}, ...),
+     * mirrored here by {@link OpenAIProvider#captureChunkExtras} in addition to
+     * the {@link #extraBuffers} round-trip. This channel is rendered live by
+     * the chat panel and is NEVER persisted or re-sent — the extras bag stays
+     * the single source of truth for the wire round-trip.
+     */
+    public final StringBuilder reasoning = new StringBuilder();
+
     public String finishReason;
     public JsonObject usage;
 

@@ -57,6 +57,11 @@ public final class NumenRoster {
         return new ArrayList<>(entries.values());
     }
 
+    /** The live companion with this UUID, or {@code null} if not one of ours. */
+    public Entry byUuid(UUID uuid) {
+        return entries.get(uuid);
+    }
+
     public int size() {
         return entries.size();
     }

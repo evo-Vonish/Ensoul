@@ -25,7 +25,7 @@ import java.util.UUID;
  * folder for players that aren't logging in — so without this index we couldn't
  * know which companions to recreate, or who owns them, while they sit dormant.
  *
- * <p>World-saved on the overworld data storage (one file, all owners' companions).
+ * <p>World-saved on the server-wide data storage (one file, all owners' companions).
  * The {@code dimension}/{@code pos} are a respawn hint (which level to construct
  * the body in); the {@code .dat} carries the authoritative restored state.
  */
@@ -74,7 +74,13 @@ public final class CompanionRegistry extends SavedData {
     }
 
     public static CompanionRegistry get(MinecraftServer server) {
-        return server.overworld().getDataStorage().computeIfAbsent(TYPE);
+        // Server-wide (not per-dimension) storage: this index spans every dimension/owner, so it
+        // belongs on the server data storage — the vanilla 26.1.2 home for server-global SavedData
+        // (scoreboard, maps, clock, weather, game rules). That lands the file at the world-root
+        // data/numen/companions.dat. (1.21.x had no server-wide storage, so the old idiom parked
+        // server-global data on overworld().getDataStorage(); in 26.1.2 the overworld moved under
+        // dimensions/minecraft/overworld/, which is where that idiom silently wrote the file.)
+        return server.getDataStorage().computeIfAbsent(TYPE);
     }
 
     /** Add or update a companion's catalog entry. */

@@ -157,6 +157,11 @@ public final class FabricNumenConfig implements INumenConfig {
     @Override
     public String getProxy() { return data.proxy == null ? "" : data.proxy; }
 
+    @Override
+    public String getReasoningEffort() {
+        return data.reasoningEffort == null || data.reasoningEffort.isBlank() ? "auto" : data.reasoningEffort;
+    }
+
     // ---- mutations ----
 
     @Override
@@ -176,6 +181,11 @@ public final class FabricNumenConfig implements INumenConfig {
 
     @Override
     public void setSystemPrompt(String value) { data.systemPrompt = value == null ? "" : value; }
+
+    @Override
+    public void setReasoningEffort(String value) {
+        data.reasoningEffort = value == null || value.isBlank() ? "auto" : value;
+    }
 
     @Override
     public void save() {
@@ -215,6 +225,14 @@ public final class FabricNumenConfig implements INumenConfig {
         // <available_skills> XML block — adding rules here just dilutes
         // attention. Mirrors opencode's default.txt minimalist style.
         public String systemPrompt = "You are Numen, a Minecraft entity controlled by the player who owns you.\nUse the tools provided to act in the world; output text only to talk to your owner.";
+        // Reasoning-effort knob for reasoning-capable models:
+        //   auto (default) — send nothing; the backend decides (zhipu's default
+        //                    is thinking ON at max effort!)
+        //   off            — disable thinking (glm-4.5+)
+        //   minimal | low | medium | high — enable thinking at that effort
+        //                    (reasoning_effort is GLM-5.2 only)
+        // Ignored by providers / models that don't support it.
+        public String reasoningEffort = "auto";
 
         static ConfigData defaults() {
             return new ConfigData();
@@ -229,6 +247,7 @@ public final class FabricNumenConfig implements INumenConfig {
             if (provider == null || provider.isBlank()) provider = d.provider;
             if (proxy == null) proxy = d.proxy;
             if (systemPrompt == null) systemPrompt = d.systemPrompt;
+            if (reasoningEffort == null || reasoningEffort.isBlank()) reasoningEffort = d.reasoningEffort;
             return this;
         }
     }

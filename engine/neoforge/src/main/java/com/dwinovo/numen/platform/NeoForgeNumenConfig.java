@@ -27,6 +27,7 @@ public final class NeoForgeNumenConfig implements INumenConfig {
     public static final ModConfigSpec.ConfigValue<String> PROVIDER;
     public static final ModConfigSpec.ConfigValue<String> PROXY;
     public static final ModConfigSpec.ConfigValue<String> SYSTEM_PROMPT;
+    public static final ModConfigSpec.ConfigValue<String> REASONING_EFFORT;
     public static final ModConfigSpec SPEC;
 
     static {
@@ -66,6 +67,12 @@ public final class NeoForgeNumenConfig implements INumenConfig {
                 .define("system_prompt",
                         "You are Numen, a Minecraft entity controlled by the player who owns you.\n"
                                 + "Use the tools provided to act in the world; output text only to talk to your owner.");
+        REASONING_EFFORT = b.comment(
+                "Reasoning effort for reasoning-capable models (currently GLM via the zhipu provider).",
+                "auto (default) → send nothing; the backend decides (zhipu's default is thinking ON at max effort!).",
+                "off → disable thinking (glm-4.5+). Effort values: minimal | low | medium | high (GLM-5.2 only).",
+                "Ignored by providers / models that don't support it.")
+                .define("reasoning_effort", "auto");
         b.pop();
 
         SPEC = b.build();
@@ -105,6 +112,12 @@ public final class NeoForgeNumenConfig implements INumenConfig {
         return safe(PROXY);
     }
 
+    @Override
+    public String getReasoningEffort() {
+        String s = safe(REASONING_EFFORT);
+        return s.isEmpty() ? "auto" : s;
+    }
+
     // ---- mutations ----
 
     @Override
@@ -135,6 +148,11 @@ public final class NeoForgeNumenConfig implements INumenConfig {
     @Override
     public void setSystemPrompt(String value) {
         SYSTEM_PROMPT.set(value == null ? "" : value);
+    }
+
+    @Override
+    public void setReasoningEffort(String value) {
+        REASONING_EFFORT.set(value == null || value.isBlank() ? "auto" : value);
     }
 
     /**

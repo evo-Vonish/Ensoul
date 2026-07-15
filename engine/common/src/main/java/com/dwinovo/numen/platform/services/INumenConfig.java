@@ -64,6 +64,19 @@ public interface INumenConfig {
      */
     String getSystemPrompt();
 
+    /**
+     * Reasoning-effort knob for reasoning-capable models. {@code "auto"}
+     * (default) means "send nothing — let the backend decide" (careful:
+     * zhipu's server default is thinking enabled at MAX effort, so auto is
+     * the most expensive option there, not the cheapest). {@code "off"}
+     * disables thinking where the provider supports a toggle. The effort
+     * values ({@code minimal} / {@code low} / {@code medium} / {@code high})
+     * enable thinking and are forwarded to providers that support a
+     * {@code reasoning_effort} request field (currently GLM-5.2 via
+     * {@code zhipu}). Ignored by providers / models that don't support it.
+     */
+    String getReasoningEffort();
+
     // ---- write surface (client-side: invoked by SettingsScreen) ----
 
     /**
@@ -81,6 +94,9 @@ public interface INumenConfig {
     void setProxy(String value);
 
     void setSystemPrompt(String value);
+
+    /** Mutate the in-memory reasoning-effort knob. Null/blank normalised to {@code "auto"}. */
+    void setReasoningEffort(String value);
 
     /**
      * Flush in-memory changes to the loader-native config file. Best-effort:

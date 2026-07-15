@@ -135,6 +135,11 @@ public final class NumenCore {
         // L2 regional observation (Wave C): recall remembered region cognition. Appended
         // after RunCommandTool so all prior tool ordering — and prompt caching — stays stable.
         ToolRegistry.register(new com.dwinovo.numen.core.tools.RecallRegionTool());
+
+        // §7 INFERENCE ledger (numen-context-design-v1.md): explicitly commit an important
+        // model inference as a persistent cognition event. Appended LAST, after
+        // RecallRegionTool, so all prior tool ordering — and prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.CommitInferenceTool());
     }
 
 

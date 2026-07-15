@@ -164,7 +164,7 @@ public final class Perceptions {
     /**
      * L2 driver: on a region-boundary crossing (edge-trigger), observe the region just entered —
      * subject to a per-region cooldown so pacing the boundary can't re-scan. The observation and
-     * its append-only snapshot/diff/checkpoint logic live in {@link RegionCognition}.
+     * its append-only snapshot/diff pairing logic (§5.4) live in {@link RegionCognition}.
      */
     private static void pollRegion(NumenPlayer body, PerceptionState st, long now) {
         if (!(body.level() instanceof ServerLevel level)) return;

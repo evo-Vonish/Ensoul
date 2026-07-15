@@ -31,6 +31,10 @@ loom {
             // fixed name keeps companion ownership valid across launches (random
             // PlayerNNN names orphan every companion in the registry on restart).
             programArgs('--username', 'Dev')
+            // Bounded heap: an uncapped client took the default (25% of RAM) and
+            // starved native allocations on a loaded system — JVM died with
+            // "insufficient memory ... Chunk::new" (hs_err_pid27196). 4G is ample.
+            vmArg('-Xmx4G')
         }
         server {
             server()

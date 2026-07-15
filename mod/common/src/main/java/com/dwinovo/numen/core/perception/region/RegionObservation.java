@@ -262,7 +262,7 @@ public final class RegionObservation {
 
     /**
      * Apply a stored diff to this (baseline) observation, reconstructing the state after the diff —
-     * the step {@code recall_region} uses to rebuild current cognition from a checkpoint + diffs
+     * the step {@code recall_region} uses to rebuild current cognition from the latest snapshot + diffs
      * (acceptance test #10). The result carries the diff's terrain and its post-diff feature set.
      */
     public RegionObservation applyDiff(Diff d) {

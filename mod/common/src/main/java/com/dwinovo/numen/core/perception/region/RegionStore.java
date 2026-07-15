@@ -27,12 +27,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code CompanionPermissions}'s persistence style.
  *
  * <p><strong>Append-only.</strong> Every region carries an ordered
- * {@code eventLog}: a first-visit {@code snapshot}, then {@code diff}s as the
- * region changes, and periodic {@code checkpoint}s once the diffs pile up. History
- * is never rewritten — a new baseline is <em>appended</em>, older segments stay on
- * disk (acceptance tests #3, #5, #10). The top-level {@code semanticHash} /
- * {@code canonical} track the current state for a fast unchanged-check
- * (acceptance test #4).
+ * {@code eventLog}: a first-visit {@code snapshot} (v1), then {@code diff}s as the
+ * region changes, and — per the §5.4 pairing rule of
+ * {@code docs/numen-context-design-v1.md} — fresh full {@code snapshot vN} baselines
+ * appended right after a structural diff (monotonic version per region). History is
+ * never rewritten — a new baseline is <em>appended</em>, older segments stay on
+ * disk. The top-level {@code semanticHash} / {@code canonical} track the current
+ * state for a fast unchanged-check (回到 A 世界未变 → 零追加).
  *
  * <h2>Thread context</h2>
  * <strong>Server thread only</strong> — created from the perception poll and the
@@ -42,17 +43,14 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class RegionStore {
 
-    /** Diffs since the last baseline that trigger a fresh checkpoint. */
-    private static final int CHECKPOINT_AFTER_DIFFS = 12;
-
     /** One log entry — an immutable statement of one observation event. */
     public static final class LogEntry {
-        final String kind;        // "snapshot" | "diff" | "checkpoint"
-        final int version;        // baseline version (snapshot = 1, checkpoint = N); 0 for diffs
+        final String kind;        // "snapshot" | "diff"
+        final int version;        // baseline version (first snapshot = 1, later snapshots = N); 0 for diffs
         final long gameTime;
         final String hash;        // the region's semantic hash after this event
-        final RegionObservation canonical;   // full state for snapshot/checkpoint; null for diff
-        final RegionObservation.Diff diff;    // change set for diff; null otherwise
+        final RegionObservation canonical;   // full state for a snapshot; null for a diff
+        final RegionObservation.Diff diff;    // change set for a diff; null otherwise
 
         LogEntry(String kind, int version, long gameTime, String hash,
                  RegionObservation canonical, RegionObservation.Diff diff) {
@@ -81,8 +79,8 @@ public final class RegionStore {
         public long observedAtGameTime() { return observedAtGameTime; }
         public RegionObservation canonical() { return canonical; }
 
-        /** Diffs appended since the most recent baseline (snapshot/checkpoint). */
-        int diffsSinceBaseline() {
+        /** Diffs appended since the most recent snapshot baseline. */
+        public int diffsSinceBaseline() {
             int n = 0;
             for (int i = eventLog.size() - 1; i >= 0; i--) {
                 LogEntry e = eventLog.get(i);
@@ -90,6 +88,29 @@ public final class RegionStore {
                 else break;   // hit the last baseline
             }
             return n;
+        }
+
+        /**
+         * Serialized size (chars, a deterministic token proxy) of every diff appended since
+         * the last snapshot baseline — the "diff 总 token" side of the §5.4 size trigger.
+         */
+        public int trailingDiffJsonChars() {
+            int total = 0;
+            for (int i = eventLog.size() - 1; i >= 0; i--) {
+                LogEntry e = eventLog.get(i);
+                if (!e.kind.equals("diff")) break;
+                if (e.diff != null) total += diffToJson(e.diff).toString().length();
+            }
+            return total;
+        }
+
+        /** Serialized size (chars) of the most recent snapshot baseline — the comparison base. */
+        public int lastBaselineJsonChars() {
+            for (int i = eventLog.size() - 1; i >= 0; i--) {
+                LogEntry e = eventLog.get(i);
+                if (e.canonical != null) return e.canonical.toJson().toString().length();
+            }
+            return Integer.MAX_VALUE;   // no baseline (shouldn't happen) — never trip the size trigger
         }
     }
 
@@ -152,10 +173,15 @@ public final class RegionStore {
         save();
     }
 
-    /** Append a new checkpoint baseline (bounded history — test #10). Returns the new version. */
-    public int recordCheckpoint(Record rec, RegionObservation obs, long now) {
+    /**
+     * Append a fresh full snapshot baseline right after a structural diff — the second half of the
+     * §5.4 pair (diff answers "why it changed", this snapshot answers "what it is now"). The version
+     * is monotonic per region; older snapshots stay in the log untouched (compaction folds them
+     * later, never here). Returns the new version N.
+     */
+    public int recordSnapshotVersion(Record rec, RegionObservation obs, long now) {
         int version = rec.baselineVersion + 1;
-        rec.eventLog.add(new LogEntry("checkpoint", version, now, obs.semanticHash(), obs, null));
+        rec.eventLog.add(new LogEntry("snapshot", version, now, obs.semanticHash(), obs, null));
         rec.baselineVersion = version;
         rec.semanticHash = obs.semanticHash();
         rec.observedAtGameTime = now;
@@ -164,26 +190,21 @@ public final class RegionStore {
         return version;
     }
 
-    /** Whether the region has accumulated enough diffs to warrant a checkpoint. */
-    public boolean needsCheckpoint(Record rec) {
-        return rec.diffsSinceBaseline() > CHECKPOINT_AFTER_DIFFS;
-    }
-
     // ============================================================ rebuild
 
     /**
      * Rebuild current cognition for a region from its event stream: start at the latest
-     * baseline (checkpoint or snapshot) and replay every subsequent diff. This is what
-     * {@code recall_region} returns, and it must reproduce {@code rec.canonical}
-     * (acceptance test #10). Falls back to the cached canonical if the log is unusable.
+     * (highest-version) snapshot baseline and replay every subsequent diff — the
+     * "最新快照 + 其后 diff" replay of §10. This is what {@code recall_region} returns,
+     * and it must reproduce {@code rec.canonical} exactly. Falls back to the cached
+     * canonical if the log is unusable.
      */
     public RegionObservation rebuild(Record rec) {
         int baselineIdx = -1;
         for (int i = rec.eventLog.size() - 1; i >= 0; i--) {
-            String k = rec.eventLog.get(i).kind;
-            if (k.equals("checkpoint") || k.equals("snapshot")) { baselineIdx = i; break; }
+            if (rec.eventLog.get(i).canonical != null) { baselineIdx = i; break; }
         }
-        if (baselineIdx < 0 || rec.eventLog.get(baselineIdx).canonical == null) {
+        if (baselineIdx < 0) {
             return rec.canonical;
         }
         RegionObservation current = rec.eventLog.get(baselineIdx).canonical;

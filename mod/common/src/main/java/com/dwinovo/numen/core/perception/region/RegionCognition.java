@@ -5,26 +5,51 @@ import com.dwinovo.numen.entity.NumenPlayer;
 import net.minecraft.server.level.ServerLevel;
 
 /**
- * The L2 policy driver: turns a region-boundary crossing into at most one
- * append-only observation event, and answers {@code recall_region}. It sits
- * between the cheap, deterministic scan ({@link RegionObservation}) and the
- * append-only store ({@link RegionStore}), applying the zero-append semantics of
- * the design:
+ * The L2 policy driver: turns a region-boundary crossing into append-only
+ * observation events, and answers {@code recall_region}. It sits between the
+ * cheap, deterministic scan ({@link RegionObservation}) and the append-only
+ * store ({@link RegionStore}), applying the dispatch + §5.4 pairing rule of
+ * {@code docs/numen-context-design-v1.md} (the canonical contract):
  *
  * <pre>
- *   从未观察  → append REGION_SNAPSHOT        (test #2)
- *   hash 相同 → 零追加 (revisit may note staleness) (test #4)
- *   hash 不同 → 结构化 diff → 过滤无意义变化 → REGION_DIFF (tests #5, #9)
- *   diff 累积 → append REGION_CHECKPOINT       (test #10)
+ *   从未观察  → append REGION_SNAPSHOT v1
+ *   hash 相同 → 零追加(复访可附时效提示)
+ *   hash 不同 → 结构化 diff → 重要性过滤 →
+ *       小变更                       → 仅 REGION_DIFF
+ *       结构性变更 / 累计 diff ≥ K /
+ *       diff 总量超上一快照 1.5 倍   → REGION_DIFF + 紧随 REGION_SNAPSHOT vN(成对)
  * </pre>
  *
+ * <p>The pair's division of labour: the diff answers "why it changed", the fresh
+ * snapshot answers "what it is now" — pushed to the tail where attention weight
+ * is highest, so the model never has to replay diffs mentally. Snapshot versions
+ * are monotonic per region ("同区域以最高版本为准"); old segments are untouched.
+ *
  * <p>Events are pushed non-urgent through {@link Companions#emitEvent}, rendered
- * FROM the canonical structure (never hashed prose). Server thread only.
+ * FROM the canonical structure (never hashed prose), and carry
+ * {@code provenance="observed"} on the root tag ({@code seq}/{@code schemaVersion}
+ * are stamped centrally by the engine's envelope, never here). Server thread only.
  */
 public final class RegionCognition {
 
     /** One game day in ticks — staleness granularity for revisit notes and recall. */
     private static final long GAME_DAY = 24000L;
+
+    /** §5.4 K: accumulated diffs since the last snapshot that force a fresh paired snapshot. */
+    private static final int PAIR_AFTER_DIFFS = 8;
+
+    /** §5.4 size trigger: trailing diff bytes above this multiple of the last snapshot pair a new one. */
+    private static final double PAIR_SIZE_RATIO = 1.5;
+
+    /**
+     * Feature categories whose appearance/disappearance is a STRUCTURAL change (§5.3 importance
+     * gate: 容器、工作站、门、危险的变化必追加 — and per §5.4 they also warrant a paired snapshot).
+     * A furnace is a workstation in this sense; markers (signs/banners) and generic block
+     * entities stay small changes. "door" is future-proofing — v1's block-entity scan never
+     * produces it, but the category rule is written where it belongs.
+     */
+    private static final java.util.Set<String> STRUCTURAL_FEATURE_TYPES =
+            java.util.Set.of("container", "furnace", "workstation", "bed", "door");
 
     private RegionCognition() {}
 
@@ -41,9 +66,9 @@ public final class RegionCognition {
         RegionStore.Record rec = store.get(key);
 
         if (rec == null) {
-            // First visit → snapshot (test #2).
+            // First visit → snapshot v1 (首次进入区域 A → 只追加一个 snapshot).
             store.recordSnapshot(obs, now);
-            emit(body, "region_snapshot", key, 0, obs.render());
+            emit(body, "region_snapshot", key, 1, obs.render());
             return;
         }
 
@@ -69,14 +94,40 @@ public final class RegionCognition {
         }
 
         store.recordDiff(rec, obs, diff, now);
-        emit(body, "region_diff", key, 0, renderDiff(key, diff));
 
-        // Bounded history: once diffs pile up, append a fresh checkpoint baseline (test #10).
-        if (store.needsCheckpoint(rec)) {
-            int version = store.recordCheckpoint(rec, obs, now);
-            emit(body, "region_checkpoint", key, version,
-                    "区域认知基线已更新(第 " + version + " 版)。当前状态:" + obs.render());
+        // §5.4 pairing decision — does this diff also warrant a fresh full snapshot?
+        //   structural: a container/workstation/bed/door/hazard appeared or vanished, or the
+        //               dominant surface / biome changed (the world is *shaped* differently);
+        //   tooMany:    ≥ K diffs since the last snapshot (mental replay is getting long);
+        //   tooBig:     the trailing diffs outweigh the last snapshot by 1.5× (a fresh
+        //               baseline is now cheaper to read than the diff chain).
+        boolean structural = isStructural(diff);
+        boolean tooMany = rec.diffsSinceBaseline() >= PAIR_AFTER_DIFFS;
+        boolean tooBig = rec.trailingDiffJsonChars() > PAIR_SIZE_RATIO * rec.lastBaselineJsonChars();
+
+        if (structural || tooMany || tooBig) {
+            // Paired append: diff then snapshot vN, TWO events in the same flush — the diff
+            // answers "why", the snapshot answers "what is now" (小变更连续发生 → 仅 diff;
+            // 结构性变更 → diff + snapshot 成对追加).
+            int version = store.recordSnapshotVersion(rec, obs, now);
+            emit(body, "region_diff", key, 0, renderDiff(key, diff));
+            emit(body, "region_snapshot", key, version, obs.render());
+        } else {
+            emit(body, "region_diff", key, 0, renderDiff(key, diff));
         }
+    }
+
+    /** Whether a diff is a structural change per the §5.3 importance categories. */
+    private static boolean isStructural(RegionObservation.Diff d) {
+        if (d.surfaceChanged() || d.biomeChanged()) return true;
+        if (!d.addedHazards.isEmpty() || !d.removedHazards.isEmpty()) return true;
+        for (RegionObservation.Feature f : d.addedFeatures) {
+            if (STRUCTURAL_FEATURE_TYPES.contains(f.type())) return true;
+        }
+        for (RegionObservation.Feature f : d.removedFeatures) {
+            if (STRUCTURAL_FEATURE_TYPES.contains(f.type())) return true;
+        }
+        return false;
     }
 
     /**
@@ -126,10 +177,17 @@ public final class RegionCognition {
         return sb.toString();
     }
 
+    /**
+     * Emit one region event, non-urgent. Root tag carries {@code provenance="observed"} (§3 —
+     * these are direct observations) and, for snapshots, the monotonic {@code version} ("同区域
+     * 以最高版本为准"). {@code seq} and {@code schemaVersion} belong to the engine's central
+     * envelope stamping — never added here.
+     */
     private static void emit(NumenPlayer body, String tag, RegionKey key, int version, String inner) {
-        String open = version > 0
-                ? "<" + tag + " region=\"" + key.label() + "\" version=\"" + version + "\">"
-                : "<" + tag + " region=\"" + key.label() + "\">";
+        StringBuilder open = new StringBuilder("<").append(tag)
+                .append(" region=\"").append(key.label()).append("\"");
+        if (version > 0) open.append(" version=\"").append(version).append("\"");
+        open.append(" provenance=\"observed\">");
         Companions.emitEvent(body, open + inner + "</" + tag + ">", false);
     }
 }

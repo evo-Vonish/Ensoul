@@ -44,7 +44,17 @@ public final class InteractAtTool extends ServerNumenTool {
     @Override
     public void runOnServer(String toolCallId, JsonObject args, NumenPlayer companion, Consumer<String> reply) {
         Args a = GSON.fromJson(args, Args.class);
-        enqueue(companion, impl.interactAt(a.button(), a.x(), a.y(), a.z(), a.hold_ticks(), a.item_id(),
+        // Models routinely send "null"/""/"air" for "no item"; treat them all as
+        // use-what's-in-hand instead of failing the whole call on an item lookup.
+        String itemId = a.item_id();
+        if (itemId != null) {
+            String v = itemId.strip().toLowerCase(java.util.Locale.ROOT);
+            if (v.isEmpty() || v.equals("null") || v.equals("none")
+                    || v.equals("air") || v.equals("minecraft:air")) {
+                itemId = null;
+            }
+        }
+        enqueue(companion, impl.interactAt(a.button(), a.x(), a.y(), a.z(), a.hold_ticks(), itemId,
                 ctx(toolCallId, companion)));
     }
 }

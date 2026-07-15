@@ -9,6 +9,7 @@ import com.dwinovo.numen.client.agent.AgentLoopRegistry;
 import com.dwinovo.numen.client.agent.ClientDeaths;
 import com.dwinovo.numen.client.agent.ClientNumenLookup;
 import com.dwinovo.numen.client.agent.EntityAgentLoop;
+import com.dwinovo.numen.client.agent.ContextExporter;
 import com.dwinovo.numen.client.agent.NumenRoster;
 import com.dwinovo.numen.client.agent.UsageTracker;
 import com.dwinovo.numen.client.data.ClientNumenInventory;
@@ -159,6 +160,8 @@ public final class NumenScreen extends Screen {
     private boolean usageView;
     /** Balance query status/result line — written from the HTTP thread (immutable String), read by render. */
     private volatile String balanceLine;
+    /** Context-export status line (written path or error) — main-thread only, shown in the Usage view. */
+    private String exportLine;
     private boolean addingSite;              // "+ 添加站点" mode: name + base URL + model → writes a site
     private EditBox proxyInput;
     private EditBox siteNameInput;
@@ -427,6 +430,11 @@ public final class NumenScreen extends Screen {
                     Component.literal("Query balance"), b -> onQueryBalance());
             qb.active = NumenLlmClient.isConfigured() && NumenLlmClient.instance().supportsBalance();
             add(qb);
+            // Full-context export (md + wire json) for the current companion — for human review.
+            SimpleButton ex = new SimpleButton(x + 110 + 4, top + PANEL_H - PAD - 18, 64, 18,
+                    Component.literal("Export"), b -> onExport());
+            ex.active = uuid != null;
+            add(ex);
             add(new SimpleButton(left + PANEL_W - PAD - 64, top + PANEL_H - PAD - 18,
                     64, 18, Component.literal("Back"), b -> { usageView = false; rebuild(); }));
             return;
@@ -461,7 +469,7 @@ public final class NumenScreen extends Screen {
             int usageW = 48;
             add(new SimpleButton(left + PANEL_W - PAD - 64 - 4 - reasonW - 4 - usageW,
                     top + PANEL_H - PAD - 18, usageW, 18, Component.literal("Usage"),
-                    b -> { preserveKeyUrl(); usageView = true; balanceLine = null; rebuild(); }));
+                    b -> { preserveKeyUrl(); usageView = true; balanceLine = null; exportLine = null; rebuild(); }));
         }
 
         add(new SimpleButton(left + PANEL_W - PAD - 64, top + PANEL_H - PAD - 18,
@@ -615,7 +623,7 @@ public final class NumenScreen extends Screen {
         if (per.isEmpty()) {
             txt(g, Component.literal("no requests yet"), x, y, TXT_FAINT);
         } else {
-            int yMax = top + PANEL_H - PAD - 18 - 26;   // stay clear of the balance line + buttons
+            int yMax = top + PANEL_H - PAD - 18 - 38;   // stay clear of the two status lines + buttons
             for (var e : per.entrySet()) {
                 if (y > yMax) break;
                 UsageTracker.Stat s = e.getValue();
@@ -625,13 +633,41 @@ public final class NumenScreen extends Screen {
                 y += 12;
             }
         }
-        // Balance status line, just above the Query balance / Back buttons.
+        int w = PANEL_W - PAD * 2;
+        // Export status line (written path / error), muted — mirrors the compacting-hint style.
         int by = top + PANEL_H - PAD - 18 - 12;
+        if (exportLine != null) {
+            txt(g, Component.literal(fitOneLine(exportLine, w)), x, by - 12, TXT_MUTED);
+        }
+        // Balance status line, just above the Query balance / Export / Back buttons.
         String line = balanceLine;
         if (line != null) {
-            txt(g, Component.literal(line), x, by, TXT);
+            txt(g, Component.literal(fitOneLine(line, w)), x, by, TXT);
         } else if (!NumenLlmClient.isConfigured() || !NumenLlmClient.instance().supportsBalance()) {
             txt(g, Component.literal("provider has no balance API"), x, by, TXT_FAINT);
+        }
+    }
+
+    /**
+     * Export the current companion's full context (md + wire json) for human review.
+     * Failure-safe by construction: everything is caught; errors render as a muted row.
+     */
+    private void onExport() {
+        if (uuid == null) {
+            exportLine = "no companion selected";
+            return;
+        }
+        try {
+            java.nio.file.Path p = ContextExporter.export(loop());
+            java.nio.file.Path game = Minecraft.getInstance().gameDirectory.toPath().toAbsolutePath().normalize();
+            java.nio.file.Path ap = p.toAbsolutePath().normalize();
+            String shown = ap.startsWith(game)
+                    ? game.relativize(ap).toString().replace('\\', '/')
+                    : ap.toString();
+            exportLine = "exported: " + shown;
+        } catch (Exception ex) {
+            com.dwinovo.numen.Constants.LOG.warn("[numen-export] failed: {}", ex.toString());
+            exportLine = "export failed: " + shortErr(ex);
         }
     }
 

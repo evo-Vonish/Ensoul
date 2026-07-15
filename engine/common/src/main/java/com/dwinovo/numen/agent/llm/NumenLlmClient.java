@@ -135,6 +135,24 @@ public final class NumenLlmClient {
      */
     public record ChatResult(AssistantTurn turn, int promptTokens, int totalTokens) {}
 
+    // ---- wire capture (context export diagnostics) ----
+
+    /** One captured outbound request: the exact serialized wire body + its prompt-prefix hash. */
+    public record WireCapture(String body, String prefixHash, long capturedAt) {}
+
+    /**
+     * Last request body actually sent, per companion — transient diagnostics read by the
+     * context exporter ({@code ContextExporter}). Static so it survives {@link #reset()};
+     * never persisted; overwritten on every dispatch.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, WireCapture> LAST_WIRE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The last captured outbound request for {@code companion}, or null when none yet. */
+    public static WireCapture lastWire(java.util.UUID companion) {
+        return companion == null ? null : LAST_WIRE.get(companion);
+    }
+
     /**
      * Streaming chat completion at the configured reasoning effort. Convenience
      * overload — delegates to {@link #chatStreaming(List, Collection, String, String,
@@ -145,7 +163,17 @@ public final class NumenLlmClient {
                                                        String systemPrompt,
                                                        Consumer<JsonObject> onChunk,
                                                        Consumer<String> onReasoning) {
-        return chatStreaming(messages, tools, systemPrompt, null, onChunk, onReasoning);
+        return chatStreaming(null, messages, tools, systemPrompt, null, onChunk, onReasoning);
+    }
+
+    /** Overload without companion attribution — no wire capture for the context exporter. */
+    public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
+                                                       Collection<NumenTool> tools,
+                                                       String systemPrompt,
+                                                       String effortOverride,
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
+        return chatStreaming(null, messages, tools, systemPrompt, effortOverride, onChunk, onReasoning);
     }
 
     /**
@@ -153,6 +181,9 @@ public final class NumenLlmClient {
      * {@link ChatResult} — the {@link AssistantTurn} built up from all SSE
      * chunks via the provider's accumulator, plus reported token usage.
      *
+     * @param companion      companion (entity uuid) this call belongs to — used solely to
+     *                       attribute the wire-body capture for the context exporter. Null
+     *                       skips the capture; nothing else changes.
      * @param messages       conversation history (provider translates to wire)
      * @param tools          tool list (provider serialises to wire shape;
      *                       empty = no tools field, e.g. for summarization calls)
@@ -171,7 +202,8 @@ public final class NumenLlmClient {
      *                       each time it grows — for the live "thinking" display.
      *                       Display-only; never persisted or re-sent. May be null.
      */
-    public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
+    public CompletableFuture<ChatResult> chatStreaming(java.util.UUID companion,
+                                                       List<ConvoState.Msg> messages,
                                                        Collection<NumenTool> tools,
                                                        String systemPrompt,
                                                        String effortOverride,
@@ -220,13 +252,19 @@ public final class NumenLlmClient {
         // system message content). With the append-only world-cognition design this must stay
         // constant across turns that add no structural new knowledge — grep one companion's
         // lr-N lines and watch prefixHash to catch a prefix that started jittering.
-        Constants.LOG.info("[numen-llm] {} prefixHash={}", requestId, prefixHash(toolList, systemPrompt));
+        String pfx = prefixHash(toolList, systemPrompt);
+        Constants.LOG.info("[numen-llm] {} prefixHash={}", requestId, pfx);
 
         // -- 2. Enable streaming + usage reporting (both server-side flags).
         body.addProperty("stream", true);
         JsonObject streamOpts = new JsonObject();
         streamOpts.addProperty("include_usage", true);
         body.add("stream_options", streamOpts);
+
+        // Wire capture for the context exporter: the exact body about to hit the network.
+        if (companion != null) {
+            LAST_WIRE.put(companion, new WireCapture(body.toString(), pfx, System.currentTimeMillis()));
+        }
 
         if (Constants.LOG.isDebugEnabled()) {
             Constants.LOG.debug("[numen-llm] chat start: provider={}, model={}, msgs={}, tools={}, system_prompt_chars={}",

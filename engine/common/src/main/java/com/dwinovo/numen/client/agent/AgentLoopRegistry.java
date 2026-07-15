@@ -45,6 +45,24 @@ public final class AgentLoopRegistry {
     }
 
     /**
+     * §7 INFERENCE seam, pack-facing entry point. A tool pack's {@code commit_inference}
+     * client-local tool calls this with the companion identity it already has on the call
+     * ({@code call.ctx().entityUuid()}) — mirroring how {@code loadSkill} reaches engine
+     * state through a static entry point. Appends
+     * {@code <inference provenance="inferred">text</inference>} to that companion's
+     * conversation tail (seq/schemaVersion/gameTime-stamped by the §3 envelope choke
+     * point) and returns the tool-result confirmation JSON. Fails soft (JSON with
+     * {@code success:false}) when no loop exists for the uuid. Client main thread only.
+     */
+    public static String commitInference(UUID entityUuid, String text) {
+        EntityAgentLoop loop = ENTITY_LOOPS.get(entityUuid);
+        if (loop == null) {
+            return "{\"success\":false,\"message\":\"no agent loop for entity " + entityUuid + "\"}";
+        }
+        return loop.commitInference(text);
+    }
+
+    /**
      * UUIDs of the companions whose loop is mid-turn ({@link EntityAgentLoop#canInterrupt()}
      * — thinking, awaiting tool results, or with a queued prompt). These are the
      * heartbeat targets: a server-side chunk-ticket lease should be held for each

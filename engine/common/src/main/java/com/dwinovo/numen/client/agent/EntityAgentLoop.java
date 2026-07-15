@@ -133,6 +133,12 @@ public final class EntityAgentLoop {
     /** Session date baseline; a mid-session rollover appends a small "今天是…" tail note. */
     private java.time.LocalDate lastKnownDate;
     /**
+     * §3 envelope: per-companion global monotonic event seq, persisted to the
+     * {@code <uuid>.seq} sidecar next to the conversation JSONL so it survives
+     * restarts (see {@link EventSeqCounter} for the persistence rationale).
+     */
+    private final EventSeqCounter eventSeq;
+    /**
      * Prompts the owner typed while a turn was still in flight (waiting on the
      * LLM, or on outstanding tool results). They must NOT be spliced into the
      * conversation immediately: the OpenAI/DeepSeek protocol requires an
@@ -255,10 +261,12 @@ public final class EntityAgentLoop {
                 .resolve("config").resolve("numen");
         this.log = ConvoLog.forEntity(numenRoot.resolve("conversations"), entityUuid);
         this.convo = new ConvoState(log::append);
+        this.eventSeq = EventSeqCounter.forEntity(numenRoot.resolve("conversations"), entityUuid);
         this.landmarks = LandmarkStore.forEntity(numenRoot.resolve("memory"), entityUuid);
         // The emitter appends landmark events onto the same buffered user-role tail the
-        // owner's prompts ride, so they splice in at the next protocol-valid boundary.
-        this.landmarkEmitter = new LandmarkEventEmitter(bufferedPrompts::add);
+        // owner's prompts ride (through the stamping choke point, so they carry the §3
+        // envelope), splicing in at the next protocol-valid boundary.
+        this.landmarkEmitter = new LandmarkEventEmitter(this::queueEventNote);
         this.dispatcher = new ToolDispatcher(entityUuid, new ToolDispatcher.Sink() {
             @Override public void onResult(ToolInvocation inv, String resultJson) {
                 harvestLandmarks(inv.name(), resultJson);
@@ -317,6 +325,11 @@ public final class EntityAgentLoop {
      * ({@code null} when none / evicted / pre-compaction). Read by the chat panel's fold rows.
      */
     public String reasoningAt(int msgIndex) { return turnReasoning.get(msgIndex); }
+
+    /** The exact system prompt a turn dispatched right now would carry — read by the context exporter. */
+    public String currentSystemPrompt() {
+        return composeSystemPrompt(Services.CONFIG.getSystemPrompt());
+    }
 
     /** Owner typed a prompt in the chat GUI (text only). */
     public void submitPrompt(String text) {
@@ -565,7 +578,7 @@ public final class EntityAgentLoop {
      */
     public void injectEvent(String xml, boolean urgent) {
         if (dead) return;
-        bufferedPrompts.add(xml);
+        queueEventNote(xml);
         Constants.LOG.info("[numen-entity#{}] event queued{}: {}",
                 entityUuid, urgent ? " (urgent)" : "", truncate(xml, 120));
         if (urgent) {
@@ -580,6 +593,76 @@ public final class EntityAgentLoop {
                 tryStartTurn();
             }
         }
+    }
+
+    // ---- §3 event envelope (the client convergence point) ----
+
+    /**
+     * The single choke point where event/note XML strings enter the buffered tail:
+     * stamps the §3 envelope ({@code seq} + {@code schemaVersion}, plus {@code gameTime}
+     * when the body's level is resolvable) into the root tag, then queues the note.
+     * Plain text (an owner prompt never routes here, but defensively) and already-stamped
+     * roots pass through untouched. {@code provenance} is left entirely to producers —
+     * absence means "observed" per the protocol. Returns the assigned seq, or {@code -1}
+     * when the note was not stampable.
+     */
+    private long queueEventNote(String note) {
+        long seq = -1L;
+        if (EventEnvelope.isStampable(note)) {
+            seq = eventSeq.next();
+            note = EventEnvelope.stamp(note, seq, currentGameTime());
+        }
+        bufferedPrompts.add(note);
+        return seq;
+    }
+
+    /** Stamp a note without queueing it — for notes placed specially (index-0 snapshot, compaction fold). */
+    private String stampIfEvent(String note) {
+        return EventEnvelope.isStampable(note)
+                ? EventEnvelope.stamp(note, eventSeq.next(), currentGameTime())
+                : note;
+    }
+
+    /**
+     * The world's game time via the resolved client body, or {@code null} when the body
+     * is unloaded this instant (then the envelope simply omits {@code gameTime} — it is
+     * an optional envelope field, not worth a lookup fallback). Cheap: client levels
+     * carry the synced game time locally ({@code LevelAccessor.getGameTime()}).
+     */
+    private Long currentGameTime() {
+        AbstractClientPlayer body = resolveEntity();
+        return body != null ? body.level().getGameTime() : null;
+    }
+
+    /**
+     * §7 INFERENCE seam — commit a model inference as a first-class, append-only cognition
+     * event. Called by the tool pack's {@code commit_inference} client-local tool (via
+     * {@link AgentLoopRegistry#commitInference}): appends
+     * {@code <inference provenance="inferred">text</inference>} through the normal buffered
+     * tail channel — it is seq/schemaVersion/gameTime-stamped by the envelope choke point
+     * like every other event, and flushes into the conversation at the next protocol-valid
+     * boundary (for a mid-turn tool call: the very next turn). Returns the tool-result
+     * confirmation JSON (carrying the assigned seq). Client main thread only, like every
+     * loop mutation — the dispatcher invokes local tools there.
+     */
+    public String commitInference(String text) {
+        if (text == null || text.isBlank()) {
+            return "{\"success\":false,\"message\":\"empty inference text\"}";
+        }
+        if (dead) {
+            return "{\"success\":false,\"message\":\"body is dead — inference not committed\"}";
+        }
+        long seq = queueEventNote("<inference provenance=\"inferred\">" + escapeXmlText(text.strip())
+                + "</inference>");
+        Constants.LOG.info("[numen-entity#{}] inference committed (seq {}): {}",
+                entityUuid, seq, truncate(text, 120));
+        return "{\"success\":true,\"seq\":" + seq
+                + ",\"message\":\"推断已落账,将出现在你的下一轮上下文中\"}";
+    }
+
+    /** Minimal XML text escaping for event bodies we compose from free-form model text. */
+    private static String escapeXmlText(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;");
     }
 
     // ---- internals ----
@@ -699,7 +782,7 @@ public final class EntityAgentLoop {
         // callback is gated on the same generation so a superseded stream stops writing
         // the shared live-reasoning display (the active turn owns it).
         final int gen = turnGeneration;
-        NumenLlmClient.instance().chatStreaming(snapshot, tools, systemPrompt, effortOverride, null,
+        NumenLlmClient.instance().chatStreaming(entityUuid, snapshot, tools, systemPrompt, effortOverride, null,
                         s -> { if (gen == turnGeneration) liveReasoning = s; })
                 .whenComplete((res, err) -> bounceBackToMain(gen, res, err));
     }
@@ -756,7 +839,7 @@ public final class EntityAgentLoop {
         if (!tail.isBlank()) note.append('\n').append(tail);
         if (!finalText.isBlank()) note.append('\n').append(finalText);
         note.append("</system-reminder>");
-        bufferedPrompts.add(note.toString());
+        queueEventNote(note.toString());
         Constants.LOG.info("[numen-entity#{}] harvested preempted think ({} reasoning chars, {} text chars) → next turn",
                 entityUuid, reasoning.length(), finalText.length());
     }
@@ -808,7 +891,7 @@ public final class EntityAgentLoop {
                 entityUuid, auto ? "auto" : "manual", request.size() - 1);
         final int gen = turnGeneration;
         // No per-call effort override (null) → summarization uses the configured base effort.
-        NumenLlmClient.instance().chatStreaming(request, List.of(), COMPACT_SYSTEM_PROMPT, null, null, null)
+        NumenLlmClient.instance().chatStreaming(entityUuid, request, List.of(), COMPACT_SYSTEM_PROMPT, null, null, null)
                 .whenComplete((res, err) -> Minecraft.getInstance().execute(
                         () -> finishCompaction(gen, auto, res, err)));
     }
@@ -840,7 +923,7 @@ public final class EntityAgentLoop {
         // message rather than as a separate note — a lone snapshot after the summary user
         // message would be back-to-back user (some backends reject that). Constitution-safe:
         // still user-role tail content, and persisted together with the summary.
-        wrapped = wrapped + "\n\n" + buildContextSnapshotNote(resolveEntity());
+        wrapped = wrapped + "\n\n" + stampIfEvent(buildContextSnapshotNote(resolveEntity()));
         lastKnownDate = LocalDate.now();
         // Boundary into the JSONL first (relaunches replay the compacted view;
         // the raw pre-compaction history stays in the file as an archive), then
@@ -911,7 +994,8 @@ public final class EntityAgentLoop {
     private void appendWorldCognitionNotes() {
         AbstractClientPlayer body = resolveEntity();
         if (contextSnapshotPending) {
-            bufferedPrompts.add(0, buildContextSnapshotNote(body));   // context first
+            // Context first — stamped like any event, then placed at the head of the flush.
+            bufferedPrompts.add(0, stampIfEvent(buildContextSnapshotNote(body)));
             contextSnapshotPending = false;
             lastKnownDate = LocalDate.now();
             return;   // first turn: the snapshot IS the baseline; diffs resume next turn
@@ -925,7 +1009,7 @@ public final class EntityAgentLoop {
         // Date rollover — cheap once-per-turn check.
         LocalDate today = LocalDate.now();
         if (lastKnownDate != null && !today.equals(lastKnownDate)) {
-            bufferedPrompts.add("<system-reminder>今天是" + today + "。</system-reminder>");
+            queueEventNote("<system-reminder>今天是" + today + "。</system-reminder>");
             lastKnownDate = today;
         }
     }

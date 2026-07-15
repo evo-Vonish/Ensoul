@@ -106,18 +106,23 @@ public final class NumenPrompts {
 
     /**
      * The static "world-cognition protocol" — a constant explainer of how the
-     * append-only world knowledge reaches the model. It is deliberately <em>fixed
-     * forever</em> (no coordinates, no dates, no per-turn data) so it lives safely
-     * in the byte-frozen system prefix; the actual world facts arrive as tail events
-     * this text teaches the model to read. Kept short (~a dozen lines).
+     * append-only world knowledge reaches the model, including the §3 event
+     * envelope (seq / schemaVersion / gameTime / provenance) and the §8 trust
+     * rules ("同主题以最高 seq 为准", evidence ordering). It is deliberately
+     * <em>fixed at runtime</em> (no coordinates, no dates, no per-turn data) so it
+     * lives safely in the byte-frozen system prefix; the actual world facts arrive
+     * as tail events this text teaches the model to read. Kept short.
      */
     public static final String WORLD_COGNITION_PROTOCOL = """
             <world_cognition_protocol>
-            你对世界的了解不是每轮重写的固定清单,而是对话历史(尾部)里按时间顺序追加的“认知事件”。请据此在脑中重建当前世界的样子:
+            你对世界的了解不是每轮重写的固定清单,而是对话历史(尾部)里按时间顺序追加的“认知事件”。事件根标签统一携带信封属性:seq(全局单调序号)、schemaVersion、gameTime(可用时)、provenance(observed|reported|inferred|system;缺省即 observed)。请据此在脑中重建当前世界的样子:
 
             - <landmark_event type="added|removed|repurposed|renamed|position_corrected" id="lm_xxx">:一处重要地标(熔炉、箱子、工作台、传送门等)发生了语义变化。added=新发现;removed=已在现场确认被破坏;repurposed/renamed/position_corrected=更正。同一 id 后来的事件覆盖较早的,但较早的事件不会被删改——按顺序读即可。
             - kind="context_snapshot" 的提示:某一时刻你已知地标的完整清单(按维度分组),是你重建认知的基线。压缩(compact)之后会再给你一份。
             - REGION_SNAPSHOT / REGION_DIFF(后续版本引入):某一区域被观察到的样子及其后续变化。
+            - <inference>:一条被显式落账的推断(provenance="inferred"),不是直接观测;之后的观测事件可以证实或反驳它——以追加方式,不回改。
+            - <system_notice>:系统发出的纠偏或运行时变更通知(如时间变更);同一问题出现新的 notice 时,以新的为准。
+            - 取信规则:同主题以最高 seq 为准;同区域以最高版本快照为准;证据强度 observed > reported > inferred。
             - 陈旧性:没有被重新观察的知识可能已过时,但在被新的观察推翻之前仍然有效。“你曾在此见过 X”不等于“X 现在还在”。距离远或区块未加载都不构成“已消失”的证据——只有现场可验证的变化才会产生 removed 事件。
 
             这些事件是你的记忆,不是主人此刻的指令。

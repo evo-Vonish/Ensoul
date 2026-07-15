@@ -19,7 +19,9 @@ import net.minecraft.client.player.AbstractClientPlayer;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -115,8 +117,21 @@ public final class EntityAgentLoop {
     /** JSONL persistence under {@code config/numen/conversations/<uuid>.jsonl}. */
     private final ConvoLog log;
     private final ConvoState convo;
-    /** Functional-block coordinate memory, injected as {@code <known_blocks>}. */
-    private final WorkBlockMemory workBlocks;
+    /**
+     * L1 landmark memory (canonical disk state) + its append-only tail emitter. World
+     * knowledge no longer sits in the system prefix; it accrues as {@code <landmark_event>}
+     * tail notes and periodic context snapshots (append-only world-cognition design).
+     */
+    private final LandmarkStore landmarks;
+    private final LandmarkEventEmitter landmarkEmitter;
+    /**
+     * True until the first per-session context snapshot has been laid down (and re-armed
+     * right after each compaction). Drives the one-shot {@code context_snapshot} note that
+     * gives the model the full current landmark baseline; diffs resume from there.
+     */
+    private boolean contextSnapshotPending = true;
+    /** Session date baseline; a mid-session rollover appends a small "今天是…" tail note. */
+    private java.time.LocalDate lastKnownDate;
     /**
      * Prompts the owner typed while a turn was still in flight (waiting on the
      * LLM, or on outstanding tool results). They must NOT be spliced into the
@@ -172,8 +187,38 @@ public final class EntityAgentLoop {
      * equivalent of Claude Code spinning up a fresh {@code AbortController} per
      * turn: an in-flight HTTP response from an interrupted turn must never be
      * spliced back into the conversation or dispatch its tool calls.
+     *
+     * <p>Also bumped by an <em>emergency preemption</em> ({@link #preemptWithEmergencyTurn}):
+     * when an urgent event arrives while a slow think is streaming, we supersede that
+     * think with a fast emergency turn. {@code volatile} because the gated
+     * {@code onReasoning} callback reads it from the HTTP thread to decide whether its
+     * stream still owns the live-reasoning display.
      */
-    private int turnGeneration = 0;
+    private volatile int turnGeneration = 0;
+
+    /**
+     * Set true when an urgent injected event ({@link #injectEvent} with {@code urgent})
+     * is what will start the next turn — so that turn runs at emergency effort. Remembers
+     * <em>why</em> a turn started across the buffer/flush boundary (the urgent flag itself
+     * is otherwise consumed by {@link #tryStartTurn} only as a wake-up). Consumed (cleared)
+     * the moment the emergency turn is dispatched: tool-chain continuations after it are
+     * ordinary turns at the base effort.
+     */
+    private boolean pendingUrgent = false;
+
+    /**
+     * Generations superseded by an emergency preemption whose in-flight response we still
+     * want to <em>harvest</em> (its accumulated reasoning + any final text) when it lands,
+     * as opposed to an owner-/death-interrupt where the discarded response is simply dropped.
+     * {@link #handleResponse} removes the entry as it harvests. Main-thread only.
+     */
+    private final Set<Integer> preemptedGenerations = new HashSet<>();
+
+    /** Cap on the harvested reasoning tail folded into the next turn's context note (chars). */
+    private static final int HARVEST_REASONING_CAP = 2000;
+
+    /** Assistant-message extras keys under which backends stream their reasoning transcript. */
+    private static final String[] REASONING_EXTRA_KEYS = {"reasoning_content", "reasoning"};
 
     /**
      * The current turn's live reasoning transcript, streamed in from the LLM's
@@ -210,10 +255,13 @@ public final class EntityAgentLoop {
                 .resolve("config").resolve("numen");
         this.log = ConvoLog.forEntity(numenRoot.resolve("conversations"), entityUuid);
         this.convo = new ConvoState(log::append);
-        this.workBlocks = WorkBlockMemory.forEntity(numenRoot.resolve("memory"), entityUuid);
+        this.landmarks = LandmarkStore.forEntity(numenRoot.resolve("memory"), entityUuid);
+        // The emitter appends landmark events onto the same buffered user-role tail the
+        // owner's prompts ride, so they splice in at the next protocol-valid boundary.
+        this.landmarkEmitter = new LandmarkEventEmitter(bufferedPrompts::add);
         this.dispatcher = new ToolDispatcher(entityUuid, new ToolDispatcher.Sink() {
             @Override public void onResult(ToolInvocation inv, String resultJson) {
-                harvestWorkBlocks(inv.name(), resultJson);
+                harvestLandmarks(inv.name(), resultJson);
                 convo.addToolResult(inv.id(), resultJson);
             }
             @Override public void onAllSettled() {
@@ -311,15 +359,16 @@ public final class EntityAgentLoop {
     }
 
     /**
-     * Pull functional-block coordinates out of successful tool results into
-     * {@link WorkBlockMemory}. The results already carry them — place_block
-     * reports the block it placed, interact_at reports the station it activated
-     * (a chest/furnace/table it opened) — this just stops the loop from
-     * forgetting them once the result scrolls out of context. Both tools report
-     * the same {@code block} + {@code x/y/z} shape; {@code workBlocks.record}
-     * filters to tracked station types, so non-station interactions fall away.
+     * Pull functional-block coordinates out of successful tool results into the
+     * {@link LandmarkStore}. The results already carry them — place_block reports the
+     * block it placed, interact_at reports the station it activated (a chest/furnace/table
+     * it opened) — this just stops the loop from forgetting them once the result scrolls
+     * out of context. Both tools report the same {@code block} + {@code x/y/z} shape;
+     * {@code landmarks.record} filters to tracked station types (non-stations fall away),
+     * updates disk-only on a re-use, and queues an {@code added}/{@code repurposed} event
+     * for a genuine change — emitted at the next turn boundary.
      */
-    private void harvestWorkBlocks(String toolName, String resultJson) {
+    private void harvestLandmarks(String toolName, String resultJson) {
         try {
             JsonObject root = JsonParser.parseString(resultJson).getAsJsonObject();
             if (!root.has("success") || !root.get("success").getAsBoolean()) return;
@@ -330,19 +379,20 @@ public final class EntityAgentLoop {
             switch (toolName) {
                 case "place_block", "interact_at" -> {
                     if (data.has("block") && data.has("x")) {
-                        String path = data.get("block").getAsString();
-                        int colon = path.indexOf(':');
-                        if (colon >= 0) path = path.substring(colon + 1);
-                        workBlocks.record(path, new net.minecraft.core.BlockPos(
+                        String kind = data.get("block").getAsString();   // full block id, e.g. minecraft:furnace
+                        AbstractClientPlayer body = resolveEntity();
+                        String dim = body != null
+                                ? body.level().dimension().identifier().toString() : null;
+                        landmarks.record(kind, new net.minecraft.core.BlockPos(
                                 data.get("x").getAsInt(),
                                 data.get("y").getAsInt(),
-                                data.get("z").getAsInt()));
+                                data.get("z").getAsInt()), dim);
                     }
                 }
                 default -> { /* nothing to harvest */ }
             }
         } catch (RuntimeException ex) {
-            Constants.LOG.debug("[numen-entity#{}] work-block harvest skipped: {}",
+            Constants.LOG.debug("[numen-entity#{}] landmark harvest skipped: {}",
                     entityUuid, ex.toString());
         }
     }
@@ -403,6 +453,8 @@ public final class EntityAgentLoop {
             // Priority 1: stop the running turn (or the in-flight compaction —
             // its response is generation-stamped too, so it gets discarded).
             turnGeneration++; // any in-flight LLM response is now stale → discarded on arrival
+            preemptedGenerations.clear(); // owner interrupt → drop any pending harvest, don't fold it in
+            pendingUrgent = false;        // an owner interrupt cancels a pending urgent classification
             boolean wasAwaitingLlm = awaitingLlmResponse;
             awaitingLlmResponse = false;
             compacting = false;
@@ -463,6 +515,8 @@ public final class EntityAgentLoop {
         // are listed in the assistant message, so all need results.
         deathInterruptedCalls = dispatcher.cancelAndDrain();
         turnGeneration++;          // discard any in-flight LLM response (halt output)
+        preemptedGenerations.clear(); // death drops any pending harvest — the loop is frozen
+        pendingUrgent = false;
         awaitingLlmResponse = false;
         compacting = false;
         liveReasoning = "";        // the dead turn's live thinking is gone too
@@ -515,7 +569,16 @@ public final class EntityAgentLoop {
         Constants.LOG.info("[numen-entity#{}] event queued{}: {}",
                 entityUuid, urgent ? " (urgent)" : "", truncate(xml, 120));
         if (urgent) {
-            tryStartTurn();
+            // Remember this turn is urgent-triggered → it runs at emergency effort, even
+            // if it can't start until a mid-flight tool chain / compaction settles.
+            pendingUrgent = true;
+            if (awaitingLlmResponse && !dispatcher.busy() && !compacting) {
+                // A slow think is streaming and nothing has been appended for it yet:
+                // supersede it NOW with a fast emergency turn rather than waiting it out.
+                preemptWithEmergencyTurn();
+            } else {
+                tryStartTurn();
+            }
         }
     }
 
@@ -565,6 +628,11 @@ public final class EntityAgentLoop {
         // Safe point: no assistant reply in flight and no tool results
         // outstanding, so the conversation ends with either a tool result or a
         // final assistant message — a user message can now be appended legally.
+        // Fold in world-cognition tail notes (first-session snapshot / landmark
+        // events / date rollover) only when a turn is actually going to run.
+        if (!bufferedPrompts.isEmpty() || !convo.snapshot().isEmpty()) {
+            appendWorldCognitionNotes();
+        }
         flushBufferedPrompts();
         if (convo.snapshot().isEmpty()) return;
         // No hard cap on tool-call turns and no loop guard — a capable agent
@@ -594,6 +662,24 @@ public final class EntityAgentLoop {
             return;
         }
 
+        // This turn runs at emergency effort iff it was started by an urgent event
+        // (consume the flag — any continuation turns after it are ordinary/base effort).
+        boolean emergency = pendingUrgent;
+        pendingUrgent = false;
+        dispatchLlmTurn(emergency);
+    }
+
+    /**
+     * Fire the streaming LLM call for one turn on the current conversation. Shared by the
+     * normal path ({@link #tryStartTurn}) and the emergency preemption path
+     * ({@link #preemptWithEmergencyTurn}). An {@code emergency} turn runs at the configured
+     * {@code emergencyEffort} (default {@code "off"}) so a reaction lands fast; a normal turn
+     * passes no override and falls back to the client's configured base effort. The captured
+     * generation stamps the response: if the turn is superseded (owner interrupt, death, or a
+     * newer emergency preemption) before it lands, {@link #handleResponse} discards it, and the
+     * gated {@code onReasoning} stops the stale stream from writing the live display.
+     */
+    private void dispatchLlmTurn(boolean emergency) {
         convo.incrementTurn();
         awaitingLlmResponse = true;
 
@@ -601,15 +687,95 @@ public final class EntityAgentLoop {
         var snapshot = convo.snapshot();
         INumenConfig config = Services.CONFIG;
         String systemPrompt = composeSystemPrompt(config.getSystemPrompt());
+        // Emergency → emergencyEffort override (e.g. "off"); normal → null (use base config).
+        String effortOverride = emergency ? config.getEmergencyEffort() : null;
 
-        Constants.LOG.info("[numen-entity#{}] turn {}: convo={} msgs, tools={}",
-                entityUuid, convo.turnCount(), snapshot.size(), tools.size());
+        Constants.LOG.info("[numen-entity#{}] turn {}: convo={} msgs, tools={}, effort={}",
+                entityUuid, convo.turnCount(), snapshot.size(), tools.size(),
+                emergency ? "EMERGENCY(" + effortOverride + ")" : "base");
 
-        // Capture the current generation; if the owner interrupts before this
-        // call resolves, handleResponse sees the mismatch and discards it.
+        // Capture the current generation; if the turn is superseded before this call
+        // resolves, handleResponse sees the mismatch and discards it. The onReasoning
+        // callback is gated on the same generation so a superseded stream stops writing
+        // the shared live-reasoning display (the active turn owns it).
         final int gen = turnGeneration;
-        NumenLlmClient.instance().chatStreaming(snapshot, tools, systemPrompt, null, s -> liveReasoning = s)
+        NumenLlmClient.instance().chatStreaming(snapshot, tools, systemPrompt, effortOverride, null,
+                        s -> { if (gen == turnGeneration) liveReasoning = s; })
                 .whenComplete((res, err) -> bounceBackToMain(gen, res, err));
+    }
+
+    /**
+     * An urgent event arrived while a slow think was streaming — supersede it with a fast
+     * emergency turn. The in-flight response has appended nothing yet, so the conversation is
+     * a protocol-valid base for a new turn. We bump {@link #turnGeneration} (the superseded
+     * response is discarded — and harvested — when it lands), flush the urgent event in as the
+     * new user message, and dispatch an emergency-effort turn in its place.
+     *
+     * <p>The superseded stream keeps running to completion (the JDK HTTP client offers no clean
+     * mid-stream cancel), but it is inert: its response fails the generation check so it neither
+     * executes tools nor appends an assistant message, and its {@code onReasoning} is gated off.
+     * When it lands we harvest its thinking into a note for the next turn (see
+     * {@link #harvestPreemptedTurn}).
+     */
+    private void preemptWithEmergencyTurn() {
+        int supersededGen = turnGeneration;
+        preemptedGenerations.add(supersededGen);
+        turnGeneration++;                    // in-flight response now stale → discarded + harvested on arrival
+        pendingUrgent = false;               // consumed: this emergency turn IS the urgent reaction
+        liveReasoning = "";                  // drop the superseded think's live display; the emergency turn owns it now
+        // Keep the convo protocol-valid: if the superseded turn's trigger is still the trailing
+        // user message, appending the urgent event would create back-to-back user messages (some
+        // backends reject those). Cap it with the same marker the owner-interrupt path uses.
+        if (convo.lastMessage() instanceof ConvoState.Msg.User) {
+            convo.addAssistant(new AssistantTurn("(被紧急事件打断)", List.of(), null));
+        }
+        Constants.LOG.info("[numen-entity#{}] URGENT preempt: superseding in-flight think (gen {} → {})",
+                entityUuid, supersededGen, turnGeneration);
+        flushBufferedPrompts();              // urgent event (+ any queued) → one user message
+        dispatchLlmTurn(true);               // emergency effort, on the bumped generation
+    }
+
+    /**
+     * Fold a superseded (emergency-preempted) turn's thinking into a note for the next turn, so
+     * the newest reasoning the model produced before the interruption isn't simply lost. Rides
+     * the ordinary buffered-prompt path (non-urgent) as an appended user-role
+     * {@code <system-reminder>} — constitution-conform tail append, never a mid-conversation
+     * system message. The reasoning tail is capped to {@link #HARVEST_REASONING_CAP} chars,
+     * truncated from the FRONT so the newest thinking is kept. No-op when there is nothing to keep.
+     */
+    private void harvestPreemptedTurn(AssistantTurn turn) {
+        String reasoning = extractReasoning(turn.extras());
+        String finalText = turn.content() == null ? "" : turn.content();
+        if (reasoning.isBlank() && finalText.isBlank()) {
+            Constants.LOG.info("[numen-entity#{}] preempted turn had nothing to harvest", entityUuid);
+            return;
+        }
+        String tail = frontTruncate(reasoning, HARVEST_REASONING_CAP);
+        StringBuilder note = new StringBuilder(
+                "<system-reminder>你上一轮被紧急事件打断,当时未执行的思考如下(仅供参考,其动作未生效):");
+        if (!tail.isBlank()) note.append('\n').append(tail);
+        if (!finalText.isBlank()) note.append('\n').append(finalText);
+        note.append("</system-reminder>");
+        bufferedPrompts.add(note.toString());
+        Constants.LOG.info("[numen-entity#{}] harvested preempted think ({} reasoning chars, {} text chars) → next turn",
+                entityUuid, reasoning.length(), finalText.length());
+    }
+
+    /** Pull the reasoning transcript out of an assistant turn's round-tripped extras ({@code ""} if none). */
+    private static String extractReasoning(com.google.gson.JsonObject extras) {
+        if (extras == null) return "";
+        for (String key : REASONING_EXTRA_KEYS) {
+            var el = extras.get(key);
+            if (el != null && el.isJsonPrimitive()) return el.getAsString();
+        }
+        return "";
+    }
+
+    /** Keep the last {@code maxChars} characters (newest reasoning), marking a front elision with an ellipsis. */
+    private static String frontTruncate(String s, int maxChars) {
+        if (s == null) return "";
+        if (s.length() <= maxChars) return s;
+        return "…" + s.substring(s.length() - maxChars);
     }
 
     // ---- compaction ----
@@ -641,7 +807,8 @@ public final class EntityAgentLoop {
         Constants.LOG.info("[numen-entity#{}] compaction started ({}, {} msgs)",
                 entityUuid, auto ? "auto" : "manual", request.size() - 1);
         final int gen = turnGeneration;
-        NumenLlmClient.instance().chatStreaming(request, List.of(), COMPACT_SYSTEM_PROMPT, null, null)
+        // No per-call effort override (null) → summarization uses the configured base effort.
+        NumenLlmClient.instance().chatStreaming(request, List.of(), COMPACT_SYSTEM_PROMPT, null, null, null)
                 .whenComplete((res, err) -> Minecraft.getInstance().execute(
                         () -> finishCompaction(gen, auto, res, err)));
     }
@@ -668,6 +835,13 @@ public final class EntityAgentLoop {
         }
 
         String wrapped = SUMMARY_HEADER + summary.strip();
+        // Right after compaction, re-lay the world-cognition baseline so the model regains
+        // full landmark state (diffs resume from here). Folded into the SAME summary user
+        // message rather than as a separate note — a lone snapshot after the summary user
+        // message would be back-to-back user (some backends reject that). Constitution-safe:
+        // still user-role tail content, and persisted together with the summary.
+        wrapped = wrapped + "\n\n" + buildContextSnapshotNote(resolveEntity());
+        lastKnownDate = LocalDate.now();
         // Boundary into the JSONL first (relaunches replay the compacted view;
         // the raw pre-compaction history stays in the file as an archive), then
         // swap the in-memory history without re-notifying the sink.
@@ -685,40 +859,95 @@ public final class EntityAgentLoop {
         if (auto || !bufferedPrompts.isEmpty()) tryStartTurn();
     }
 
+    /**
+     * Build the <strong>byte-frozen</strong> system prefix: base config prompt + the static
+     * {@code ENTITY_PROMPT} + a session-constant {@code <env>} (owner name + entity uuid) +
+     * the static world-cognition protocol + the (stable) skills XML. Everything here is
+     * constant for the session, so the prompt cache prefix never moves. Volatile world state
+     * — dimension, today's date, the landmark list — is deliberately NOT here; it arrives as
+     * append-only tail notes (context snapshot, {@code <landmark_event>}, date rollover).
+     */
     private String composeSystemPrompt(String basePrompt) {
         String base = basePrompt == null ? "" : basePrompt;
-        String envBlock = buildEnvBlock();
-        AbstractClientPlayer body = resolveEntity();
-        String knownBlocks = workBlocks.formatXml(body != null ? body.level() : null);
         String skillsXml = SkillRegistry.instance().formatXml();
 
         StringBuilder sb = new StringBuilder();
         if (!base.isBlank()) sb.append(base);
         sb.append(ENTITY_PROMPT);
-        if (envBlock != null) {
-            sb.append("\n\n").append(envBlock);
-        }
-        if (!knownBlocks.isEmpty()) {
-            sb.append("\n\n").append(knownBlocks);
-        }
+        sb.append("\n\n").append(buildStaticEnvBlock());
+        sb.append("\n\n").append(com.dwinovo.numen.agent.prompt.NumenPrompts.WORLD_COGNITION_PROTOCOL);
         if (!skillsXml.isEmpty()) {
             sb.append("\n\n").append(skillsXml);
         }
         return sb.toString();
     }
 
-    private String buildEnvBlock() {
-        AbstractClientPlayer entity = resolveEntity();
-        if (entity == null) return null;
-        // The brain runs on the owner's client, so the local player IS the owner.
+    /**
+     * The session-constant {@code <env>}: only fields that never change for this loop's
+     * lifetime — the companion's uuid and its owner's name (the brain runs on the owner's
+     * client, so the local player IS the owner). No dimension, no date (those jitter the
+     * prefix and now ride the tail instead).
+     */
+    private String buildStaticEnvBlock() {
         var localOwner = Minecraft.getInstance().player;
         String ownerName = localOwner != null ? localOwner.getName().getString() : "unknown";
         return "<env>\n"
                 + "  entity_uuid: " + entityUuid + "\n"
                 + "  owner_name: " + ownerName + "\n"
-                + "  dimension: " + entity.level().dimension().identifier() + "\n"
-                + "  today: " + LocalDate.now() + "\n"
                 + "</env>";
+    }
+
+    /**
+     * Append world-cognition tail notes at a turn boundary (called just before the buffered
+     * prompts flush, so they merge into the same user-role message):
+     * <ul>
+     *   <li>first turn of a session → a full {@code context_snapshot} note (baseline);</li>
+     *   <li>otherwise → self-heal the landmark store and emit any queued
+     *       {@code <landmark_event>}s (added during the prior turn's harvest, removed by
+     *       verification now);</li>
+     *   <li>a mid-session date rollover → a small "今天是…" note.</li>
+     * </ul>
+     */
+    private void appendWorldCognitionNotes() {
+        AbstractClientPlayer body = resolveEntity();
+        if (contextSnapshotPending) {
+            bufferedPrompts.add(0, buildContextSnapshotNote(body));   // context first
+            contextSnapshotPending = false;
+            lastKnownDate = LocalDate.now();
+            return;   // first turn: the snapshot IS the baseline; diffs resume next turn
+        }
+        // Ongoing: verify against the live world (queues removed events), then emit
+        // everything accumulated since the last boundary (added + removed) as tail notes.
+        if (body != null) {
+            landmarks.verify(body.level(), body.level().dimension().identifier().toString());
+        }
+        landmarkEmitter.emit(landmarks.drainEvents());
+        // Date rollover — cheap once-per-turn check.
+        LocalDate today = LocalDate.now();
+        if (lastKnownDate != null && !today.equals(lastKnownDate)) {
+            bufferedPrompts.add("<system-reminder>今天是" + today + "。</system-reminder>");
+            lastKnownDate = today;
+        }
+    }
+
+    /**
+     * Build the one-shot {@code context_snapshot} tail note: today's date + current dimension
+     * + the full landmark baseline (grouped by dimension). Self-heals first so the baseline is
+     * accurate, then discards the verify-produced events (they're folded into the snapshot,
+     * not emitted separately). Used on the first session turn and, inline, right after a compaction.
+     */
+    private String buildContextSnapshotNote(AbstractClientPlayer body) {
+        String dim = body != null ? body.level().dimension().identifier().toString() : "unknown";
+        if (body != null) {
+            landmarks.verify(body.level(), dim);
+            landmarks.drainEvents();   // baseline: reflected in the snapshot, not emitted twice
+        }
+        String landmarkBody = landmarks.renderSnapshotBody();
+        StringBuilder sb = new StringBuilder("<system-reminder kind=\"context_snapshot\">今天是");
+        sb.append(LocalDate.now()).append("。当前维度:").append(dim).append("。");
+        sb.append(landmarkBody.isEmpty() ? "(暂无已知地标)" : "\n" + landmarkBody);
+        sb.append("</system-reminder>");
+        return sb.toString();
     }
 
     private AbstractClientPlayer resolveEntity() {
@@ -739,9 +968,14 @@ public final class EntityAgentLoop {
         // started, awaitingLlmResponse belongs to *that* call). Discard wholesale
         // — do NOT touch awaitingLlmResponse here, or we'd clear the newer turn's.
         if (gen != turnGeneration) {
-            Constants.LOG.info("[numen-entity#{}] discarding interrupted LLM response (gen {} != {})",
+            Constants.LOG.info("[numen-entity#{}] discarding superseded LLM response (gen {} != {})",
                     entityUuid, gen, turnGeneration);
-            liveReasoning = "";
+            // If this was superseded by an emergency preemption (not an owner/death interrupt),
+            // harvest its thinking for the next turn. Do NOT touch liveReasoning: it now belongs
+            // to the active turn (a later emergency turn may already be streaming into it).
+            if (preemptedGenerations.remove(gen) && res != null && res.turn() != null) {
+                harvestPreemptedTurn(res.turn());
+            }
             return;
         }
         awaitingLlmResponse = false;

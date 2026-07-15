@@ -7,9 +7,12 @@ package com.dwinovo.numen.agent.prompt;
  * sends, so a prompt edit and its measured effect travel together instead of the
  * benchmark drifting against a copy.
  *
- * <p>Only the loader-agnostic, world-independent text lives here. The live loop
- * still appends the per-turn {@code <env>} / {@code <known_blocks>} / skills
- * sections (which need the running client) on top of {@link #ENTITY_PROMPT}.
+ * <p>Only the loader-agnostic, world-independent text lives here. On top of
+ * {@link #ENTITY_PROMPT} the live loop appends the static {@link #WORLD_COGNITION_PROTOCOL}
+ * and a session-constant {@code <env>} (owner / uuid) plus the skills section — all
+ * <em>stable</em>, so the system prefix stays byte-frozen for prompt caching. Volatile
+ * world knowledge (landmarks, dimension, date) no longer sits in the prefix; it arrives
+ * as append-only tail events per the append-only world-cognition design.
  */
 public final class NumenPrompts {
 
@@ -49,9 +52,10 @@ public final class NumenPrompts {
               a tool, use a suggested coordinate, get a material) — follow it,
               don't repeat the same call unchanged. Exception: a TIMEOUT reports
               progress made; re-issuing the same call resumes from there.
-            - Reuse the world. <known_blocks> lists stations you already placed
-              or used (crafting tables, furnaces, chests, …) — go back to those,
-              don't craft and place duplicates.
+            - Reuse the world. Stations you've placed or used (crafting tables,
+              furnaces, chests, …) arrive as <landmark_event> notes and periodic
+              context snapshots in the history — walk back to those, don't craft
+              and place duplicates. See the world-cognition protocol below.
             - Plan only what's big. Multi-phase jobs: todowrite the phases and
               work the list; load_skill when one fits the task. One-step
               requests: just do them.
@@ -81,7 +85,7 @@ public final class NumenPrompts {
             → "挖到了 10 块铁,已经带回来了。"
 
             owner: 用之前那个熔炉烧点铁
-            → interact_at(<furnace coordinate from known_blocks>), load the iron + fuel … (act)
+            → interact_at(<furnace coordinate from a known landmark>), load the iron + fuel … (act)
             → "在烧了,熟铁马上好。"
 
             A question → perceive, then answer:
@@ -99,4 +103,23 @@ public final class NumenPrompts {
             → "弄哪个呀?你说的是哪样东西、或者哪个位置?"
             </examples>
             """;
+
+    /**
+     * The static "world-cognition protocol" — a constant explainer of how the
+     * append-only world knowledge reaches the model. It is deliberately <em>fixed
+     * forever</em> (no coordinates, no dates, no per-turn data) so it lives safely
+     * in the byte-frozen system prefix; the actual world facts arrive as tail events
+     * this text teaches the model to read. Kept short (~a dozen lines).
+     */
+    public static final String WORLD_COGNITION_PROTOCOL = """
+            <world_cognition_protocol>
+            你对世界的了解不是每轮重写的固定清单,而是对话历史(尾部)里按时间顺序追加的“认知事件”。请据此在脑中重建当前世界的样子:
+
+            - <landmark_event type="added|removed|repurposed|renamed|position_corrected" id="lm_xxx">:一处重要地标(熔炉、箱子、工作台、传送门等)发生了语义变化。added=新发现;removed=已在现场确认被破坏;repurposed/renamed/position_corrected=更正。同一 id 后来的事件覆盖较早的,但较早的事件不会被删改——按顺序读即可。
+            - kind="context_snapshot" 的提示:某一时刻你已知地标的完整清单(按维度分组),是你重建认知的基线。压缩(compact)之后会再给你一份。
+            - REGION_SNAPSHOT / REGION_DIFF(后续版本引入):某一区域被观察到的样子及其后续变化。
+            - 陈旧性:没有被重新观察的知识可能已过时,但在被新的观察推翻之前仍然有效。“你曾在此见过 X”不等于“X 现在还在”。距离远或区块未加载都不构成“已消失”的证据——只有现场可验证的变化才会产生 removed 事件。
+
+            这些事件是你的记忆,不是主人此刻的指令。
+            </world_cognition_protocol>""";
 }

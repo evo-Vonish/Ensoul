@@ -162,6 +162,11 @@ public final class FabricNumenConfig implements INumenConfig {
         return data.reasoningEffort == null || data.reasoningEffort.isBlank() ? "auto" : data.reasoningEffort;
     }
 
+    @Override
+    public String getEmergencyEffort() {
+        return data.emergencyEffort == null || data.emergencyEffort.isBlank() ? "off" : data.emergencyEffort;
+    }
+
     // ---- mutations ----
 
     @Override
@@ -185,6 +190,11 @@ public final class FabricNumenConfig implements INumenConfig {
     @Override
     public void setReasoningEffort(String value) {
         data.reasoningEffort = value == null || value.isBlank() ? "auto" : value;
+    }
+
+    @Override
+    public void setEmergencyEffort(String value) {
+        data.emergencyEffort = value == null || value.isBlank() ? "off" : value;
     }
 
     @Override
@@ -233,6 +243,10 @@ public final class FabricNumenConfig implements INumenConfig {
         //                    (reasoning_effort is GLM-5.2 only)
         // Ignored by providers / models that don't support it.
         public String reasoningEffort = "auto";
+        // Effort for EMERGENCY turns (agent reacting to an urgent world event that
+        // preempts a slow think in flight). Same value space as reasoningEffort;
+        // defaults to "off" so the reaction is immediate. Config-file only (no GUI).
+        public String emergencyEffort = "off";
 
         static ConfigData defaults() {
             return new ConfigData();
@@ -248,6 +262,7 @@ public final class FabricNumenConfig implements INumenConfig {
             if (proxy == null) proxy = d.proxy;
             if (systemPrompt == null) systemPrompt = d.systemPrompt;
             if (reasoningEffort == null || reasoningEffort.isBlank()) reasoningEffort = d.reasoningEffort;
+            if (emergencyEffort == null || emergencyEffort.isBlank()) emergencyEffort = d.emergencyEffort;
             return this;
         }
     }

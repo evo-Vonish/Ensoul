@@ -28,6 +28,7 @@ public final class NeoForgeNumenConfig implements INumenConfig {
     public static final ModConfigSpec.ConfigValue<String> PROXY;
     public static final ModConfigSpec.ConfigValue<String> SYSTEM_PROMPT;
     public static final ModConfigSpec.ConfigValue<String> REASONING_EFFORT;
+    public static final ModConfigSpec.ConfigValue<String> EMERGENCY_EFFORT;
     public static final ModConfigSpec SPEC;
 
     static {
@@ -73,6 +74,12 @@ public final class NeoForgeNumenConfig implements INumenConfig {
                 "off → disable thinking (glm-4.5+). Effort values: minimal | low | medium | high (GLM-5.2 only).",
                 "Ignored by providers / models that don't support it.")
                 .define("reasoning_effort", "auto");
+        EMERGENCY_EFFORT = b.comment(
+                "Reasoning effort for EMERGENCY turns — the agent reacting to an urgent world event",
+                "(an incoming attack, a hazard) that preempts a slow think already in flight.",
+                "off (default) → react immediately with no thinking. Same value space as reasoning_effort.",
+                "Ignored by providers / models that don't support it.")
+                .define("emergency_effort", "off");
         b.pop();
 
         SPEC = b.build();
@@ -118,6 +125,12 @@ public final class NeoForgeNumenConfig implements INumenConfig {
         return s.isEmpty() ? "auto" : s;
     }
 
+    @Override
+    public String getEmergencyEffort() {
+        String s = safe(EMERGENCY_EFFORT);
+        return s.isEmpty() ? "off" : s;
+    }
+
     // ---- mutations ----
 
     @Override
@@ -153,6 +166,11 @@ public final class NeoForgeNumenConfig implements INumenConfig {
     @Override
     public void setReasoningEffort(String value) {
         REASONING_EFFORT.set(value == null || value.isBlank() ? "auto" : value);
+    }
+
+    @Override
+    public void setEmergencyEffort(String value) {
+        EMERGENCY_EFFORT.set(value == null || value.isBlank() ? "off" : value);
     }
 
     /**

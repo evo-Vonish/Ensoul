@@ -136,6 +136,19 @@ public final class NumenLlmClient {
     public record ChatResult(AssistantTurn turn, int promptTokens, int totalTokens) {}
 
     /**
+     * Streaming chat completion at the configured reasoning effort. Convenience
+     * overload — delegates to {@link #chatStreaming(List, Collection, String, String,
+     * Consumer, Consumer)} with no per-call effort override (falls back to config).
+     */
+    public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
+                                                       Collection<NumenTool> tools,
+                                                       String systemPrompt,
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
+        return chatStreaming(messages, tools, systemPrompt, null, onChunk, onReasoning);
+    }
+
+    /**
      * Streaming chat completion. Returns a future of the final
      * {@link ChatResult} — the {@link AssistantTurn} built up from all SSE
      * chunks via the provider's accumulator, plus reported token usage.
@@ -144,6 +157,13 @@ public final class NumenLlmClient {
      * @param tools          tool list (provider serialises to wire shape;
      *                       empty = no tools field, e.g. for summarization calls)
      * @param systemPrompt   prepended automatically — pass empty / null to skip
+     * @param effortOverride per-call reasoning-effort override (e.g. {@code "off"}
+     *                       for an emergency turn that must react fast). Null or
+     *                       blank means "use the client's configured effort" — a
+     *                       real value like {@code "off"} / {@code "low"} passes
+     *                       through as-is. Forwarded to the provider's
+     *                       {@code applyReasoning}; no-op for providers/models
+     *                       without a reasoning knob.
      * @param onChunk        optional per-chunk callback (e.g. for live UI).
      *                       Receives the raw provider chunk JSON. May be null.
      * @param onReasoning    optional live-reasoning callback. Fired (on the HTTP
@@ -154,6 +174,7 @@ public final class NumenLlmClient {
     public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
                                                        Collection<NumenTool> tools,
                                                        String systemPrompt,
+                                                       String effortOverride,
                                                        Consumer<JsonObject> onChunk,
                                                        Consumer<String> onReasoning) {
         // -- 1. Build wire-format messages and tool list via provider.
@@ -180,17 +201,26 @@ public final class NumenLlmClient {
         JsonArray toolList = provider.buildToolList(tools);
         JsonObject body = provider.buildRequestBody(model, systemPrompt, wire, toolList);
         // Reasoning-effort knob (provider-specific; no-op unless the provider
-        // supports it AND the configured effort/model warrant it).
-        provider.applyReasoning(body, model, reasoningEffort);
+        // supports it AND the configured effort/model warrant it). A per-call
+        // override wins when supplied (blank/null falls back to the configured
+        // effort); a real value like "off" — an emergency turn — passes through.
+        String effort = (effortOverride == null || effortOverride.isBlank())
+                ? reasoningEffort : effortOverride;
+        provider.applyReasoning(body, model, effort);
         // One INFO line per request stating the effort actually configured, tagged with
         // the same lr-N id the transport will use — so the game log shows exactly what
         // reached the wire (reserve the id here; the transport reuses it below).
         String requestId = HttpLlmTransport.nextRequestId();
-        boolean effortAuto = reasoningEffort == null || reasoningEffort.isBlank()
-                || reasoningEffort.equalsIgnoreCase("auto");
+        boolean effortAuto = effort == null || effort.isBlank()
+                || effort.equalsIgnoreCase("auto");
         Constants.LOG.info("[numen-llm] {} reasoning: effort={} ({}, {})",
-                requestId, effortAuto ? "none/provider-default" : reasoningEffort,
+                requestId, effortAuto ? "none/provider-default" : effort,
                 provider.name(), model);
+        // Cache-regression hook: hash the byte-frozen prompt prefix (serialized tools array +
+        // system message content). With the append-only world-cognition design this must stay
+        // constant across turns that add no structural new knowledge — grep one companion's
+        // lr-N lines and watch prefixHash to catch a prefix that started jittering.
+        Constants.LOG.info("[numen-llm] {} prefixHash={}", requestId, prefixHash(toolList, systemPrompt));
 
         // -- 2. Enable streaming + usage reporting (both server-side flags).
         body.addProperty("stream", true);
@@ -251,6 +281,28 @@ public final class NumenLlmClient {
                 elapsedMs, acc.chunkCount, tokens,
                 acc.finishReason == null ? "?" : acc.finishReason,
                 toolSummary, contentSnippet);
+    }
+
+    /**
+     * SHA-256 over the prompt prefix (serialized tools array + a separator + system message
+     * content), returned as the first 12 hex digits. Deterministic and cheap; used only for
+     * the cache-regression log line. Returns {@code "unavailable"} if hashing somehow fails.
+     */
+    private static String prefixHash(JsonArray tools, String systemPrompt) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            md.update((tools == null ? "[]" : tools.toString())
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            md.update((byte) 0);
+            md.update((systemPrompt == null ? "" : systemPrompt)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            byte[] h = md.digest();
+            StringBuilder sb = new StringBuilder(12);
+            for (int i = 0; i < 6; i++) sb.append(String.format("%02x", h[i]));   // 6 bytes → 12 hex
+            return sb.toString();
+        } catch (Exception ex) {
+            return "unavailable";
+        }
     }
 
     private static boolean nonBlank(String s) { return s != null && !s.isBlank(); }

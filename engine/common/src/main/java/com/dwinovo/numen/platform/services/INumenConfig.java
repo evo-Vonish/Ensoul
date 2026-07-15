@@ -77,6 +77,19 @@ public interface INumenConfig {
      */
     String getReasoningEffort();
 
+    /**
+     * Reasoning effort used for <em>emergency</em> turns — a turn the agent loop
+     * starts in reaction to an urgent injected world event (an incoming attack,
+     * a hazard) that must be answered fast, preempting any slow think already in
+     * flight. Defaults to {@code "off"} (disable thinking so the reaction lands
+     * immediately). Same value space as {@link #getReasoningEffort()}
+     * ({@code auto} / {@code off} / {@code minimal} / {@code low} / {@code medium}
+     * / {@code high}); ignored by providers / models without a reasoning knob.
+     *
+     * <p>Config-file only for now — there is no settings-GUI control (follow-up).
+     */
+    String getEmergencyEffort();
+
     // ---- write surface (client-side: invoked by SettingsScreen) ----
 
     /**
@@ -97,6 +110,9 @@ public interface INumenConfig {
 
     /** Mutate the in-memory reasoning-effort knob. Null/blank normalised to {@code "auto"}. */
     void setReasoningEffort(String value);
+
+    /** Mutate the in-memory emergency-effort knob. Null/blank normalised to {@code "off"}. */
+    void setEmergencyEffort(String value);
 
     /**
      * Flush in-memory changes to the loader-native config file. Best-effort:

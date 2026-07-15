@@ -124,6 +124,10 @@ public final class NumenCore {
         ToolRegistry.register(new com.dwinovo.numen.core.tools.GetWorldInfoTool());
         ToolRegistry.register(new com.dwinovo.numen.core.tools.TodoWriteTool());   // raw NumenTool
         ToolRegistry.register(new com.dwinovo.numen.core.tools.LoadSkillTool());   // raw NumenTool
+
+        // DERIVATIVE ADDITION (ours, not upstream): appended LAST so existing tool
+        // ordering — and thus prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RunCommandTool());
     }
 
 

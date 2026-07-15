@@ -27,6 +27,10 @@ loom {
             setConfigName('Fabric Client')
             ideConfigGenerated(true)
             runDir('runs/client')
+            // Stable dev identity: the offline UUID derives from the username, so a
+            // fixed name keeps companion ownership valid across launches (random
+            // PlayerNNN names orphan every companion in the registry on restart).
+            programArgs('--username', 'Dev')
         }
         server {
             server()

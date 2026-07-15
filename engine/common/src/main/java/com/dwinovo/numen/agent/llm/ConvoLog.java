@@ -192,6 +192,13 @@ public final class ConvoLog {
             case ConvoState.Msg.User u -> {
                 o.addProperty("role", "user");
                 o.addProperty("content", u.content());
+                // Image attachment file paths, when present. Omitted entirely for
+                // the text-only case so old logs and plain turns stay byte-identical.
+                if (!u.attachments().isEmpty()) {
+                    JsonArray atts = new JsonArray();
+                    for (String p : u.attachments()) atts.add(p);
+                    o.add("attachments", atts);
+                }
             }
             case ConvoState.Msg.Assistant a -> {
                 o.addProperty("role", "assistant");
@@ -225,7 +232,17 @@ public final class ConvoLog {
     private static ConvoState.Msg decode(JsonObject o) {
         String role = str(o.get("role"));
         return switch (role) {
-            case "user" -> new ConvoState.Msg.User(str(o.get("content")));
+            case "user" -> {
+                List<String> atts = new ArrayList<>();
+                if (o.has("attachments") && o.get("attachments").isJsonArray()) {
+                    for (JsonElement el : o.getAsJsonArray("attachments")) {
+                        if (el != null && el.isJsonPrimitive()) atts.add(el.getAsString());
+                    }
+                }
+                // Old logs predate the field → atts stays empty (text-only), which
+                // is exactly the legacy behaviour.
+                yield new ConvoState.Msg.User(str(o.get("content")), atts);
+            }
             case "tool" -> new ConvoState.Msg.Tool(str(o.get("tool_call_id")), str(o.get("content")));
             case "assistant" -> {
                 List<LlmToolCall> calls = new ArrayList<>();

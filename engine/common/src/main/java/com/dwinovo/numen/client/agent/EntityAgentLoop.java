@@ -127,6 +127,13 @@ public final class EntityAgentLoop {
      * at the next protocol-valid point (see {@link #flushBufferedPrompts}).
      */
     private final List<String> bufferedPrompts = new ArrayList<>();
+    /**
+     * Image attachment file paths for the buffered owner prompt(s), accumulated
+     * in lock-step with {@link #bufferedPrompts} and flushed onto the single
+     * merged user message. Only owner prompts carry attachments; injected events
+     * and death notes use the text-only path, contributing nothing here.
+     */
+    private final List<String> bufferedAttachments = new ArrayList<>();
 
     private boolean awaitingLlmResponse = false;
     private boolean aborted = false;
@@ -167,6 +174,35 @@ public final class EntityAgentLoop {
      * spliced back into the conversation or dispatch its tool calls.
      */
     private int turnGeneration = 0;
+
+    /**
+     * The current turn's live reasoning transcript, streamed in from the LLM's
+     * reasoning channel (DeepSeek {@code reasoning_content}, GLM {@code reasoning},
+     * ...) via the {@code onReasoning} callback and rendered live by the chat
+     * panel. Written whole-String from the HTTP thread (hence {@code volatile});
+     * display-only — never added to the conversation, persisted, or re-sent.
+     * Cleared at every turn boundary (response landed, interrupt, death).
+     */
+    private volatile String liveReasoning = "";
+
+    /** Keep at most this many recent turns' reasoning transcripts for the panel's fold-open browsing. */
+    private static final int MAX_TURN_REASONING = 20;
+
+    /**
+     * Display-only reasoning transcripts of recently completed turns, keyed by the assistant
+     * message's index in the convo snapshot at the moment it was appended. Indices stay valid
+     * because ConvoState history is append-only between compactions; compaction ({@code replaceAll})
+     * renumbers everything, so the map is cleared there. Never persisted (ConvoLog untouched) and
+     * never sent on the wire — pure UI state, bounded at {@link #MAX_TURN_REASONING} entries
+     * (eldest evicted first). Main-thread only, like all other loop mutations.
+     */
+    private final java.util.LinkedHashMap<Integer, String> turnReasoning =
+            new java.util.LinkedHashMap<>() {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<Integer, String> eldest) {
+                    return size() > MAX_TURN_REASONING;
+                }
+            };
 
     EntityAgentLoop(UUID entityUuid) {
         this.entityUuid = entityUuid;
@@ -225,8 +261,26 @@ public final class EntityAgentLoop {
     public UUID entityUuid() { return entityUuid; }
     public ConvoState convo() { return convo; }
 
-    /** Owner typed a prompt in the chat GUI. */
+    /** The current turn's live reasoning transcript ({@code ""} when none) — read by the chat panel. */
+    public String liveReasoning() { return liveReasoning; }
+
+    /**
+     * Reasoning transcript stored for the assistant message at snapshot index {@code msgIndex}
+     * ({@code null} when none / evicted / pre-compaction). Read by the chat panel's fold rows.
+     */
+    public String reasoningAt(int msgIndex) { return turnReasoning.get(msgIndex); }
+
+    /** Owner typed a prompt in the chat GUI (text only). */
     public void submitPrompt(String text) {
+        submitPrompt(text, List.of());
+    }
+
+    /**
+     * Owner sent a prompt from the chat GUI, optionally with image attachments
+     * (absolute paths to persisted image files). The attachments ride along with
+     * the text on the same merged user message (see {@link #flushBufferedPrompts}).
+     */
+    public void submitPrompt(String text, List<String> attachments) {
         if (dead) {
             Constants.LOG.info("[numen-entity#{}] prompt ignored — body is dead", entityUuid);
             return;
@@ -241,8 +295,10 @@ public final class EntityAgentLoop {
         // and its tool results (which the API rejects with HTTP 400).
         boolean deferred = awaitingLlmResponse || dispatcher.busy();
         bufferedPrompts.add(text);
-        Constants.LOG.info("[numen-entity#{}] user prompt ({} chars){}{}: {}",
+        if (attachments != null && !attachments.isEmpty()) bufferedAttachments.addAll(attachments);
+        Constants.LOG.info("[numen-entity#{}] user prompt ({} chars, {} image(s)){}{}: {}",
                 entityUuid, text.length(),
+                attachments == null ? 0 : attachments.size(),
                 wasAborted ? " — reset previous abort" : "",
                 deferred ? " — buffered (mid-turn)" : "",
                 truncate(text, 200));
@@ -350,6 +406,7 @@ public final class EntityAgentLoop {
             boolean wasAwaitingLlm = awaitingLlmResponse;
             awaitingLlmResponse = false;
             compacting = false;
+            liveReasoning = ""; // the interrupted turn's live thinking is gone too
 
             // Synthesize cancelled results for EVERY outstanding call (in flight AND
             // still-queued) so the assistant(tool_calls) message keeps matching tool
@@ -382,6 +439,7 @@ public final class EntityAgentLoop {
             // Priority 2: idle — drop the held queue.
             int dropped = bufferedPrompts.size();
             bufferedPrompts.clear();
+            bufferedAttachments.clear();
             Constants.LOG.info("[numen-entity#{}] interrupt cleared {} queued prompt(s)",
                     entityUuid, dropped);
         }
@@ -407,7 +465,9 @@ public final class EntityAgentLoop {
         turnGeneration++;          // discard any in-flight LLM response (halt output)
         awaitingLlmResponse = false;
         compacting = false;
+        liveReasoning = "";        // the dead turn's live thinking is gone too
         bufferedPrompts.clear();
+        bufferedAttachments.clear();
         dead = true;
         Constants.LOG.info("[numen-entity#{}] body died ({}) — loop frozen ({} call(s) in flight)",
                 entityUuid, cause, deathInterruptedCalls.size());
@@ -472,8 +532,10 @@ public final class EntityAgentLoop {
     private void flushBufferedPrompts() {
         if (bufferedPrompts.isEmpty()) return;
         String merged = String.join("\n", bufferedPrompts);
+        List<String> attachments = List.copyOf(bufferedAttachments);
         bufferedPrompts.clear();
-        convo.addUser(merged);
+        bufferedAttachments.clear();
+        convo.addUser(merged, attachments);
         // A fresh owner directive starts a new tool-chain: restart the turn
         // counter (just log numbering now that the hard cap is gone).
         convo.resetTurnCount();
@@ -546,7 +608,7 @@ public final class EntityAgentLoop {
         // Capture the current generation; if the owner interrupts before this
         // call resolves, handleResponse sees the mismatch and discards it.
         final int gen = turnGeneration;
-        NumenLlmClient.instance().chatStreaming(snapshot, tools, systemPrompt, null)
+        NumenLlmClient.instance().chatStreaming(snapshot, tools, systemPrompt, null, s -> liveReasoning = s)
                 .whenComplete((res, err) -> bounceBackToMain(gen, res, err));
     }
 
@@ -579,13 +641,14 @@ public final class EntityAgentLoop {
         Constants.LOG.info("[numen-entity#{}] compaction started ({}, {} msgs)",
                 entityUuid, auto ? "auto" : "manual", request.size() - 1);
         final int gen = turnGeneration;
-        NumenLlmClient.instance().chatStreaming(request, List.of(), COMPACT_SYSTEM_PROMPT, null)
+        NumenLlmClient.instance().chatStreaming(request, List.of(), COMPACT_SYSTEM_PROMPT, null, null)
                 .whenComplete((res, err) -> Minecraft.getInstance().execute(
                         () -> finishCompaction(gen, auto, res, err)));
     }
 
     private void finishCompaction(int gen, boolean auto,
                                   NumenLlmClient.ChatResult res, Throwable err) {
+        recordUsage(res);   // summarization calls bill like any other — count them too
         if (gen != turnGeneration) {
             Constants.LOG.info("[numen-entity#{}] discarding interrupted compaction (gen {} != {})",
                     entityUuid, gen, turnGeneration);
@@ -610,6 +673,7 @@ public final class EntityAgentLoop {
         // swap the in-memory history without re-notifying the sink.
         log.appendCompactSummary(wrapped);
         convo.replaceAll(List.of(new ConvoState.Msg.User(wrapped)));
+        turnReasoning.clear();  // snapshot indices renumbered — stored reasoning no longer maps
         lastPromptTokens = 0;   // unknown until the next request reports usage
         compactFailures = 0;
         Constants.LOG.info("[numen-entity#{}] compaction done ({}): history → 1 summary msg ({} chars)",
@@ -667,6 +731,9 @@ public final class EntityAgentLoop {
     }
 
     private void handleResponse(int gen, NumenLlmClient.ChatResult res, Throwable err) {
+        // Usage accounting first, BEFORE the generation check: a discarded (interrupted)
+        // response was still billed by the backend, so it still counts.
+        recordUsage(res);
         // Owner interrupted this turn while the call was in flight: abort()
         // already settled the conversation (and, if a newer turn has since
         // started, awaitingLlmResponse belongs to *that* call). Discard wholesale
@@ -674,9 +741,15 @@ public final class EntityAgentLoop {
         if (gen != turnGeneration) {
             Constants.LOG.info("[numen-entity#{}] discarding interrupted LLM response (gen {} != {})",
                     entityUuid, gen, turnGeneration);
+            liveReasoning = "";
             return;
         }
         awaitingLlmResponse = false;
+        // The turn's response has landed — its thinking is done streaming. Capture the
+        // live transcript (moved to per-turn storage below, once the assistant message
+        // is appended and its index is known) and clear the live channel.
+        String finishedReasoning = liveReasoning;
+        liveReasoning = "";
 
         // World is unloading (owner quit / disconnected): the client→server channel is gone, so a
         // dispatched ExecuteToolPayload would NPE in the platform sender. Drop this turn quietly.
@@ -705,6 +778,11 @@ public final class EntityAgentLoop {
         }
 
         convo.addAssistant(turn);
+        // Keep the finished turn's reasoning browsable in the panel, keyed by the index
+        // the assistant message just received (append-only until compaction clears the map).
+        if (!finishedReasoning.isBlank()) {
+            turnReasoning.put(convo.snapshot().size() - 1, finishedReasoning);
+        }
 
         if (!turn.hasToolCalls()) {
             // Final text reply — spoken to the owner. Chain settles; the next
@@ -728,6 +806,13 @@ public final class EntityAgentLoop {
         dispatcher.dispatch(turn.toolCalls().stream()
                 .map(tc -> new ToolInvocation(tc.id(), tc.name(), tc.arguments()))
                 .toList());
+    }
+
+    /** Feed a landed response's usage frame into the session {@link UsageTracker}. */
+    private void recordUsage(NumenLlmClient.ChatResult res) {
+        if (res == null) return;
+        UsageTracker.instance().record(entityUuid, res.promptTokens(),
+                Math.max(0, res.totalTokens() - res.promptTokens()));
     }
 
     private static String truncate(String s, int max) {

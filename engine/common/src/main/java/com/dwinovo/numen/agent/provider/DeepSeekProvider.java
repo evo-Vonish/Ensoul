@@ -1,5 +1,8 @@
 package com.dwinovo.numen.agent.provider;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
 /**
  * DeepSeek-flavour OpenAI provider. Strictly aligned with LiteLLM's
  * <a href="https://github.com/BerriAI/litellm/blob/main/litellm/llms/deepseek/chat/transformation.py">{@code DeepSeekChatConfig}</a>
@@ -48,4 +51,33 @@ public final class DeepSeekProvider extends OpenAIProvider {
     @Override public String name() { return NAME; }
 
     @Override public String defaultBaseUrl() { return DEFAULT_BASE_URL; }
+
+    /**
+     * Documented balance endpoint ({@code GET /user/balance}, Bearer key):
+     * <a href="https://api-docs.deepseek.com/api/get-user-balance">api-docs.deepseek.com</a>.
+     * Lives on the bare host — NOT under the {@code /beta} chat base.
+     */
+    @Override
+    public String balanceUrl(String configuredBaseUrl) {
+        return "https://api.deepseek.com/user/balance";
+    }
+
+    /** {@code {"is_available":..,"balance_infos":[{"currency","total_balance","granted_balance",..}]}} */
+    @Override
+    public String parseBalance(JsonObject body) {
+        if (!body.has("balance_infos") || !body.get("balance_infos").isJsonArray()) return null;
+        JsonArray infos = body.getAsJsonArray("balance_infos");
+        if (infos.isEmpty() || !infos.get(0).isJsonObject()) return null;
+        JsonObject info = infos.get(0).getAsJsonObject();
+        String sym = "USD".equalsIgnoreCase(str(info, "currency")) ? "$" : "¥";
+        String total = str(info, "total_balance");
+        String granted = str(info, "granted_balance");
+        String s = "余额: " + sym + (total.isEmpty() ? "?" : total);
+        if (!granted.isEmpty() && !"0.00".equals(granted)) s += " (赠送 " + sym + granted + ")";
+        return s;
+    }
+
+    private static String str(JsonObject o, String key) {
+        return o.has(key) && o.get(key).isJsonPrimitive() ? o.get(key).getAsString() : "";
+    }
 }

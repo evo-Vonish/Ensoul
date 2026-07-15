@@ -46,6 +46,96 @@ public class OpenAIProvider implements LlmProvider {
         return m;
     }
 
+    /**
+     * Multimodal user message (OpenAI-compatible vision shape). When the message
+     * has image attachments AND {@code includeImages} is set, {@code content}
+     * becomes the array form:
+     * <pre>
+     * "content": [
+     *   {"type":"text","text":"..."},
+     *   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+     * ]
+     * </pre>
+     * which OpenAI, Zhipu GLM vision models (glm-4.5v / glm-4.6v / glm-5v), and
+     * the rest of the OpenAI-compat vision ecosystem all accept. Backends without
+     * a vision model simply error on the {@code image_url} part — that error
+     * surfaces through the existing chat error path.
+     *
+     * <p>Text-only messages (no attachments) fall through to the EXACT plain
+     * string {@link #buildUserMessage(String)} shape, keeping the prompt-cache
+     * prefix stable for the common case.
+     *
+     * <p>{@code includeImages == false} (an older user message in history) emits
+     * text plus a compact "[N image(s) omitted]" note rather than re-shipping the
+     * bytes every turn — the cost-control rule the caller enforces by only
+     * inlining images for the most recent user message.
+     */
+    @Override
+    public JsonObject buildUserMessage(String content, java.util.List<String> attachmentPaths,
+                                       boolean includeImages) {
+        if (attachmentPaths == null || attachmentPaths.isEmpty()) {
+            return buildUserMessage(content);   // exact text-only shape (cache stability)
+        }
+        String text = content == null ? "" : content;
+        if (!includeImages) {
+            // Older turn: keep the text but drop the pixels — a placeholder so the
+            // model still knows an image was here without paying to re-send it.
+            JsonObject m = new JsonObject();
+            m.addProperty("role", "user");
+            m.addProperty("content", text + omittedNote(attachmentPaths.size()));
+            return m;
+        }
+        JsonArray parts = new JsonArray();
+        JsonObject textPart = new JsonObject();
+        textPart.addProperty("type", "text");
+        textPart.addProperty("text", text);
+        parts.add(textPart);
+        for (String path : attachmentPaths) {
+            String dataUrl = toDataUrl(path);
+            if (dataUrl == null) continue;   // unreadable file → skip that image
+            JsonObject imgPart = new JsonObject();
+            imgPart.addProperty("type", "image_url");
+            JsonObject imageUrl = new JsonObject();
+            imageUrl.addProperty("url", dataUrl);
+            imgPart.add("image_url", imageUrl);
+            parts.add(imgPart);
+        }
+        JsonObject m = new JsonObject();
+        m.addProperty("role", "user");
+        if (parts.size() == 1) {
+            // Every image failed to load — degrade to the plain string form.
+            m.addProperty("content", text);
+        } else {
+            m.add("content", parts);
+        }
+        return m;
+    }
+
+    private static String omittedNote(int n) {
+        return "\n[" + n + (n == 1 ? " image" : " images") + " omitted from history]";
+    }
+
+    /** Read an image file and encode it as a {@code data:} URL, or null if unreadable. */
+    private static String toDataUrl(String path) {
+        try {
+            java.nio.file.Path p = java.nio.file.Path.of(path);
+            byte[] bytes = java.nio.file.Files.readAllBytes(p);
+            String b64 = java.util.Base64.getEncoder().encodeToString(bytes);
+            return "data:" + mimeFor(p.getFileName().toString()) + ";base64," + b64;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /** MIME type from a file extension; defaults to PNG (the format we persist in). */
+    private static String mimeFor(String fileName) {
+        String lower = fileName.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+        if (lower.endsWith(".webp")) return "image/webp";
+        if (lower.endsWith(".gif")) return "image/gif";
+        return "image/png";
+    }
+
     @Override
     public JsonObject buildSystemMessage(String content) {
         JsonObject m = new JsonObject();
@@ -257,9 +347,28 @@ public class OpenAIProvider implements LlmProvider {
             if (STANDARD_DELTA_FIELDS.contains(e.getKey())) continue;
             var el = e.getValue();
             if (el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isString()) {
-                acc.appendExtra(e.getKey(), el.getAsString());
+                String value = el.getAsString();
+                // Unchanged: the extras round-trip (DeepSeek/Moonshot depend on it).
+                acc.appendExtra(e.getKey(), value);
+                // Additionally mirror recognised reasoning deltas into the live,
+                // display-only channel. This does NOT touch extras — the reasoning
+                // buffer is rendered live and neither persisted nor re-sent.
+                if (reasoningDeltaFields().contains(e.getKey())) {
+                    acc.reasoning.append(value);
+                }
             }
         }
+    }
+
+    /**
+     * Delta field names that carry the model's live reasoning stream. Mirrored
+     * into {@link StreamAccumulator#reasoning} by {@link #captureChunkExtras} for
+     * the live "thinking" display. Overridable so backends that name the field
+     * differently can extend the set. Purely a display concern — has no bearing
+     * on the extras round-trip.
+     */
+    protected java.util.Set<String> reasoningDeltaFields() {
+        return java.util.Set.of("reasoning_content", "reasoning");
     }
 
     /** Set of delta fields we treat as "standard" — subclasses use this for partition. */

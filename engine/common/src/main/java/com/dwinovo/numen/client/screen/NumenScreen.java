@@ -10,6 +10,7 @@ import com.dwinovo.numen.client.agent.ClientDeaths;
 import com.dwinovo.numen.client.agent.ClientNumenLookup;
 import com.dwinovo.numen.client.agent.EntityAgentLoop;
 import com.dwinovo.numen.client.agent.NumenRoster;
+import com.dwinovo.numen.client.agent.UsageTracker;
 import com.dwinovo.numen.client.data.ClientNumenInventory;
 import com.dwinovo.numen.network.payload.RequestInventoryPayload;
 import com.dwinovo.numen.platform.Services;
@@ -34,6 +35,7 @@ import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -124,6 +126,20 @@ public final class NumenScreen extends Screen {
     private SimpleButton compactButton;
     private String savedInput = "";
 
+    // ---- pending image attachments (chat tab) ----
+    /** Thumbnail longest-side and card box, in px. */
+    private static final int THUMB_MAX = 40;
+    private static final int CARD_H = 40;
+    private static final int CARD_W = 44;
+    private static final int CARD_GAP = 4;
+    /** Cap on images composed onto one message (keeps the card row within the panel). */
+    private static final int MAX_ATTACH = 6;
+    /** Images pasted/dropped onto the current draft, shown as removable cards above the input. */
+    private final List<PendingImage> pendingImages = new ArrayList<>();
+    /** Transient hint above the input (attachment limit, paste-unsupported, …). */
+    private long attachHintUntil;
+    private String attachHintText = "";
+
     // "+" summon flow: a transient name field shown over the panel
     private boolean summoning;
     private EditBox summonInput;
@@ -137,6 +153,12 @@ public final class NumenScreen extends Screen {
     // unsaved working state — settings widgets are (re)built from these, NOT from config, so a rebuild
     // (provider change / custom toggle) doesn't revert what you just picked or typed.
     private String wProvider = "", wApiKey = "", wModel = "", wBaseUrl = "", wProxy = "", wSiteName = "";
+    /** Working copy of the reasoning-effort knob (auto | low | medium | high), cycled by its button. */
+    private String wReasoning = "auto";
+    /** Settings body swapped to the Usage view (session token stats + provider balance query). */
+    private boolean usageView;
+    /** Balance query status/result line — written from the HTTP thread (immutable String), read by render. */
+    private volatile String balanceLine;
     private boolean addingSite;              // "+ 添加站点" mode: name + base URL + model → writes a site
     private EditBox proxyInput;
     private EditBox siteNameInput;
@@ -193,6 +215,7 @@ public final class NumenScreen extends Screen {
     private void switchTo(UUID u, String n) {
         if (java.util.Objects.equals(u, uuid)) return;
         input = null; savedInput = "";          // don't carry typed text across companions
+        clearAttachments();                      // …nor composed image attachments
         uuid = u; name = n;
         scroll = 0; pinBottom = true; expandedGroups.clear();
         rebuild();
@@ -372,7 +395,10 @@ public final class NumenScreen extends Screen {
         wModel = cfg.getModel() == null ? "" : cfg.getModel();
         wBaseUrl = cfg.getBaseUrl() == null ? "" : cfg.getBaseUrl();
         wProxy = cfg.getProxy() == null ? "" : cfg.getProxy();
+        wReasoning = cfg.getReasoningEffort() == null || cfg.getReasoningEffort().isBlank()
+                ? "auto" : cfg.getReasoningEffort();
         addingSite = false;
+        usageView = false;   // entering Settings always lands on the form, not the Usage view
         ModelRegistry.Provider mp = ModelRegistry.provider(LlmProviders.normalize(wProvider));
         boolean known = mp != null && mp.models().stream().anyMatch(m -> m.id().equals(wModel));
         customModel = (mp != null && mp.custom()) || (!wModel.isBlank() && !known);
@@ -393,6 +419,19 @@ public final class NumenScreen extends Screen {
         int x = left + PAD, w = PANEL_W - PAD * 2;
         int y0 = top + HEADER_H + 8;
 
+        if (usageView) {
+            // Usage sub-view — swaps the whole settings body, like the "+ add site" form.
+            // All text is drawn in renderUsage; only the two buttons are widgets.
+            providerDropdown = null;   // don't let the stale form dropdown render/catch clicks
+            SimpleButton qb = new SimpleButton(x, top + PANEL_H - PAD - 18, 110, 18,
+                    Component.literal("Query balance"), b -> onQueryBalance());
+            qb.active = NumenLlmClient.isConfigured() && NumenLlmClient.instance().supportsBalance();
+            add(qb);
+            add(new SimpleButton(left + PANEL_W - PAD - 64, top + PANEL_H - PAD - 18,
+                    64, 18, Component.literal("Back"), b -> { usageView = false; rebuild(); }));
+            return;
+        }
+
         if (addingSite) {
             // row0: site name + cancel
             siteNameInput = field(x, y0 + 11, w - 20, 64, wSiteName);
@@ -408,10 +447,37 @@ public final class NumenScreen extends Screen {
             buildModelRow(x, y0 + 2 * SET_SP + 11, w);
             baseUrlInput = field(x, y0 + 3 * SET_SP + 11, w, 256, wBaseUrl);
             proxyInput = field(x, y0 + 4 * SET_SP + 11, w, 128, wProxy);
+            // Reasoning-effort cycle button, self-labeled, on the Save line (no room
+            // for a 6th labeled row — 5 rows + Save fill the panel). Values are
+            // engine-generic; providers without reasoning_effort ignore them.
+            int reasonW = 110;
+            add(new SimpleButton(left + PANEL_W - PAD - 64 - 4 - reasonW, top + PANEL_H - PAD - 18,
+                    reasonW, 18, Component.literal("Reasoning: " + wReasoning),
+                    b -> {
+                        wReasoning = nextEffort(wReasoning);
+                        b.setMessage(Component.literal("Reasoning: " + wReasoning));
+                    }));
+            // Usage view entry — swaps the settings body to session stats + balance query.
+            int usageW = 48;
+            add(new SimpleButton(left + PANEL_W - PAD - 64 - 4 - reasonW - 4 - usageW,
+                    top + PANEL_H - PAD - 18, usageW, 18, Component.literal("Usage"),
+                    b -> { preserveKeyUrl(); usageView = true; balanceLine = null; rebuild(); }));
         }
 
         add(new SimpleButton(left + PANEL_W - PAD - 64, top + PANEL_H - PAD - 18,
                 64, 18, Component.literal("Save"), b -> onSaveSettings()));
+    }
+
+    /** Cycle auto → off → minimal → low → medium → high → auto (any unrecognised value re-enters at auto). */
+    private static String nextEffort(String cur) {
+        return switch (cur == null ? "auto" : cur) {
+            case "auto" -> "off";
+            case "off" -> "minimal";
+            case "minimal" -> "low";
+            case "low" -> "medium";
+            case "medium" -> "high";
+            default -> "auto";
+        };
     }
 
     private void buildApiKeyRow(int x, int y, int w) {
@@ -505,6 +571,7 @@ public final class NumenScreen extends Screen {
         cfg.setModel(model);
         cfg.setBaseUrl(baseUrlInput.getValue());
         cfg.setProxy(proxyInput == null ? wProxy : proxyInput.getValue());
+        cfg.setReasoningEffort(wReasoning);
         cfg.save();
         NumenLlmClient.reset();
         savedFlashUntil = System.currentTimeMillis() + 1500;
@@ -513,6 +580,10 @@ public final class NumenScreen extends Screen {
     private void renderSettings(GuiGraphicsExtractor g, int mouseX, int mouseY) {
         int x = left + PAD;
         int y0 = top + HEADER_H + 8;
+        if (usageView) {
+            renderUsage(g, x, y0);
+            return;
+        }
         if (addingSite) {
             txt(g, Component.literal("Site name"), x, y0, TXT_MUTED);
             txt(g, Component.literal("API Key"), x, y0 + SET_SP, TXT_MUTED);
@@ -529,6 +600,70 @@ public final class NumenScreen extends Screen {
             txt(g, Component.literal("✔ saved"), x, top + PANEL_H - PAD - 14, OK);
         }
         // the dropdowns themselves render in render, AFTER the widgets (open list on top)
+    }
+
+    /** The Usage sub-view body: session token stats (global + per companion) and the balance line. */
+    private void renderUsage(GuiGraphicsExtractor g, int x, int y0) {
+        int y = y0;
+        UsageTracker.Stat all = UsageTracker.instance().global();
+        txt(g, Component.literal("Usage (this session)"), x, y, TXT_MUTED);
+        y += 14;
+        txt(g, Component.literal("all: " + all.requests() + " req · prompt " + fmtTok(all.promptTokens())
+                + " · completion " + fmtTok(all.completionTokens())), x, y, TXT);
+        y += 14;
+        var per = UsageTracker.instance().perCompanion();
+        if (per.isEmpty()) {
+            txt(g, Component.literal("no requests yet"), x, y, TXT_FAINT);
+        } else {
+            int yMax = top + PANEL_H - PAD - 18 - 26;   // stay clear of the balance line + buttons
+            for (var e : per.entrySet()) {
+                if (y > yMax) break;
+                UsageTracker.Stat s = e.getValue();
+                txt(g, Component.literal(rosterName(e.getKey()) + ": " + s.requests() + " req · "
+                        + fmtTok(s.promptTokens()) + "/" + fmtTok(s.completionTokens()) + " tok"),
+                        x, y, TXT_MUTED);
+                y += 12;
+            }
+        }
+        // Balance status line, just above the Query balance / Back buttons.
+        int by = top + PANEL_H - PAD - 18 - 12;
+        String line = balanceLine;
+        if (line != null) {
+            txt(g, Component.literal(line), x, by, TXT);
+        } else if (!NumenLlmClient.isConfigured() || !NumenLlmClient.instance().supportsBalance()) {
+            txt(g, Component.literal("provider has no balance API"), x, by, TXT_FAINT);
+        }
+    }
+
+    /** Kick off the async balance query; the result lands in {@link #balanceLine} for render. */
+    private void onQueryBalance() {
+        balanceLine = "querying…";
+        NumenLlmClient.instance().queryBalance().whenComplete((s, err) ->
+                balanceLine = err != null ? "error: " + shortErr(err) : s);
+    }
+
+    /** Companion display name from the roster, falling back to a uuid stub for despawned ones. */
+    private static String rosterName(UUID u) {
+        for (NumenRoster.Entry e : NumenRoster.instance().entries()) {
+            if (e.uuid().equals(u)) return e.name();
+        }
+        return u.toString().substring(0, 8);
+    }
+
+    /** Compact token count: 812 → "812", 12345 → "12.3k", 4200000 → "4.20M". */
+    private static String fmtTok(long n) {
+        if (n < 1000) return String.valueOf(n);
+        if (n < 1_000_000) return String.format(java.util.Locale.ROOT, "%.1fk", n / 1000.0);
+        return String.format(java.util.Locale.ROOT, "%.2fM", n / 1_000_000.0);
+    }
+
+    /** Root-cause message, one line, truncated — for the balance error display. */
+    private static String shortErr(Throwable t) {
+        Throwable c = t;
+        while (c.getCause() != null && c != c.getCause()) c = c.getCause();
+        String m = c.getMessage() == null ? c.getClass().getSimpleName() : c.getMessage();
+        m = m.replace('\n', ' ');
+        return m.length() > 70 ? m.substring(0, 70) + "…" : m;
     }
 
     @Override
@@ -550,15 +685,32 @@ public final class NumenScreen extends Screen {
     private void onSend() {
         if (input == null) return;
         String text = input.getValue() == null ? "" : input.getValue().trim();
-        if (text.isEmpty()) return;
+        if (text.isEmpty() && pendingImages.isEmpty()) return;   // nothing to send
         if (!NumenLlmClient.isConfigured()) {
             com.dwinovo.numen.Constants.LOG.warn("[numen-chat] no apiKey; open Settings.");
             warnUntil = System.currentTimeMillis() + 4000;   // visible hint instead of a silent no-op
             return;
         }
-        loop().submitPrompt(text);
+        // Persist the composed images (copy bytes into config/numen/attachments/<uuid>/)
+        // and hand their paths to the loop alongside the text — one API call.
+        List<String> attachments = persistPending();
+        loop().submitPrompt(text, attachments);
         input.setValue("");
+        clearAttachments();   // frees the thumbnail textures; the files persist on disk
         pinBottom = true;
+    }
+
+    /** Copy every pending image into the companion's attachments dir; returns the saved paths. */
+    private List<String> persistPending() {
+        if (pendingImages.isEmpty() || uuid == null) return List.of();
+        List<String> paths = new ArrayList<>();
+        long ts = System.currentTimeMillis();
+        int n = 0;
+        for (PendingImage pi : pendingImages) {
+            Path saved = ChatImages.persist(pi.source(), uuid, ts, n++);
+            if (saved != null) paths.add(saved.toAbsolutePath().toString());
+        }
+        return paths;
     }
 
     // ---- input ----
@@ -578,6 +730,19 @@ public final class NumenScreen extends Screen {
         if ((k == 257 || k == 335) && input != null && input.isFocused()) {
             onSend();
             return true;
+        }
+        // Ctrl+V image paste (best-effort). Minecraft sets java.awt.headless=true,
+        // so AWT clipboard access usually throws on the dev client — drag-and-drop
+        // is the reliable path. When paste yields no image and the clipboard has no
+        // text either (i.e. the user meant to paste an image we can't read), show a
+        // hint; when it DOES hold text, fall through so the EditBox pastes it.
+        if (tab == Tab.CHAT && uuid != null && event.isPaste()) {
+            if (tryPasteImages()) return true;
+            String clip = Minecraft.getInstance().keyboardHandler.getClipboard();
+            if (clip == null || clip.isBlank()) {
+                flashAttachHint("拖拽图片文件到窗口即可添加");
+                return true;
+            }
         }
         return super.keyPressed(event);
     }
@@ -657,6 +822,7 @@ public final class NumenScreen extends Screen {
                     }
                 }
             }
+            if (tab == Tab.CHAT && removeCardAt((int) mouseX, my)) return true;   // ❌ on a pending image
             if (tab == Tab.CHAT && toggleFoldAt((int) mouseX, my)) return true;
         }
         return super.mouseClicked(event, dbl);
@@ -665,7 +831,7 @@ public final class NumenScreen extends Screen {
     /** If a chat fold-toggle row sits under (mx,my), flip its expanded state. Mirrors renderChat geometry. */
     private boolean toggleFoldAt(int mx, int my) {
         int bodyY = top + HEADER_H + 4;
-        int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6;
+        int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6 - cardsBandH();
         int transX = left + PAD;
         int transW = PANEL_W - PAD * 2 - PLAN_W - 8;
         if (mx < transX || mx >= transX + transW || my < bodyY || my >= bodyBottom) return false;
@@ -751,7 +917,8 @@ public final class NumenScreen extends Screen {
             w.extractRenderState(g, mouseX, mouseY, partial);
         }
         // Base URL / Proxy placeholders, drawn shadowless by us (the EditBox hint renders with a shadow).
-        if (tab == Tab.SETTINGS) {
+        // Skipped in the Usage sub-view: its body has no fields and providerDropdown is null there.
+        if (tab == Tab.SETTINGS && !usageView) {
             String urlPh = addingSite ? "https://… (OpenAI-compatible)"
                     : LlmProviders.byId(providerDropdown.selectedId()).defaultBaseUrl();
             placeholder(g, baseUrlInput, urlPh);
@@ -765,7 +932,7 @@ public final class NumenScreen extends Screen {
         // (Chat-input placeholder is the FlatEditBox hint now — drawn shadowless and under the
         // caret in the widget pass, so it can't paint over the caret like a screen-side draw did.)
         // The provider dropdown's open list must sit above even the fields.
-        if (tab == Tab.SETTINGS) {
+        if (tab == Tab.SETTINGS && !usageView) {
             // render the non-open one first so the open list draws on top
             if (modelDropdown != null && providerDropdown != null && providerDropdown.isOpen()) {
                 modelDropdown.render(g, font, mouseX, mouseY);
@@ -985,15 +1152,16 @@ public final class NumenScreen extends Screen {
 
     private void renderChat(GuiGraphicsExtractor g) {
         int bodyY = top + HEADER_H + 4;
-        int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6;
+        int planBottom = top + PANEL_H - INPUT_H - PAD - 6;      // plan panel keeps full height
+        int bodyBottom = planBottom - cardsBandH();              // transcript yields room for the card row
         int transX = left + PAD;
         int transW = PANEL_W - PAD * 2 - PLAN_W - 8;
         int viewH = bodyBottom - bodyY;
 
         // plan panel divider + content
         int planX = transX + transW + 8;
-        g.fill(planX - 4, bodyY, planX - 3, bodyBottom, BORDER);
-        renderPlan(g, planX, bodyY, bodyBottom);
+        g.fill(planX - 4, bodyY, planX - 3, planBottom, BORDER);
+        renderPlan(g, planX, bodyY, planBottom);
 
         List<Row> rows = buildRows(transW);
         int contentH = rows.size() * LINE_H;
@@ -1034,6 +1202,164 @@ public final class NumenScreen extends Screen {
             g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, SCROLL_TRACK, sbX, bodyY, 4, viewH);
             g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, SCROLL_THUMB, sbX, thumbY, 4, thumbH);
         }
+
+        // Pending-attachment cards, in the reserved band just above the input.
+        if (!pendingImages.isEmpty()) {
+            renderAttachmentCards(g, transX, cardsBandTop());
+        }
+        // Transient attachment hint (limit reached / paste unsupported) — muted, above the band.
+        if (attachHintUntil > System.currentTimeMillis()) {
+            txt(g, colored(attachHintText, TXT_MUTED), transX, cardsBandTop() - 11, TXT_MUTED);
+        }
+    }
+
+    // ---- pending image attachments ----
+
+    /** Height of the reserved card band (0 when nothing is attached, so layout is stable). */
+    private int cardsBandH() { return pendingImages.isEmpty() ? 0 : CARD_H + 6; }
+
+    /** Top y of the card band — the cards sit flush above the input row. */
+    private int cardsBandTop() { return top + PANEL_H - INPUT_H - PAD - CARD_H - 3; }
+
+    private void flashAttachHint(String msg) {
+        attachHintText = msg;
+        attachHintUntil = System.currentTimeMillis() + 4000;
+    }
+
+    private void renderAttachmentCards(GuiGraphicsExtractor g, int x0, int y0) {
+        for (int i = 0; i < pendingImages.size(); i++) {
+            PendingImage pi = pendingImages.get(i);
+            int cx = x0 + i * (CARD_W + CARD_GAP);
+            g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, FIELD_SPRITE, cx, y0, CARD_W, CARD_H);
+            int dw = pi.w(), dh = pi.h();                       // already scaled to fit THUMB_MAX
+            int ix = cx + (CARD_W - dw) / 2;
+            int iy = y0 + (CARD_H - dh) / 2;
+            g.blit(pi.texId(), ix, iy, ix + dw, iy + dh, 0f, 1f, 0f, 1f);
+            txt(g, colored("✗", FAIL), cx + CARD_W - 8, y0 + 1, FAIL);   // remove affordance (top-right)
+        }
+    }
+
+    /** True if (mx,my) hit a card's ❌ region — remove that pending image and free its texture. */
+    private boolean removeCardAt(int mx, int my) {
+        if (pendingImages.isEmpty()) return false;
+        int x0 = left + PAD;
+        int y0 = cardsBandTop();
+        for (int i = 0; i < pendingImages.size(); i++) {
+            int cx = x0 + i * (CARD_W + CARD_GAP);
+            if (mx >= cx + CARD_W - 12 && mx < cx + CARD_W && my >= y0 && my < y0 + 12) {
+                freeAttachment(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Add an image file as a pending attachment (decodes a thumbnail); returns false if rejected. */
+    private boolean addAttachment(Path source) {
+        if (pendingImages.size() >= MAX_ATTACH) {
+            flashAttachHint("最多 " + MAX_ATTACH + " 张图片");
+            return false;
+        }
+        for (PendingImage pi : pendingImages) {
+            if (pi.source().equals(source)) return false;   // already attached
+        }
+        ChatImages.Thumb thumb = ChatImages.loadThumbnail(source, THUMB_MAX);
+        if (thumb == null) return false;
+        pendingImages.add(new PendingImage(source, thumb.texId(), thumb.width(), thumb.height()));
+        return true;
+    }
+
+    private void freeAttachment(int i) {
+        PendingImage pi = pendingImages.remove(i);
+        Minecraft.getInstance().getTextureManager().release(pi.texId());   // closes texture + NativeImage
+    }
+
+    private void clearAttachments() {
+        for (PendingImage pi : pendingImages) {
+            Minecraft.getInstance().getTextureManager().release(pi.texId());
+        }
+        pendingImages.clear();
+    }
+
+    /**
+     * GLFW drag-and-drop of files onto the window — the reliable attach path
+     * (dispatched to the active screen on the main thread by {@code MouseHandler}).
+     * Accepts image files onto the chat tab; other files are ignored.
+     */
+    @Override
+    public void onFilesDrop(List<Path> files) {
+        if (tab != Tab.CHAT || uuid == null) { super.onFilesDrop(files); return; }
+        boolean any = false;
+        for (Path p : files) {
+            if (ChatImages.isImageFile(p) && addAttachment(p)) any = true;
+        }
+        if (!any) flashAttachHint("仅支持 png / jpg 图片");
+    }
+
+    /**
+     * Best-effort Ctrl+V image paste via AWT (image flavor + file-list flavor).
+     * Minecraft sets {@code java.awt.headless=true}, so this typically throws on
+     * the dev client and is fully guarded; drag-and-drop remains the supported
+     * path. Returns true only if at least one image was actually attached.
+     */
+    private boolean tryPasteImages() {
+        try {
+            java.awt.datatransfer.Clipboard cb = java.awt.Toolkit.getDefaultToolkit().getSystemClipboard();
+            if (cb.isDataFlavorAvailable(java.awt.datatransfer.DataFlavor.javaFileListFlavor)) {
+                Object data = cb.getData(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+                if (data instanceof List<?> files) {
+                    boolean any = false;
+                    for (Object f : files) {
+                        if (f instanceof java.io.File file
+                                && ChatImages.isImageFile(file.toPath())
+                                && addAttachment(file.toPath())) any = true;
+                    }
+                    if (any) return true;
+                }
+            }
+            if (cb.isDataFlavorAvailable(java.awt.datatransfer.DataFlavor.imageFlavor)) {
+                Object data = cb.getData(java.awt.datatransfer.DataFlavor.imageFlavor);
+                if (data instanceof java.awt.Image img) {
+                    Path tmp = writeClipboardImage(img);
+                    if (tmp != null && addAttachment(tmp)) return true;
+                }
+            }
+        } catch (Throwable t) {
+            com.dwinovo.numen.Constants.LOG.debug("[numen-chat] AWT clipboard image paste unavailable: {}",
+                    t.toString());
+        }
+        return false;
+    }
+
+    /** Encode a raw clipboard image to a staging PNG (only reachable when AWT works). */
+    private Path writeClipboardImage(java.awt.Image img) {
+        try {
+            java.awt.image.BufferedImage bi;
+            if (img instanceof java.awt.image.BufferedImage b) {
+                bi = b;
+            } else {
+                int w = img.getWidth(null), h = img.getHeight(null);
+                if (w <= 0 || h <= 0) return null;
+                bi = new java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                java.awt.Graphics2D gr = bi.createGraphics();
+                gr.drawImage(img, 0, 0, null);
+                gr.dispose();
+            }
+            Path dir = Minecraft.getInstance().gameDirectory.toPath()
+                    .resolve("config").resolve("numen").resolve("attachments").resolve("_paste");
+            java.nio.file.Files.createDirectories(dir);
+            Path tmp = dir.resolve("paste-" + System.currentTimeMillis() + ".png");
+            javax.imageio.ImageIO.write(bi, "png", tmp.toFile());
+            return tmp;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Override
+    public void removed() {
+        clearAttachments();   // free GPU thumbnails when the panel closes
+        super.removed();
     }
 
     /** Flatten the convo into render rows. Tool RESULT messages aren't drawn — they only mark the
@@ -1043,16 +1369,27 @@ public final class NumenScreen extends Screen {
         Set<String> done = doneIds();
         Set<String> failed = failedIds();
         List<LlmToolCall> group = new ArrayList<>();        // a run of consecutive tool calls
-        for (ConvoState.Msg msg : loop().convo().snapshot()) {
-            switch (msg) {
+        List<ConvoState.Msg> snap = loop().convo().snapshot();
+        for (int i = 0; i < snap.size(); i++) {
+            switch (snap.get(i)) {
                 case ConvoState.Msg.User u -> {
                     flushTools(out, group, done, failed, width);
                     wrapPlain(out, u.content(), YOU, width);     // user = teal body, no label
+                    int nAtt = u.attachments().size();           // muted "N image(s)" note under the text
+                    if (nAtt > 0) {
+                        wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
+                    }
                 }
                 case ConvoState.Msg.Assistant a -> {
                     AssistantTurn turn = a.turn();
                     if (turn.content() != null && !turn.content().isBlank()) {
                         flushTools(out, group, done, failed, width);   // spoken reply breaks the fold
+                        // A past turn's stored reasoning folds in right before its text row,
+                        // collapsed by default (keyed by the message's snapshot index).
+                        String pastThink = loop().reasoningAt(i);
+                        if (pastThink != null && !pastThink.isBlank()) {
+                            addThinkingRows(out, "think-" + i, pastThink, false, width);
+                        }
                         addHeader(out, name, AI, width);         // bold name header on its OWN line
                         wrapPlain(out, turn.content(), AI, width);
                     }
@@ -1062,6 +1399,14 @@ public final class NumenScreen extends Screen {
             }
         }
         flushTools(out, group, done, failed, width);
+        // Live "thinking" — the current turn's streaming reasoning transcript, shown as a fold:
+        // collapsed (default) = ONE row with a live-updating tail preview, so the row count stays
+        // stable while streaming; click to expand the full text. Keyed by the snapshot size so each
+        // new turn's fold starts collapsed again. Display-only (never in the convo snapshot).
+        String think = loop().liveReasoning();
+        if (think != null && !think.isBlank()) {
+            addThinkingRows(out, "think-live-" + snap.size(), think, true, width);
+        }
         if (loop().isCompacting()) {
             wrapPlain(out, "compacting history…", TXT_MUTED, width);
         }
@@ -1105,6 +1450,44 @@ public final class NumenScreen extends Screen {
     private void addToolRow(List<Row> out, LlmToolCall tc, int width) {
         FormattedCharSequence seq = colored(fitOneLine(toolLine(tc), width - 2 - 11), TOOL).getVisualOrderText();
         out.add(new Row(seq, TOOL, List.of(tc.id()), null));
+    }
+
+    /** Emit a thinking fold. Collapsed → one clickable summary row: live turns show
+     *  {@code ▸ thinking · <tail preview>} (updates in place while streaming), past turns show
+     *  {@code ▸ thinking (1.2k chars)}. Expanded → a {@code ▾ thinking} header + the wrapped
+     *  TXT_FAINT body. Click toggling rides the same {@code foldKey} + {@link #expandedGroups}
+     *  mechanism as tool-call groups ({@link #toggleFoldAt}), just with non-colliding keys. */
+    private void addThinkingRows(List<Row> out, String key, String text, boolean live, int width) {
+        if (!expandedGroups.contains(key)) {
+            String label = live
+                    ? tailFit("▸ thinking · ", text, width - 2)
+                    : fitOneLine("▸ thinking (" + fmtChars(text.length()) + ")", width - 2);
+            out.add(new Row(colored(label, TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
+        } else {
+            out.add(new Row(colored("▾ thinking", TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
+            wrapPlain(out, text, TXT_FAINT, width);
+        }
+    }
+
+    /** One line of {@code prefix} + the TAIL of {@code text} (its newest part), front-ellipsized to
+     *  fit {@code pxWidth}. A rough char pre-cut keeps the per-frame trim loop cheap on long text. */
+    private String tailFit(String prefix, String text, int pxWidth) {
+        String t = text.replaceAll("\\s+", " ").trim();
+        int budget = pxWidth - font.width(prefix);
+        int maxChars = Math.max(1, budget / 2);   // narrowest glyphs are ~2px, so this always overshoots
+        String tail = t.length() > maxChars ? t.substring(t.length() - maxChars) : t;
+        boolean cut = tail.length() < t.length();
+        while (tail.length() > 1 && font.width((cut ? "…" : "") + tail) > budget) {
+            tail = tail.substring(1);
+            cut = true;
+        }
+        return prefix + (cut ? "…" : "") + tail;
+    }
+
+    /** Compact char count for the fold summary: 812 → "812 chars", 1234 → "1.2k chars". */
+    private static String fmtChars(int n) {
+        return n < 1000 ? n + " chars"
+                : String.format(java.util.Locale.ROOT, "%.1fk chars", n / 1000.0);
     }
 
     /** Trim a string with an ellipsis so it fits one line of the given pixel width. */
@@ -1308,4 +1691,8 @@ public final class NumenScreen extends Screen {
     /** A rendered transcript line. {@code toolIds} non-null = a tool row (status icon = spinner/✔/✗).
      *  {@code foldKey} non-null = a clickable fold toggle (the group's first id); both null = plain text. */
     private record Row(FormattedCharSequence text, int color, List<String> toolIds, String foldKey) {}
+
+    /** A composed-but-unsent image: the source file (copied into the attachments dir on send)
+     *  plus its live thumbnail texture and on-screen size. */
+    private record PendingImage(Path source, net.minecraft.resources.Identifier texId, int w, int h) {}
 }

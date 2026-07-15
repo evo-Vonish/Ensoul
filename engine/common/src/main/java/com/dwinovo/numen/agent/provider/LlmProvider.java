@@ -62,6 +62,29 @@ public interface LlmProvider {
     /** Build the user-role wire message for {@code content}. */
     JsonObject buildUserMessage(String content);
 
+    /**
+     * Build the user-role wire message for {@code content} that may carry image
+     * {@code attachmentPaths} (absolute paths to persisted image files).
+     *
+     * <p>When there are no attachments the result MUST be byte-identical to
+     * {@link #buildUserMessage(String)} — a plain {@code content} string — so the
+     * common text-only case keeps its prompt-cache-stable shape.
+     *
+     * <p>{@code includeImages} gates whether the image bytes are actually inlined
+     * (as OpenAI multimodal {@code image_url} data URLs). The caller passes
+     * {@code true} only for the MOST RECENT user message and {@code false} for
+     * older ones, so history doesn't re-ship every image on every turn — older
+     * messages degrade to text plus a short "[image omitted]" placeholder.
+     *
+     * <p>Default: ignore attachments entirely (text-only backends). The
+     * OpenAI-compatible family overrides this in {@link OpenAIProvider}; every
+     * OpenAI-compat subclass (Zhipu, DeepSeek, …) inherits that override.
+     */
+    default JsonObject buildUserMessage(String content, java.util.List<String> attachmentPaths,
+                                        boolean includeImages) {
+        return buildUserMessage(content);
+    }
+
     /** Build the system-role wire message for {@code content}. */
     JsonObject buildSystemMessage(String content);
 
@@ -89,8 +112,43 @@ public interface LlmProvider {
     JsonObject buildRequestBody(String model, String systemPrompt,
                                 List<JsonObject> messages, JsonArray tools);
 
+    /**
+     * Apply the user-configured reasoning-effort knob to an already-built
+     * request {@code body}. No-op by default: most backends don't expose a
+     * reasoning_effort parameter, and passing one where it isn't supported is
+     * an error. Providers that support it override this, gating on both the
+     * {@code effort} value ({@code null}/blank/{@code "auto"} means "leave the
+     * body alone") and the {@code model} (the parameter is often model-family
+     * specific).
+     *
+     * @param body    the mutable request body to augment in place
+     * @param model   the model id the request targets
+     * @param effort  configured effort ({@code auto}/{@code off}/{@code minimal}/
+     *                {@code low}/{@code medium}/{@code high}); {@code auto} =
+     *                don't send anything, {@code off} = disable thinking where
+     *                the provider supports a toggle
+     */
+    default void applyReasoning(JsonObject body, String model, String effort) {}
+
     /** Decode the response body into our internal {@link AssistantTurn}. */
     AssistantTurn parseResponseBody(JsonObject body);
+
+    // ---- account balance (optional capability) ----
+
+    /**
+     * Absolute URL of this backend's key-scoped account-balance endpoint, or {@code null}
+     * when the provider has no such API (OpenAI: dashboard-only; zhipu: console-only —
+     * no documented balance endpoint for standard API keys). {@code configuredBaseUrl} is
+     * advisory (region/host selection); most providers return a canonical absolute URL.
+     */
+    default String balanceUrl(String configuredBaseUrl) { return null; }
+
+    /**
+     * Turn a successful balance-endpoint response into a one-line display string, e.g.
+     * {@code "余额: ¥12.34 (赠送 ¥0.50)"}. Only called when {@link #balanceUrl} returned
+     * non-null and the GET succeeded; implementations should be tolerant of missing fields.
+     */
+    default String parseBalance(JsonObject body) { return null; }
 
     // ---- streaming ----
 

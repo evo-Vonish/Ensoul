@@ -28,7 +28,22 @@ public final class ConvoState {
 
     /** Tagged union for conversation history. */
     public sealed interface Msg permits Msg.User, Msg.Assistant, Msg.Tool {
-        record User(String content) implements Msg {}
+        /**
+         * An owner message. {@code attachments} are absolute paths to persisted
+         * image files under {@code config/numen/attachments/<uuid>/} that ride
+         * along with this turn (empty for the overwhelmingly common text-only
+         * case). Kept as file paths, not bytes: the image is base64-inlined only
+         * at request-build time, and only for the most recent user message (see
+         * {@code NumenLlmClient}), so history stays cheap.
+         */
+        record User(String content, List<String> attachments) implements Msg {
+            /** Text-only convenience — the common case; no image attachments. */
+            public User(String content) { this(content, List.of()); }
+            /** Normalise null / defensively copy so the record stays immutable. */
+            public User {
+                attachments = attachments == null ? List.of() : List.copyOf(attachments);
+            }
+        }
         record Assistant(AssistantTurn turn) implements Msg {}
         record Tool(String toolCallId, String content) implements Msg {}
     }
@@ -72,6 +87,11 @@ public final class ConvoState {
 
     public void addUser(String content) {
         push(new Msg.User(content));
+    }
+
+    /** Owner message carrying image attachment file paths (see {@link Msg.User}). */
+    public void addUser(String content, List<String> attachments) {
+        push(new Msg.User(content, attachments));
     }
 
     public void addAssistant(AssistantTurn turn) {

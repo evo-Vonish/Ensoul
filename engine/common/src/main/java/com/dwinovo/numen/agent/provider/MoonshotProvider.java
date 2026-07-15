@@ -62,4 +62,36 @@ public final class MoonshotProvider extends OpenAIProvider {
         }
         return m;
     }
+
+    /**
+     * Documented balance endpoint ({@code GET /v1/users/me/balance}, Bearer key):
+     * <a href="https://platform.moonshot.ai/docs/api/balance">platform.moonshot.ai/docs/api/balance</a>.
+     * Users pointed at the China host ({@code api.moonshot.cn}) get its counterpart.
+     */
+    @Override
+    public String balanceUrl(String configuredBaseUrl) {
+        boolean cn = configuredBaseUrl != null && configuredBaseUrl.contains("moonshot.cn");
+        return (cn ? "https://api.moonshot.cn" : "https://api.moonshot.ai") + "/v1/users/me/balance";
+    }
+
+    /** {@code {"code":0,"data":{"available_balance","voucher_balance","cash_balance"},"status":true}} — CNY. */
+    @Override
+    public String parseBalance(JsonObject body) {
+        if (!body.has("data") || !body.get("data").isJsonObject()) return null;
+        JsonObject data = body.getAsJsonObject("data");
+        String avail = num(data, "available_balance");
+        String s = "余额: ¥" + (avail.isEmpty() ? "?" : avail);
+        String voucher = num(data, "voucher_balance");
+        if (!voucher.isEmpty() && !"0.00".equals(voucher)) s += " (代金券 ¥" + voucher + ")";
+        return s;
+    }
+
+    private static String num(JsonObject o, String key) {
+        if (!o.has(key) || !o.get(key).isJsonPrimitive()) return "";
+        try {
+            return String.format(java.util.Locale.ROOT, "%.2f", o.get(key).getAsDouble());
+        } catch (RuntimeException ex) {
+            return o.get(key).getAsString();
+        }
+    }
 }

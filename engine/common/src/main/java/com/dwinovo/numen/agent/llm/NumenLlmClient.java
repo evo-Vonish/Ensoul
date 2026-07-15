@@ -59,6 +59,8 @@ public final class NumenLlmClient {
     private final String fullUrl;
     private final String apiKey;
     private final String model;
+    /** Configured reasoning-effort knob, forwarded to the provider's {@code applyReasoning}. */
+    private final String reasoningEffort;
 
     private NumenLlmClient(INumenConfig config) {
         this.provider = pickProvider(config.getProvider());
@@ -69,6 +71,7 @@ public final class NumenLlmClient {
                 com.dwinovo.numen.agent.model.ModelRegistry.headers(config.getProvider()));
         String configured = config.getModel();
         this.model = (configured == null || configured.isBlank()) ? "gpt-5.4-mini" : configured;
+        this.reasoningEffort = config.getReasoningEffort();
         Constants.LOG.info("[numen-llm] client initialised: provider={}, model={}, url={}, streaming={}",
                 provider.name(), model, fullUrl, provider.supportsStreaming());
     }
@@ -143,22 +146,51 @@ public final class NumenLlmClient {
      * @param systemPrompt   prepended automatically — pass empty / null to skip
      * @param onChunk        optional per-chunk callback (e.g. for live UI).
      *                       Receives the raw provider chunk JSON. May be null.
+     * @param onReasoning    optional live-reasoning callback. Fired (on the HTTP
+     *                       thread) with the whole running reasoning transcript
+     *                       each time it grows — for the live "thinking" display.
+     *                       Display-only; never persisted or re-sent. May be null.
      */
     public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
                                                        Collection<NumenTool> tools,
                                                        String systemPrompt,
-                                                       Consumer<JsonObject> onChunk) {
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
         // -- 1. Build wire-format messages and tool list via provider.
+        // Image cost control: re-sending every attachment in history each turn
+        // balloons requests, so images are inlined ONLY for the MOST RECENT user
+        // message; older user messages with attachments render as text + an
+        // "[image omitted]" placeholder on the wire (see OpenAIProvider). Find
+        // that most-recent user index up front.
+        int lastUserIdx = -1;
+        for (int i = 0; i < messages.size(); i++) {
+            if (messages.get(i) instanceof ConvoState.Msg.User) lastUserIdx = i;
+        }
         List<JsonObject> wire = new ArrayList<>(messages.size());
-        for (ConvoState.Msg m : messages) {
+        for (int i = 0; i < messages.size(); i++) {
+            ConvoState.Msg m = messages.get(i);
+            final boolean inlineImages = (i == lastUserIdx);
             switch (m) {
-                case ConvoState.Msg.User u -> wire.add(provider.buildUserMessage(u.content()));
+                case ConvoState.Msg.User u ->
+                        wire.add(provider.buildUserMessage(u.content(), u.attachments(), inlineImages));
                 case ConvoState.Msg.Assistant a -> wire.add(provider.assistantToRequestMessage(a.turn()));
                 case ConvoState.Msg.Tool t -> wire.add(provider.buildToolResultMessage(t.toolCallId(), t.content()));
             }
         }
         JsonArray toolList = provider.buildToolList(tools);
         JsonObject body = provider.buildRequestBody(model, systemPrompt, wire, toolList);
+        // Reasoning-effort knob (provider-specific; no-op unless the provider
+        // supports it AND the configured effort/model warrant it).
+        provider.applyReasoning(body, model, reasoningEffort);
+        // One INFO line per request stating the effort actually configured, tagged with
+        // the same lr-N id the transport will use — so the game log shows exactly what
+        // reached the wire (reserve the id here; the transport reuses it below).
+        String requestId = HttpLlmTransport.nextRequestId();
+        boolean effortAuto = reasoningEffort == null || reasoningEffort.isBlank()
+                || reasoningEffort.equalsIgnoreCase("auto");
+        Constants.LOG.info("[numen-llm] {} reasoning: effort={} ({}, {})",
+                requestId, effortAuto ? "none/provider-default" : reasoningEffort,
+                provider.name(), model);
 
         // -- 2. Enable streaming + usage reporting (both server-side flags).
         body.addProperty("stream", true);
@@ -175,10 +207,17 @@ public final class NumenLlmClient {
         // -- 3. Stream the response into an accumulator.
         long t0 = System.nanoTime();
         StreamAccumulator acc = new StreamAccumulator();
-        return transport.postSse(fullUrl, apiKey, body, chunk -> {
+        // Tracks the reasoning buffer length last seen, so we only fire the
+        // callback (with the whole running transcript) when it actually grew.
+        final int[] lastReasoningLen = {0};
+        return transport.postSse(requestId, fullUrl, apiKey, body, chunk -> {
             try {
                 provider.accumulateChunk(chunk, acc);
                 if (onChunk != null) onChunk.accept(chunk);
+                if (onReasoning != null && acc.reasoning.length() > lastReasoningLen[0]) {
+                    lastReasoningLen[0] = acc.reasoning.length();
+                    onReasoning.accept(acc.reasoning.toString());
+                }
             } catch (RuntimeException ex) {
                 Constants.LOG.warn("[numen-llm] accumulator failed on chunk: {}", ex.getMessage());
             }
@@ -228,6 +267,38 @@ public final class NumenLlmClient {
 
     public LlmProvider provider() { return provider; }
     public String model() { return model; }
+
+    // ---- account balance (Settings → Usage view) ----
+
+    /** Whether the active provider exposes a key-scoped balance endpoint. */
+    public boolean supportsBalance() {
+        return provider.balanceUrl(balanceBase()) != null;
+    }
+
+    /**
+     * Query the provider's account balance. Resolves with a one-line display string
+     * (provider-parsed, e.g. {@code "余额: ¥12.34 (赠送 ¥0.50)"}; raw JSON as a fallback
+     * when the parse comes up empty). Fails when the provider has no balance API or the
+     * HTTP call errors. Fully async — completes on the HTTP executor thread.
+     */
+    public CompletableFuture<String> queryBalance() {
+        String url = provider.balanceUrl(balanceBase());
+        if (url == null) {
+            return CompletableFuture.failedFuture(
+                    new UnsupportedOperationException("provider has no balance API"));
+        }
+        return transport.get(url, apiKey).thenApply(body -> {
+            String s = provider.parseBalance(body);
+            return (s == null || s.isBlank()) ? truncate(body.toString(), 120) : s;
+        });
+    }
+
+    /** The effective base URL (chat URL minus the {@code /chat/completions} suffix). */
+    private String balanceBase() {
+        return fullUrl.endsWith(CHAT_COMPLETIONS_SUFFIX)
+                ? fullUrl.substring(0, fullUrl.length() - CHAT_COMPLETIONS_SUFFIX.length())
+                : fullUrl;
+    }
 
     /**
      * Map a config {@code provider} string to a concrete {@link LlmProvider}.

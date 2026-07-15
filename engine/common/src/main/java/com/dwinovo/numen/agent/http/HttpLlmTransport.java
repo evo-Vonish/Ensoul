@@ -105,6 +105,27 @@ public final class HttpLlmTransport {
     }
 
     /**
+     * GET a JSON resource with the same bearer auth + per-site headers as chat calls —
+     * used for provider account-balance endpoints. Buffered (no SSE); resolves with the
+     * parsed body or fails with {@link LlmHttpException} on non-2xx.
+     */
+    public CompletableFuture<JsonObject> get(String url, String apiKey) {
+        String requestId = nextRequestId();
+        long t0 = System.nanoTime();
+        Constants.LOG.debug("[numen-http][{}] GET {}", requestId, url);
+        HttpRequest.Builder b = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(REQUEST_TIMEOUT);
+        extraHeaders.forEach(b::header);
+        HttpRequest request = b.header("Authorization", "Bearer " + apiKey)
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+        return client.sendAsync(request, BodyHandlers.ofString(StandardCharsets.UTF_8))
+                .thenCompose(resp -> interpretBuffered(requestId, t0, resp));
+    }
+
+    /**
      * POST a JSON body, stream the response as SSE events into the
      * {@code chunkHandler}. The returned future completes when the stream
      * terminates normally; it fails with {@link LlmHttpException} if the
@@ -113,7 +134,17 @@ public final class HttpLlmTransport {
      */
     public CompletableFuture<Void> postSse(String url, String apiKey, JsonObject body,
                                             Consumer<JsonObject> chunkHandler) {
-        String requestId = nextRequestId();
+        return postSse(nextRequestId(), url, apiKey, body, chunkHandler);
+    }
+
+    /**
+     * Same as {@link #postSse(String, String, JsonObject, Consumer)} but with a caller-reserved
+     * request id (obtained from {@link #nextRequestId()}), so the caller can emit its own log
+     * lines correlated with this request BEFORE dispatch (e.g. the per-request reasoning-effort
+     * line in {@code NumenLlmClient}).
+     */
+    public CompletableFuture<Void> postSse(String requestId, String url, String apiKey, JsonObject body,
+                                            Consumer<JsonObject> chunkHandler) {
         String bodyStr = body.toString();
         long t0 = System.nanoTime();
         AtomicLong chunkCount = new AtomicLong();
@@ -187,7 +218,8 @@ public final class HttpLlmTransport {
         }
     }
 
-    private static String nextRequestId() {
+    /** Reserve the next sequential request id ({@code lr-N}) — for callers that pre-log against it. */
+    public static String nextRequestId() {
         return "lr-" + REQUEST_ID_SOURCE.incrementAndGet();
     }
 

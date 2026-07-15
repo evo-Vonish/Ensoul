@@ -2,6 +2,7 @@ package com.dwinovo.numen.core;
 
 import com.dwinovo.numen.agent.skill.SkillRegistry;
 import com.dwinovo.numen.core.pathing.cache.PathCaches;
+import com.dwinovo.numen.core.perception.Perceptions;
 import com.dwinovo.numen.core.perm.NumenPermCommand;
 import com.dwinovo.numen.core.task.CompanionTickDispatcher;
 import com.dwinovo.numen.core.task.ScanBlocksJob;
@@ -66,6 +67,7 @@ public class NumenCoreNeoForge {
     private static void onServerTickPost(ServerTickEvent.Post event) {
         CompanionTickDispatcher.tick(event.getServer());
         ScanBlocksJob.tick(event.getServer());
+        Perceptions.tick(event.getServer());
         PathCaches.serverTick(event.getServer());
     }
 }

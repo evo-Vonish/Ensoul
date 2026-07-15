@@ -69,6 +69,9 @@ public final class NumenCore {
         registerTools();
         registerTaskRunners();
         registerTransport();
+        // L3 immediate perception (Wave B): subscribe the PerceptionEvents seams +
+        // lifecycle cleanup. The poll pass is registered per-loader (see loader entries).
+        com.dwinovo.numen.core.perception.Perceptions.register();
         Constants.LOG.info("[numen-core] registered {} tool(s), {} task type(s)",
                 ToolRegistry.size(), CompanionTaskFactory.size());
     }
@@ -128,6 +131,10 @@ public final class NumenCore {
         // DERIVATIVE ADDITION (ours, not upstream): appended LAST so existing tool
         // ordering — and thus prompt caching — stays stable.
         ToolRegistry.register(new com.dwinovo.numen.core.tools.RunCommandTool());
+
+        // L2 regional observation (Wave C): recall remembered region cognition. Appended
+        // after RunCommandTool so all prior tool ordering — and prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RecallRegionTool());
     }
 
 

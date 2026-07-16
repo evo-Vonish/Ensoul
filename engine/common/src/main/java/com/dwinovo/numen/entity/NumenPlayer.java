@@ -215,9 +215,18 @@ public final class NumenPlayer extends ServerPlayer {
      * combat tracker exactly as before).
      */
     public String consumeLastDeathMessage() {
-        String s = lastDeathMessage;
-        lastDeathMessage = null;
-        return s;
+        // Deliberately NON-clearing since the pack's corrective producer reads the same
+        // snapshot (CorrectiveNotices.onDeath): a body dies once — respawn builds a fresh
+        // NumenPlayer, so the field's lifetime already matches the death. Clearing here
+        // created a first-reader-wins race between the engine death event and the pack's
+        // stop-loss counter (field evidence: engine logged "Fenn淹死了" while the toll
+        // still recorded "死"). Name kept for API stability.
+        return lastDeathMessage;
+    }
+
+    /** The snapshot taken by {@link #die}, or {@code null} if death bypassed die(). Non-clearing. */
+    public String lastDeathMessage() {
+        return lastDeathMessage;
     }
 
     @Override

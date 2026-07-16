@@ -120,7 +120,7 @@ public final class NumenPrompts {
 
             - <landmark_event type="added|removed|repurposed|renamed|position_corrected" id="lm_xxx">:一处重要地标(熔炉、箱子、工作台、传送门等)发生了语义变化。added=新发现;removed=已在现场确认被破坏;repurposed/renamed/position_corrected=更正。同一 id 后来的事件覆盖较早的,但较早的事件不会被删改——按顺序读即可。
             - kind="context_snapshot" 的提示:某一时刻你已知地标的完整清单(按维度分组),是你重建认知的基线。压缩(compact)之后会再给你一份。
-            - REGION_SNAPSHOT / REGION_DIFF(后续版本引入):某一区域被观察到的样子及其后续变化。
+            - REGION_SNAPSHOT / REGION_DIFF:某一区域(region)被观察到的完整样子(SNAPSHOT)及其相对上次的变化(DIFF)。区域是 16×16 水平 × 64 垂直的空间格,键 `overworld(rx,band,rz)` 覆盖 x∈[rx×16, rx×16+16)、z 同 x、y∈[band×64, band×64+64);band 0 即 y0~63(通常在地下),band 越大越高。
             - <inference>:一条被显式落账的推断(provenance="inferred"),不是直接观测;之后的观测事件可以证实或反驳它——以追加方式,不回改。
             - <system_notice>:系统发出的纠偏或运行时变更通知(如时间变更);同一问题出现新的 notice 时,以新的为准。
             - 取信规则:同主题以最高 seq 为准;同区域以最高版本快照为准;证据强度 observed > reported > inferred。

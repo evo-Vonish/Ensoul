@@ -107,6 +107,7 @@ public final class Perceptions {
         PerceptionEvents.onHurt(Perceptions::onHurt);
         PerceptionEvents.onEffectChange(Perceptions::onEffectChange);
         PerceptionEvents.onItemPickup(Perceptions::onItemPickup);
+        Reflexes.register();   // spinal reflex layer: its own hurt subscription for attacker tracking
         // Drop per-companion perception + region-memory state when the body leaves the world.
         CompanionLifecycle.onRemove(body -> {
             STATES.remove(body.getUUID());
@@ -115,7 +116,8 @@ public final class Perceptions {
         Constants.LOG.info("[numen-core] L3 immediate perception + L2 regional observation registered");
     }
 
-    private static PerceptionState stateFor(NumenPlayer body) {
+    /** Package-private so {@link Reflexes} can reach a body's state from its own hurt seam. */
+    static PerceptionState stateFor(NumenPlayer body) {
         return STATES.computeIfAbsent(body.getUUID(), k -> new PerceptionState());
     }
 
@@ -138,6 +140,10 @@ public final class Perceptions {
     private static void tickOne(NumenPlayer body) {
         PerceptionState st = stateFor(body);
         long now = body.level().getGameTime();
+
+        // Spinal reflex pass — runs EVERY tick (survival can't wait for the 10t/20t polls or the
+        // LLM). Trivial and early-bailing: a couple of cheap checks unless an episode is live.
+        Reflexes.tick(body, st, now);
 
         // Time-independent flushes (O(1) guards; only work when something is buffered).
         if (st.hurtWindowEnd != 0 && now >= st.hurtWindowEnd) flushHurt(body, st);
@@ -462,13 +468,13 @@ public final class Perceptions {
         return ew + ns;   // 东北 / 东南 / 西北 / 西南
     }
 
-    /** Trim a float to a compact string: "12" for whole values, "6.5" otherwise. */
-    private static String fmt(float v) {
+    /** Trim a float to a compact string: "12" for whole values, "6.5" otherwise. (Shared with {@link Reflexes}.) */
+    static String fmt(float v) {
         return v == Math.rint(v) ? Integer.toString((int) v) : String.format(Locale.ROOT, "%.1f", v);
     }
 
-    /** Neutralise the XML delimiters so a custom entity/item name can't break the {@code <event>} tag. */
-    private static String safe(String s) {
+    /** Neutralise the XML delimiters so a custom entity/item name can't break the {@code <event>} tag. (Shared with {@link Reflexes}.) */
+    static String safe(String s) {
         if (s == null) return "";
         return s.replace('&', '＆').replace('<', '（').replace('>', '）');
     }

@@ -1,5 +1,7 @@
 package com.dwinovo.numen.core.perception;
 
+import net.minecraft.world.entity.Entity;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -77,4 +79,24 @@ final class PerceptionState {
     // ---- L2 regional observation (Wave C) ----
     /** Storage key of the region the companion was in last poll; null = not yet known. */
     String lastRegionKey;
+
+    // ---- reflex layer (spinal cord) — see {@link Reflexes}. Server-thread only, like the rest. ----
+
+    // Reflex 1: suffocation escape (the wall death).
+    /** Game time the next block-break attempt is allowed (20t between attempts); 0 = ready. */
+    long reflexSuffocateCooldownUntil;
+    /** True while stuck-in-a-wall; gates the once-per-episode note (cleared when free again). */
+    boolean reflexSuffocateEpisode;
+
+    // Reflex 2: critical-HP fight-back / flee (the mauled-while-thinking death).
+    /** Last LIVING attacker recorded from the hurt seam (fight-back target); null = none. */
+    Entity reflexAttacker;
+    /** Game time we were last hit by / last saw {@link #reflexAttacker} (arms the 100t gone-timer). */
+    long reflexAttackerSeenTick;
+    /** True while a critical-HP episode is live; gates the once-per-episode note. */
+    boolean reflexCriticalEpisode;
+    /** Game time the next reflex swing is allowed (~one hit per 12t); 0 = ready. */
+    long reflexSwingUntil;
+    /** Flee-drive deadline (≤ now+60t) while sprinting away; 0 = not currently fleeing. */
+    long reflexFleeUntil;
 }

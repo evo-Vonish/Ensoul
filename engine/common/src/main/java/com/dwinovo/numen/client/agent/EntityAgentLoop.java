@@ -213,6 +213,35 @@ public final class EntityAgentLoop {
     private boolean pendingUrgent = false;
 
     /**
+     * Emergency refractory latch: true while the LLM response currently awaited belongs to an
+     * EMERGENCY-classified turn. While set, urgent events must NOT preempt — the emergency turn
+     * is already racing toward a reaction, and superseding it restarts the latency clock. Under
+     * a sustained attack (a zombie biting every 1.5–3 s) preempt-on-every-hit livelocks: each
+     * response lands just after the next preemption superseded it, its tool calls are discarded,
+     * and zero combat actions ever dispatch (field incident: gens 0→6 in 9 s, five correct
+     * [equip_item, hunt] decisions all wasted, companion died). Urgents arriving during the
+     * refractory buffer normally and keep {@link #pendingUrgent} set, so the FOLLOW-UP turn is
+     * emergency-classified too. Lifecycle mirrors {@link #awaitingLlmResponse} exactly: set at
+     * dispatch, cleared when the awaited response lands (success or failure), on owner abort,
+     * and on death freeze — no path leaves it stuck.
+     */
+    private boolean awaitingEmergency = false;
+
+    /** At most one preemption per this many client ticks, whatever the turn classification (3 s). */
+    private static final int PREEMPT_COOLDOWN_TICKS = 60;
+
+    /** Client ticks seen by this loop (bumped in {@link #clientTick}) — the cooldown clock. */
+    private long clientTicks = 0;
+
+    /**
+     * Tick of the last preemption — the cooldown backstop against cross-kind urgent storms
+     * (e.g. hurt + creeper alarms interleaved) where each kind alone would pass the refractory
+     * check. Initialised to {@code -PREEMPT_COOLDOWN_TICKS} so the first preemption is never
+     * blocked (and no {@code Long.MIN_VALUE} subtraction overflow).
+     */
+    private long lastPreemptTick = -PREEMPT_COOLDOWN_TICKS;
+
+    /**
      * Generations superseded by an emergency preemption whose in-flight response we still
      * want to <em>harvest</em> (its accumulated reasoning + any final text) when it lands,
      * as opposed to an owner-/death-interrupt where the discarded response is simply dropped.
@@ -366,8 +395,9 @@ public final class EntityAgentLoop {
         tryStartTurn();
     }
 
-    /** Driven once per client tick (see {@code AgentLoopRegistry.tickAll}) — backstop timeout. */
+    /** Driven once per client tick (see {@code AgentLoopRegistry.tickAll}) — backstop timeout + cooldown clock. */
     public void clientTick() {
+        clientTicks++;
         dispatcher.tick();
     }
 
@@ -470,6 +500,7 @@ public final class EntityAgentLoop {
             pendingUrgent = false;        // an owner interrupt cancels a pending urgent classification
             boolean wasAwaitingLlm = awaitingLlmResponse;
             awaitingLlmResponse = false;
+            awaitingEmergency = false;   // interrupt ends any emergency refractory
             compacting = false;
             liveReasoning = ""; // the interrupted turn's live thinking is gone too
 
@@ -586,9 +617,25 @@ public final class EntityAgentLoop {
             // if it can't start until a mid-flight tool chain / compaction settles.
             pendingUrgent = true;
             if (awaitingLlmResponse && !dispatcher.busy() && !compacting) {
-                // A slow think is streaming and nothing has been appended for it yet:
-                // supersede it NOW with a fast emergency turn rather than waiting it out.
-                preemptWithEmergencyTurn();
+                if (awaitingEmergency) {
+                    // REFRACTORY: an emergency turn is already racing toward a reaction.
+                    // Preempting it would restart the latency clock — under a sustained
+                    // attack that livelocks (every response lands pre-superseded, its
+                    // tools discarded, and no action ever executes). Buffer instead;
+                    // pendingUrgent stays set so the follow-up turn is emergency too.
+                    Constants.LOG.info("[numen-entity#{}] urgent buffered (emergency turn in flight, gen {})",
+                            entityUuid, turnGeneration);
+                } else if (clientTicks - lastPreemptTick < PREEMPT_COOLDOWN_TICKS) {
+                    // COOLDOWN backstop: at most one preemption per window, whatever the
+                    // in-flight turn's classification (covers cross-kind urgent storms).
+                    Constants.LOG.info("[numen-entity#{}] urgent buffered (preempt cooldown, {} tick(s) left)",
+                            entityUuid, PREEMPT_COOLDOWN_TICKS - (clientTicks - lastPreemptTick));
+                } else {
+                    // A slow BASE think is streaming and nothing has been appended for it
+                    // yet: supersede it NOW with a fast emergency turn rather than waiting
+                    // it out (first-response latency matters).
+                    preemptWithEmergencyTurn();
+                }
             } else {
                 tryStartTurn();
             }
@@ -765,6 +812,9 @@ public final class EntityAgentLoop {
     private void dispatchLlmTurn(boolean emergency) {
         convo.incrementTurn();
         awaitingLlmResponse = true;
+        // Refractory latch: while an EMERGENCY turn's response is awaited, urgent events
+        // buffer instead of preempting (see injectEvent). Mirrors awaitingLlmResponse.
+        awaitingEmergency = emergency;
 
         var tools = ToolRegistry.all();
         var snapshot = convo.snapshot();
@@ -801,6 +851,7 @@ public final class EntityAgentLoop {
      * {@link #harvestPreemptedTurn}).
      */
     private void preemptWithEmergencyTurn() {
+        lastPreemptTick = clientTicks;       // start the preempt cooldown window (one per 60 ticks)
         int supersededGen = turnGeneration;
         preemptedGenerations.add(supersededGen);
         turnGeneration++;                    // in-flight response now stale → discarded + harvested on arrival
@@ -1063,6 +1114,7 @@ public final class EntityAgentLoop {
             return;
         }
         awaitingLlmResponse = false;
+        awaitingEmergency = false;   // refractory ends with the awaited response — success OR failure below
         // The turn's response has landed — its thinking is done streaming. Capture the
         // live transcript (moved to per-turn storage below, once the assistant message
         // is appended and its index is known) and clear the live channel.

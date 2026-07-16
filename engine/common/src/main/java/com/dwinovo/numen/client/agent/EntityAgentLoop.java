@@ -104,7 +104,7 @@ public final class EntityAgentLoop {
 
     private static final String COMPACT_SYSTEM_PROMPT =
             "You are a helpful AI assistant tasked with summarizing conversations "
-            + "between a Minecraft companion entity (the Numen) and its owner.";
+            + "between a Minecraft companion entity (Fenn) and its owner.";
 
     /**
      * The summarization request, appended as the final user message over the

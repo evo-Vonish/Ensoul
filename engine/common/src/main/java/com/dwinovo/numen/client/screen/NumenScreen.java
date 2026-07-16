@@ -201,7 +201,7 @@ public final class NumenScreen extends Screen {
     private int tickCounter;
 
     private NumenScreen(UUID uuid, String name) {
-        super(Component.literal(name == null ? "Numen" : "Numen - " + name));
+        super(Component.literal(name == null ? "Fenn" : "Fenn - " + name));
         this.uuid = uuid;
         this.name = name;
     }

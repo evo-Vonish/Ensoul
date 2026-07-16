@@ -244,7 +244,7 @@ public final class FabricNumenConfig implements INumenConfig {
         // entirely from those tools' own descriptions plus the runtime-injected
         // <available_skills> XML block — adding rules here just dilutes
         // attention. Mirrors opencode's default.txt minimalist style.
-        public String systemPrompt = "You are Numen, a Minecraft entity controlled by the player who owns you.\nUse the tools provided to act in the world; output text only to talk to your owner.";
+        public String systemPrompt = "You are Fenn, a Minecraft entity controlled by the player who owns you.\nUse the tools provided to act in the world; output text only to talk to your owner.";
         // Reasoning-effort knob for reasoning-capable models:
         //   auto (default) — send nothing; the backend decides (zhipu's default
         //                    is thinking ON at max effort!)

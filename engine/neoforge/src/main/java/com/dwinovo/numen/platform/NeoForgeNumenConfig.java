@@ -67,7 +67,7 @@ public final class NeoForgeNumenConfig implements INumenConfig {
         // attention. Mirrors opencode's default.txt minimalist style.
         SYSTEM_PROMPT = b.comment("System prompt prepended to every conversation.")
                 .define("system_prompt",
-                        "You are Numen, a Minecraft entity controlled by the player who owns you.\n"
+                        "You are Fenn, a Minecraft entity controlled by the player who owns you.\n"
                                 + "Use the tools provided to act in the world; output text only to talk to your owner.");
         REASONING_EFFORT = b.comment(
                 "Reasoning effort for reasoning-capable models (currently GLM via the zhipu provider).",

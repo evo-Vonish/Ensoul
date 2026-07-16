@@ -53,9 +53,15 @@ public final class PlaceManeuver {
     private static final Direction[] FACES = {
             Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST, Direction.DOWN};
     /** After this many ticks without placing, back off a step to re-find the angle
-     *  (Baritone MovementAscend MOVE_BACK), then edge in again — alternating windows. */
+     *  (Baritone MovementAscend MOVE_BACK), then edge in again — alternating windows.
+     *  PATHFINDER (bridge/scaffold) mode only; settle mode never backs off. */
     private static final int BACK_OFF_TICKS = 12;
     private static final int LIMIT_TICKS = 60;
+    /** Settle mode: the most forward sneak-creep ticks allowed before the body must
+     *  already be at a rim with a clear line of sight (≈half a block of lean). Small
+     *  because the place_block task pre-positions to a good stance first; the creep is
+     *  only a gentle lean-over, never a walk. */
+    private static final int MAX_CREEP_TICKS = 10;
 
     private final NumenPlayer player;
     private final BlockPos placeAt;
@@ -63,28 +69,51 @@ public final class PlaceManeuver {
     private final BooleanSupplier placed;    // is placeAt now filled the way we want?
     private final Hints hints;
     private final Block block;               // for the dry-run; null for the pathfinder (no hints)
+    /** Stationary tool placement (place_block): settle in a dead zone and place, no
+     *  fore/aft oscillation. {@code false} = the pathfinder's lean-out bridge feel. */
+    private final boolean settle;
 
     private BlockPos against;
     private Direction faceDir;               // from `against` back to the target
     private int ticks;
+    /** Settle mode: whether a clear line of sight has ever been achieved from this stance —
+     *  once true, stop creeping so the body holds still instead of overshooting. */
+    private boolean hadLos;
+    /** Settle mode: forward sneak-creep ticks spent so far (capped at {@link #MAX_CREEP_TICKS}). */
+    private int crept;
     private String failReason = "couldn't place";
 
-    /** Pathfinder / orientation-agnostic placement. */
+    /** Pathfinder / orientation-agnostic placement (lean-out bridge feel). */
     public PlaceManeuver(NumenPlayer player, BlockPos placeAt,
                          IntSupplier slotFinder, BooleanSupplier placed) {
-        this(player, placeAt, slotFinder, placed, Hints.NONE, null);
+        this(player, placeAt, slotFinder, placed, Hints.NONE, null, false);
     }
 
-    /** Oriented placement: {@code block} + {@code hints} drive the support-face / aim choice. */
+    /** Oriented placement: {@code block} + {@code hints} drive the support-face / aim choice.
+     *  Lean-out (pathfinder) feel — {@link #PlaceManeuver(NumenPlayer, BlockPos, IntSupplier,
+     *  BooleanSupplier, Hints, Block, boolean)} with {@code settle=true} is the tool path. */
     public PlaceManeuver(NumenPlayer player, BlockPos placeAt,
                          IntSupplier slotFinder, BooleanSupplier placed,
                          Hints hints, Block block) {
+        this(player, placeAt, slotFinder, placed, hints, block, false);
+    }
+
+    /**
+     * Full form. {@code settle=true} is the stationary {@code place_block} placement: the
+     * body settles in a dead zone at a rim and places without the fore/aft shuffle
+     * (the caller has already walked it to a chosen stance). {@code settle=false} keeps
+     * the pathfinder's Baritone lean-out bridge feel (forward creep + periodic back-off).
+     */
+    public PlaceManeuver(NumenPlayer player, BlockPos placeAt,
+                         IntSupplier slotFinder, BooleanSupplier placed,
+                         Hints hints, Block block, boolean settle) {
         this.player = player;
         this.placeAt = placeAt.immutable();
         this.slotFinder = slotFinder;
         this.placed = placed;
         this.hints = hints == null ? Hints.NONE : hints;
         this.block = block;
+        this.settle = settle;
     }
 
     public String failReason() {
@@ -119,19 +148,16 @@ public final class PlaceManeuver {
         // (Baritone MOVE_BACK), alternating in BACK_OFF_TICKS windows.
         player.setShiftKeyDown(true);
         InputDriver.lookAt(player, facePoint);
-        boolean backing = ticks >= BACK_OFF_TICKS && (ticks / BACK_OFF_TICKS) % 2 == 1;
-        player.zza = backing ? -1.0f : 1.0f;
-        player.xxa = 0.0f;
-        player.setSprinting(false);
 
-        // Place ONLY once actually crouching (Baritone crouch-confirm — the sneak takes
-        // a tick to register) AND the raycast genuinely reaches a support face. Never
-        // fabricate a hit: if line of sight never lands, we just keep trying / time out.
-        // With orientation hints we hold back until a dry-run predicts the right state, so the
-        // body keeps repositioning to place it the right way — but never past a grace window.
+        // Place ONLY once actually crouching (Baritone crouch-confirm — the sneak takes a tick
+        // to register) AND the raycast genuinely reaches a support face. Never fabricate a hit:
+        // if line of sight never lands, keep trying / time out. With orientation hints we hold
+        // back until a dry-run predicts the right state — but never past a grace window.
+        boolean losNow = false;
         if (player.isCrouching()) {
             BlockHitResult hit = Placement.resolve(player, placeAt, true);
             if (hit != null) {
+                losNow = true;
                 boolean orientationOk = hints.isEmpty()
                         || ticks > (LIMIT_TICKS * 3) / 5         // grace: take what we can get
                         || matchesHints(predict(hit));
@@ -140,10 +166,40 @@ public final class PlaceManeuver {
                 }
             }
         }
+
+        if (settle) {
+            // Stationary tool placement: the caller pre-positioned the body at a chosen stance,
+            // so the honest place was tried FIRST (above); only lean gently toward the rim while
+            // there is NO line of sight and the small creep budget remains. Once LOS has ever
+            // landed, HALT and hold still — no back-off, no fore/aft shuffle. This is what ends
+            // the "crouch/stand, forward/back" churn: sneak is held continuously (one crouch),
+            // the body never drives backward, and it stops moving the instant it can place.
+            if (losNow) hadLos = true;
+            if (!hadLos && player.isCrouching() && crept < MAX_CREEP_TICKS) {
+                player.zza = 1.0f;
+                player.xxa = 0.0f;
+                player.setSprinting(false);
+                crept++;
+            } else {
+                InputDriver.halt(player);   // dead zone: settle and let the crouch / raycast land
+            }
+        } else {
+            // Pathfinder lean-out (bridge / scaffold): edge toward the support face, and after
+            // grinding forward without success back off a step to re-find the angle (Baritone
+            // MOVE_BACK), alternating in BACK_OFF_TICKS windows.
+            boolean backing = ticks >= BACK_OFF_TICKS && (ticks / BACK_OFF_TICKS) % 2 == 1;
+            player.zza = backing ? -1.0f : 1.0f;
+            player.xxa = 0.0f;
+            player.setSprinting(false);
+        }
+
         if (++ticks > LIMIT_TICKS) {
-            failReason = "couldn't get a clear line to a support face at " + placeAt.toShortString()
-                    + " — the view to it is blocked (a wall between, or the body is boxed in). Try a more "
-                    + "open spot next to solid ground.";
+            failReason = settle
+                    ? "couldn't get a clear line to a support face for " + placeAt.toShortString()
+                        + " from this stance — the view is blocked (a wall between, or the body is boxed in)"
+                    : "couldn't get a clear line to a support face at " + placeAt.toShortString()
+                        + " — the view to it is blocked (a wall between, or the body is boxed in). Try a more "
+                        + "open spot next to solid ground.";
             return Status.FAILED;
         }
         return Status.RUNNING;

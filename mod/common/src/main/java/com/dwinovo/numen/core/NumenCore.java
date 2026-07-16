@@ -150,6 +150,14 @@ public final class NumenCore {
         // assessment. Appended LAST, after CommitInferenceTool, so all prior tool ordering — and prompt
         // caching — stays stable.
         ToolRegistry.register(new com.dwinovo.numen.core.tools.AssessThreatTool());
+
+        // Motor-skill library v1 (docs/motor-skills-v1.md): deterministic, code-closed physical
+        // muscles the brain orders in one call — pillar up, bridge across, escape a shaft to the
+        // surface. Appended LAST, after AssessThreatTool, so all prior tool ordering — and prompt
+        // caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.PillarUpTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.BridgeToTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.EscapeToSurfaceTool());
     }
 
 
@@ -169,5 +177,13 @@ public final class NumenCore {
         CompanionTaskFactory.register(InteractEntityTaskRecord.class, (p, r) -> new InteractEntityCompanionTask(p, r));
         CompanionTaskFactory.register(LocateStructureTaskRecord.class, (p, r) -> new LocateStructureTaskGoal(p, r));
         CompanionTaskFactory.register(LocateBiomeTaskRecord.class, (p, r) -> new LocateBiomeTaskGoal(p, r));
+
+        // Motor-skill library v1 (fully-qualified to keep this a purely additive change).
+        CompanionTaskFactory.register(com.dwinovo.numen.core.task.PillarUpTaskRecord.class,
+                (p, r) -> new com.dwinovo.numen.core.task.PillarUpCompanionTask(p, r));
+        CompanionTaskFactory.register(com.dwinovo.numen.core.task.BridgeToTaskRecord.class,
+                (p, r) -> new com.dwinovo.numen.core.task.BridgeToCompanionTask(p, r));
+        CompanionTaskFactory.register(com.dwinovo.numen.core.task.EscapeToSurfaceTaskRecord.class,
+                (p, r) -> new com.dwinovo.numen.core.task.EscapeToSurfaceCompanionTask(p, r));
     }
 }

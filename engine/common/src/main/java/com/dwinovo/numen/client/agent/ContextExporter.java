@@ -84,13 +84,14 @@ public final class ContextExporter {
         sb.append("- exported: ").append(LocalDateTime.now()).append('\n');
         sb.append("- prefixHash (last request): ")
                 .append(cap != null ? cap.prefixHash() : "n/a — no request captured yet").append('\n');
+        // (helper below: ", cache NN%" or "" when the provider reported no cache detail)
         sb.append("- session usage (this companion): ").append(mine != null
                 ? mine.requests() + " req, prompt " + mine.promptTokens()
-                        + " tok, completion " + mine.completionTokens() + " tok"
+                        + " tok, completion " + mine.completionTokens() + " tok" + cacheNote(mine)
                 : "none").append('\n');
         sb.append("- session usage (global): ").append(all.requests()).append(" req, prompt ")
                 .append(all.promptTokens()).append(" tok, completion ")
-                .append(all.completionTokens()).append(" tok\n");
+                .append(all.completionTokens()).append(" tok").append(cacheNote(all)).append('\n');
         sb.append("- messages: ").append(snap.size()).append('\n');
 
         sb.append("\n## System prompt\n\n");
@@ -153,6 +154,16 @@ public final class ContextExporter {
         while (m.find()) longest = Math.max(longest, m.group().length());
         String fence = "`".repeat(longest + 1);
         sb.append(fence).append('\n').append(s).append('\n').append(fence).append('\n');
+    }
+
+    /**
+     * ", cache NN%" for a usage stat, or "" when the provider reported no cache
+     * detail (unknown is not 0%). Provider-metered — the supplier-side audit of
+     * the frozen-prefix constitution, alongside the prefixHash line above it.
+     */
+    private static String cacheNote(UsageTracker.Stat s) {
+        double rate = s.cacheHitRate();
+        return rate < 0 ? "" : ", cache " + Math.round(rate * 100) + "%";
     }
 
     private static String firstLine(String s) {

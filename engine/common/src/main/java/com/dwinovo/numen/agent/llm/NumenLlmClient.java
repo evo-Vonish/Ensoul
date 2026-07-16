@@ -132,8 +132,15 @@ public final class NumenLlmClient {
      * is the request's true context size as the API counted it — the signal the
      * agent loop's auto-compaction triggers on (no client-side token estimation
      * needed). Zero when the backend sent no usage frame.
+     *
+     * <p>{@code cachedTokens} is the provider-reported prompt-cache hit for this
+     * request ({@code usage.prompt_tokens_details.cached_tokens}, or DeepSeek's
+     * {@code prompt_cache_hit_tokens}); {@code -1} when the provider reported no
+     * cache detail — unknown is NOT the same as a miss. This is the supplier-side
+     * audit of the context constitution: a byte-frozen prefix that stops hitting
+     * the cache shows up here first.
      */
-    public record ChatResult(AssistantTurn turn, int promptTokens, int totalTokens) {}
+    public record ChatResult(AssistantTurn turn, int promptTokens, int totalTokens, int cachedTokens) {}
 
     // ---- wire capture (context export diagnostics) ----
 
@@ -292,10 +299,68 @@ public final class NumenLlmClient {
         }).thenApply(v -> {
             AssistantTurn turn = provider.finalizeStream(acc);
             logCallSummary(t0, acc, turn);
-            return new ChatResult(turn,
-                    jsonInt(acc.usage, "prompt_tokens"),
-                    jsonInt(acc.usage, "total_tokens"));
+            int prompt = jsonInt(acc.usage, "prompt_tokens");
+            int cached = cachedTokens(acc.usage);
+            auditCacheHit(companion, requestId, pfx, prompt, cached);
+            return new ChatResult(turn, prompt,
+                    jsonInt(acc.usage, "total_tokens"), cached);
         });
+    }
+
+    // ---- prompt-cache audit (constitution telemetry) ----
+
+    /**
+     * Provider-reported prompt-cache hit for one usage frame, or {@code -1} when the
+     * provider sent no cache detail. Reads the OpenAI-compatible shape
+     * ({@code prompt_tokens_details.cached_tokens} — OpenAI, zhipu, moonshot) and falls
+     * back to DeepSeek's top-level {@code prompt_cache_hit_tokens}.
+     */
+    private static int cachedTokens(JsonObject usage) {
+        if (usage == null) return -1;
+        if (usage.has("prompt_tokens_details") && usage.get("prompt_tokens_details").isJsonObject()) {
+            JsonObject details = usage.getAsJsonObject("prompt_tokens_details");
+            if (details.has("cached_tokens") && details.get("cached_tokens").isJsonPrimitive()) {
+                return details.get("cached_tokens").getAsInt();
+            }
+        }
+        if (usage.has("prompt_cache_hit_tokens") && usage.get("prompt_cache_hit_tokens").isJsonPrimitive()) {
+            return usage.get("prompt_cache_hit_tokens").getAsInt();
+        }
+        return -1;
+    }
+
+    /** Last request's (prefixHash, promptTokens) per companion — the cache-regression baseline. */
+    private record CacheBaseline(String prefixHash, int promptTokens) {}
+
+    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, CacheBaseline> CACHE_BASELINE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The supplier-side constitution audit. One INFO line per request with the metered
+     * hit; a WARN when the hit collapses even though OUR prefix stayed byte-identical
+     * and the history only grew (append-only) — i.e. the provider should have hit.
+     * A shrunken prompt (post-compaction splice) resets the baseline without warning:
+     * that recast is the one sanctioned prefix-adjacent change. First requests and
+     * providers that report no cache detail never warn.
+     */
+    private static void auditCacheHit(java.util.UUID companion, String requestId,
+                                      String pfx, int prompt, int cached) {
+        if (cached >= 0 && prompt > 0) {
+            Constants.LOG.info("[numen-llm] {} cache: hit {}/{} prompt tokens ({}%)",
+                    requestId, cached, prompt, Math.round(cached * 100.0 / prompt));
+        }
+        if (companion == null) return;
+        CacheBaseline prev = CACHE_BASELINE.put(companion, new CacheBaseline(pfx, prompt));
+        if (cached < 0 || prev == null) return;
+        boolean samePrefix = prev.prefixHash().equals(pfx);
+        boolean appendOnlyGrowth = prompt >= prev.promptTokens();
+        if (samePrefix && appendOnlyGrowth && cached < prev.promptTokens() / 2) {
+            Constants.LOG.warn(
+                    "[numen-llm] {} cache regression: prefix frozen (hash {}) and history append-only "
+                    + "(prev prompt {} -> {}), yet provider cached only {} tokens — "
+                    + "TTL expiry, provider eviction, or an unnoticed byte drift below the hash",
+                    requestId, pfx, prev.promptTokens(), prompt, cached);
+        }
     }
 
     private void logCallSummary(long t0, StreamAccumulator acc, AssistantTurn turn) {

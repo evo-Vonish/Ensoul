@@ -661,6 +661,16 @@ public final class NumenScreen extends Screen {
         // the dropdowns themselves render in render, AFTER the widgets (open list on top)
     }
 
+    /**
+     * " · cache NN%" for a usage stat, or "" when the provider reported no cache detail
+     * (unknown is not 0% — hide rather than mislead). The percentage is the provider's
+     * own metering, i.e. the supplier-side audit of the frozen-prefix constitution.
+     */
+    private static String cacheSuffix(UsageTracker.Stat s) {
+        double rate = s.cacheHitRate();
+        return rate < 0 ? "" : " · cache " + Math.round(rate * 100) + "%";
+    }
+
     /** The Usage sub-view body: session token stats (global + per companion) and the balance line. */
     private void renderUsage(GuiGraphicsExtractor g, int x, int y0) {
         int y = y0;
@@ -668,7 +678,7 @@ public final class NumenScreen extends Screen {
         txt(g, Component.literal("Usage (this session)"), x, y, TXT_MUTED);
         y += 14;
         txt(g, Component.literal("all: " + all.requests() + " req · prompt " + fmtTok(all.promptTokens())
-                + " · completion " + fmtTok(all.completionTokens())), x, y, TXT);
+                + " · completion " + fmtTok(all.completionTokens()) + cacheSuffix(all)), x, y, TXT);
         y += 14;
         var per = UsageTracker.instance().perCompanion();
         if (per.isEmpty()) {
@@ -679,7 +689,8 @@ public final class NumenScreen extends Screen {
                 if (y > yMax) break;
                 UsageTracker.Stat s = e.getValue();
                 txt(g, Component.literal(rosterName(e.getKey()) + ": " + s.requests() + " req · "
-                        + fmtTok(s.promptTokens()) + "/" + fmtTok(s.completionTokens()) + " tok"),
+                        + fmtTok(s.promptTokens()) + "/" + fmtTok(s.completionTokens()) + " tok"
+                        + cacheSuffix(s)),
                         x, y, TXT_MUTED);
                 y += 12;
             }

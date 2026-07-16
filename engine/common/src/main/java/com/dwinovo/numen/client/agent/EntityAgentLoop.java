@@ -1536,7 +1536,7 @@ public final class EntityAgentLoop {
     private void recordUsage(NumenLlmClient.ChatResult res) {
         if (res == null) return;
         UsageTracker.instance().record(entityUuid, res.promptTokens(),
-                Math.max(0, res.totalTokens() - res.promptTokens()));
+                Math.max(0, res.totalTokens() - res.promptTokens()), res.cachedTokens());
     }
 
     private static String truncate(String s, int max) {

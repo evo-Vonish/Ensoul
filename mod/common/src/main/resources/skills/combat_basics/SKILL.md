@@ -61,6 +61,16 @@ Both `hunt` and `shoot` run until done, so decide *between* tool calls: after ea
 2. **Avoid lava-adjacent corridors** in the Nether; knockback into lava is the #1 way to lose your inventory.
 3. Prefer flat, open ground for `hunt`; the pathfinder closes distance best there.
 
+## Never punch above your gear (threat gate)
+
+Before you `hunt` anything, weigh the enemy against your gear. Some enemies hit far harder than a bare or stone-tier body can trade with — charging them unarmoured is suicide, not bravery, and dying drops everything you carried.
+
+- **Iron golem**: ~7–21 damage per hit — it can two-shot a full-HP body. Village golems are NEUTRAL: they only attack if you hit a villager or hit the golem. **Do not attack a golem at all** unless you have iron armor AND an iron+ sword AND a real plan (pillar up 3+ blocks so it can't reach you, or lure it off a ledge). No armor = do not engage, full stop.
+- **Warden / Wither**: never melee. Flee.
+- **General rule**: if a single hit from the enemy would take more than a third of your HP, you are under-geared for a straight fight. Get armor and a better weapon first, or avoid it. `get_self_status` shows your gear; when in doubt, ask your owner before engaging a heavy hitter.
+
+If you have already died to something twice, that is the world telling you the fight is not winnable with your current gear — stop re-attempting it and change the plan (better gear, or leave it alone), don't feed it your equipment a third time.
+
 ## Aggro pitfalls
 
 - **Zombified piglins group-aggro**: hit one and every one nearby swarms you. Never `hunt` them.

@@ -84,6 +84,19 @@ public final class CompanionPermissions {
         return Map.copyOf(cache);
     }
 
+    /**
+     * The tier ceiling to apply when a companion's OP master switch is ON: the owner's explicit
+     * {@code /numenperm} tier if one was set, otherwise {@link PermissionLevel#GAMEMASTERS} — the sensible
+     * "OP on" default so flipping OP actually grants operator-tier commands even before the dial is touched.
+     * (Distinct from {@link #get}, which returns the {@link #DEFAULT_LEVEL ALL} default and drives the
+     * command's own query/display; OP-off flooring to ALL is handled by the caller, not here.)
+     */
+    public static PermissionLevel tierWhenOpEnabled(String companionName) {
+        load();
+        PermissionLevel explicit = cache.get(key(companionName));
+        return explicit != null ? explicit : PermissionLevel.GAMEMASTERS;
+    }
+
     // ---- tier name helpers (shared with the /numenperm command) ----
 
     /** The serialized tier names, lowest → highest, for command suggestions. */

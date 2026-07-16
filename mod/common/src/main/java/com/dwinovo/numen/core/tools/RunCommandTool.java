@@ -3,6 +3,7 @@ package com.dwinovo.numen.core.tools;
 import com.dwinovo.numen.core.perm.CompanionPermissions;
 import com.dwinovo.numen.core.tool.Schema;
 import com.dwinovo.numen.core.tool.ServerNumenTool;
+import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -34,11 +35,15 @@ import java.util.function.Consumer;
  *       {@link CommandSourceStack} is built from
  *       {@link ServerPlayer#createCommandSourceStack()}, so {@code @s}, position
  *       and dimension resolve to the body.</li>
- *   <li>Permission is capped at the OWNER's level, never more: if the owner is
- *       online we set the stack's permission to whatever the server grants the
- *       owner ({@code getProfilePermissions(owner.nameAndId())}). If the owner is
- *       offline/unresolvable we leave the companion's own default permission
- *       untouched — we do NOT elevate.</li>
+ *   <li>Permission is gated by the per-companion OP master switch (G-panel Settings), then capped:
+ *       <ul>
+ *         <li><b>OP off</b> (default) — floored to {@code all} (level 0): no operator privileges.</li>
+ *         <li><b>OP on</b> — {@code min(owner's level, the /numenperm tier)}; the tier defaults to
+ *             {@code gamemasters} when unset ({@link CompanionPermissions#tierWhenOpEnabled}). Never
+ *             elevates past the owner, never past the configured tier. Offline owner → {@code all}.</li>
+ *       </ul>
+ *       The OP flag is engine-persisted per companion ({@code Companions.isOpEnabled}); the tier stays
+ *       the pack-side {@code /numenperm} dial.</li>
  *   <li>Command feedback (success AND failure lines) is captured through a
  *       collecting {@link CommandSource} attached with
  *       {@link CommandSourceStack#withSource} and returned to the model, so it can
@@ -61,8 +66,9 @@ public final class RunCommandTool extends ServerNumenTool {
 
     @Override
     public String description() {
-        return "Run a Minecraft command as yourself, exactly like typing / in chat. Your permission "
-                + "is capped at your OWNER's level, so operator-only commands work only if they can. "
+        return "Run a Minecraft command as yourself, exactly like typing / in chat. Operator-only commands "
+                + "work only when your owner has enabled OP for you (G-panel Settings) AND their own level "
+                + "allows it; with OP off you can still run non-operator commands. "
                 + "The command's own output lines are returned in \"feedback\" so you can read what "
                 + "happened and fix mistakes. Give the command with or without a leading slash. "
                 + "Examples: \"time set day\", \"tp @s ~ ~10 ~\".";
@@ -123,12 +129,22 @@ public final class RunCommandTool extends ServerNumenTool {
             // Execute AS the companion, with feedback routed to our collector.
             CommandSourceStack stack = self.createCommandSourceStack().withSource(collector);
 
-            // Cap at the owner's permission level (never elevate beyond it). Offline owner ->
-            // keep the companion's own default permission, i.e. no elevation.
+            // Effective command permission (the OP master switch is the gate; /numenperm is the ceiling dial):
+            //   OP off -> floored to ALL (level 0): no operator privileges, whatever the owner or tier is.
+            //   OP on  -> min(owner's level, the /numenperm tier — default gamemasters if unset): never past
+            //             the owner, never past the configured tier. Offline owner -> ALL (never elevate).
             ServerPlayer owner = self.resolveOwnerPlayer();
-            if (owner != null) {
-                stack = stack.withPermission(server.getProfilePermissions(owner.nameAndId()));
+            PermissionLevel effective;
+            if (!Companions.isOpEnabled(server, self.getUUID())) {
+                effective = PermissionLevel.ALL;
+            } else {
+                PermissionLevel ownerLevel = owner != null
+                        ? server.getProfilePermissions(owner.nameAndId()).level()
+                        : PermissionLevel.ALL;
+                PermissionLevel tier = CompanionPermissions.tierWhenOpEnabled(self.getName().getString());
+                effective = ownerLevel.id() <= tier.id() ? ownerLevel : tier;   // min(owner, tier)
             }
+            stack = stack.withPermission(LevelBasedPermissionSet.forLevel(effective));
 
             // Dispatcher already trims an optional leading "/"; we stripped one above too.
             server.getCommands().performPrefixedCommand(stack, command);

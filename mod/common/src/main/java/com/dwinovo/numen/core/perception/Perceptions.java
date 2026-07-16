@@ -18,6 +18,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
 
@@ -121,6 +122,19 @@ public final class Perceptions {
         return STATES.computeIfAbsent(body.getUUID(), k -> new PerceptionState());
     }
 
+    /**
+     * The single creative-mode gate. A creative companion is invulnerable, never starves, and can't die to the
+     * environment (verified: {@code GameType.CREATIVE} grants {@code abilities.invulnerable} + no food
+     * exhaustion), so every damage-class perception and survival reflex is pure noise / token-waste for it —
+     * without this gate an invincible companion would spam "我快死了". Muting funnels through here so the whole
+     * pack shares ONE definition of "muted": {@link #onHurt} and the hunger/durability/proximity polls in
+     * {@link #tickOne}, all of {@link Reflexes#tick}, and the death stop-loss in {@link CorrectiveNotices}.
+     * Non-combat perception (item pickup, status effects, regional observation, time-of-day / weather) stays live.
+     */
+    static boolean isCreative(NumenPlayer body) {
+        return body.gameMode() == GameType.CREATIVE;
+    }
+
     // ================================================================= poll pass
 
     /** Server-tick poll of every live companion. Cheap when there are none due. */
@@ -140,23 +154,27 @@ public final class Perceptions {
     private static void tickOne(NumenPlayer body) {
         PerceptionState st = stateFor(body);
         long now = body.level().getGameTime();
+        boolean creative = isCreative(body);   // creative mutes damage-class perception + all survival reflexes
 
         // Spinal reflex pass — runs EVERY tick (survival can't wait for the 10t/20t polls or the
         // LLM). Trivial and early-bailing: a couple of cheap checks unless an episode is live.
+        // Self-gates on creative (a creative body can't die, so the reflexes are pure noise).
         Reflexes.tick(body, st, now);
 
         // Time-independent flushes (O(1) guards; only work when something is buffered).
         if (st.hurtWindowEnd != 0 && now >= st.hurtWindowEnd) flushHurt(body, st);
         if (st.pickupFlushAt != 0 && now >= st.pickupFlushAt) flushPickups(body, st);
 
-        // Throttled polls.
-        if (now % POLL_HUNGER_DURABILITY == 0) {
+        // Throttled polls. In creative the damage-class polls (hunger / tool durability / hostile proximity)
+        // are muted — a creative companion doesn't starve, its tools don't wear, and hostiles are no threat.
+        if (!creative && now % POLL_HUNGER_DURABILITY == 0) {
             pollHunger(body, st);
             pollDurability(body, st);
         }
-        if (now % POLL_PROXIMITY == 0) {
+        if (!creative && now % POLL_PROXIMITY == 0) {
             pollProximity(body, st, now);
         }
+        // Non-combat polls stay live in any mode.
         if (now % POLL_TIME_WEATHER == 0) {
             pollTimeAndWeather(body, st);
         }
@@ -187,6 +205,7 @@ public final class Perceptions {
 
     private static void onHurt(PerceptionEvents.HurtInfo info) {
         NumenPlayer body = info.body();
+        if (isCreative(body)) return;   // creative is invulnerable — no hurt / low-HP alerts (see isCreative)
         PerceptionState st = stateFor(body);
         long now = body.level().getGameTime();
         float hpAfter = info.remainingHealth();

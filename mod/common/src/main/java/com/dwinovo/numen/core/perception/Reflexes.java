@@ -141,6 +141,7 @@ public final class Reflexes {
      */
     static void tick(NumenPlayer body, PerceptionState st, long now) {
         if (!ENABLED) return;
+        if (Perceptions.isCreative(body)) return;   // creative can't die — suffocation/critical-HP/creeper reflexes are noise
         if (body.isDeadOrDying()) return;   // the corpse is handled by NumenPlayer#tick / Companions#onDeath
         if (body.level() instanceof ServerLevel level) {
             suffocationReflex(body, st, now, level);

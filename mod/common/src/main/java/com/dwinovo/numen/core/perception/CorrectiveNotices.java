@@ -90,6 +90,9 @@ public final class CorrectiveNotices {
      */
     static void onDeath(NumenPlayer body) {
         try {
+            // A creative companion can only die by /kill (invulnerability bypass), never from a survival hazard,
+            // so it carries no survival-pattern to stop-loss against — don't count it or pollute the cause tolls.
+            if (Perceptions.isCreative(body)) return;
             String name = body.getName().getString();
             String cause = normalizeCause(body.getCombatTracker().getDeathMessage().getString(), name);
             int n = DeathTolls.record(name, cause);

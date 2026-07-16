@@ -1,6 +1,9 @@
 package com.dwinovo.numen.core.perception;
 
 import com.dwinovo.numen.core.Constants;
+import com.dwinovo.numen.core.combat.Decision;
+import com.dwinovo.numen.core.combat.EngagementAssessment;
+import com.dwinovo.numen.core.combat.McCombatAdapter;
 import com.dwinovo.numen.core.pathing.exec.InputDriver;
 import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
@@ -17,7 +20,10 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 /**
  * The <strong>reflex layer</strong> (the companion's spinal cord): instant,
@@ -94,13 +100,28 @@ public final class Reflexes {
     /** How far ahead of the body the flee waypoint is placed (direction matters, not the exact point). */
     private static final double FLEE_LOOKAHEAD = 8.0;
 
-    // ---- Reflex 2 (v2): heavy-hitter override ----
+    // ---- Reflex 2 (v3): engagement-engine flee/fight verdict (replaces the crude 25%-hit rule) ----
     /**
-     * A single hit ≥ this fraction of max HP marks the attacker a "heavy hitter": flee unconditionally
-     * (any distance, any HP), never trade blows. The iron-golem death — 7.5–18.5 dmg/hit is ≥25% of a
-     * 20-HP body, so v1's distance-only rule kept swinging into a fatal exchange.
+     * How often the deterministic combat engine ({@link McCombatAdapter#assessNearby}) is re-run during a live
+     * critical episode. The v2 rule was a single scalar — "one blow ≥ 25% of max HP → flee unconditionally" —
+     * which mis-called both directions: it fled a lucky big hit from a beatable mob, and it kept trading blows
+     * into a 3-zombie pile that summed to a kill. v3 asks the engine ({@code ttkClear} vs a decreasing-k
+     * survival sim, armor-degradation math, a dynamic one-shot guard) instead. It is O(entities) arithmetic, so
+     * it runs on a throttle (this cadence), never every tick.
      */
-    private static final float HEAVY_HIT_FRAC = 0.25f;
+    private static final int REASSESS_PERIOD = 10;
+    /** Radius the engagement engine gathers hostiles over for a reflex assessment. */
+    private static final double THREAT_SCAN_RADIUS = 16.0;
+
+    /**
+     * The cached engagement verdict per companion in a LIVE critical episode ({@code nextReassess} = when to
+     * re-run the engine). Populated on episode start, refreshed every {@link #REASSESS_PERIOD} ticks, and
+     * dropped in {@link #endCriticalEpisode}, so it only ever holds entries for bodies currently in an episode —
+     * no lifecycle leak (server-thread only, like the rest of the reflex state).
+     */
+    private static final Map<UUID, ReflexPlan> PLANS = new HashMap<>();
+
+    private record ReflexPlan(long nextReassess, Decision decision, String limiting) {}
 
     // ---- Reflex 3 (v2): creeper panic sprint (HP-independent, pre-explosion) ----
     /** A creeper within this many blocks → unconditional sprint away, regardless of HP. */
@@ -232,66 +253,106 @@ public final class Reflexes {
     // ============================================================ reflex 2: critical-HP fight-back / flee
 
     /**
-     * The mauled-while-thinking death, hardened by v2's heavy-hitter seam. Engages when a LIVING attacker
-     * has recently hit the body AND either its last blow alone was ≥ {@link #HEAVY_HIT_FRAC} of max HP
-     * (rule 1 — engage at any HP) or HP is below {@link #HP_CRITICAL_FRAC} (rule 2). While engaged, each
-     * tick: a HEAVY hitter is fled from unconditionally at any distance (the iron-golem death — trading
-     * blows was fatal); a small hitter keeps the v1 rule — fight back (face + native swing, one per
-     * {@link #SWING_COOLDOWN} at full charge) within {@link #MELEE_RANGE}, else flee. Flight follows the
-     * shared owner-aware {@link #fleeDirection} vector for up to {@link #FLEE_MAX_TICKS}. A small-hitter
-     * episode ends when HP recovers above {@link #HP_RECOVER_FRAC}; a heavy-hitter episode ends only when
-     * the attacker is dead / gone for {@link #ATTACKER_GONE_TICKS} (an HP rebound is not safety — one more
-     * of its blows can still be lethal). Yields movement to a live creeper sprint. One non-urgent note per
-     * episode (the reflex has already reacted; it does not consult the brain).
+     * The mauled-while-thinking death, now decided by the deterministic engagement engine (§3.1/§3.2) instead
+     * of the crude v2 "one blow ≥ 25% of max HP → flee" scalar, which mis-called both directions (fled a lucky
+     * big hit from a beatable mob; kept trading blows into a pile that summed to a kill). Engages when a LIVING
+     * attacker has recently hit the body AND the engine's verdict is not a clean {@link Decision#ENGAGE} (the
+     * heavy-hitter / one-shot / pack cases the old scalar tried to catch), OR HP is already below
+     * {@link #HP_CRITICAL_FRAC}. While engaged, each tick acts on the cached verdict ({@link #planFor},
+     * re-run at most every {@link #REASSESS_PERIOD} ticks — O(entities) arithmetic, never per tick):
+     * {@link Decision#ENGAGE}/{@link Decision#CORNERED} → fight back (face + native swing, one per
+     * {@link #SWING_COOLDOWN} at full charge) within {@link #MELEE_RANGE}; every other verdict → flee along the
+     * shared owner-aware {@link #fleeDirection} vector for up to {@link #FLEE_MAX_TICKS}. A dangerous verdict
+     * keeps us fleeing until the attacker is gone (an HP rebound is not safety — one more blow can be lethal);
+     * a clean-ENGAGE verdict ends the episode on HP recovery above {@link #HP_RECOVER_FRAC}. The episode also
+     * ends when the attacker is dead / gone for {@link #ATTACKER_GONE_TICKS}. Yields movement to a live creeper
+     * sprint. One non-urgent note per episode (the reflex has already reacted; it informs, never consults).
      */
     private static void criticalHpReflex(NumenPlayer body, PerceptionState st, long now) {
         Entity attacker = st.reflexAttacker;
         boolean attackerLive = attacker != null && attacker.isAlive() && !attacker.isRemoved()
                 && attacker.level() == body.level();
-        float max = body.getMaxHealth();
-        float hp = body.getHealth();
-        boolean heavyHit = st.reflexLastHitDamage >= max * HEAVY_HIT_FRAC;   // v2: the last blow alone was ≥25% max HP
+        boolean recentContact = attackerLive && (now - st.reflexAttackerSeenTick) <= ATTACKER_GONE_TICKS;
 
-        if (st.reflexCriticalEpisode) {
-            boolean gone = !attackerLive || (now - st.reflexAttackerSeenTick) > ATTACKER_GONE_TICKS;
-            // A heavy hitter keeps us fleeing until it is gone — one of its blows can still be lethal, so an
-            // HP rebound is not safety. A small hitter ends on HP recovery, exactly like v1.
-            boolean recovered = !heavyHit && hp > max * HP_RECOVER_FRAC;
-            if (gone || recovered) {
+        // No live, recently-seen attacker → no episode. Close any open one, drop the cached verdict, bail cheap.
+        if (!recentContact) {
+            if (st.reflexCriticalEpisode) {
                 if (st.reflexFleeUntil != 0) InputDriver.halt(body);   // stop the flee drive we owned
-                endCriticalEpisode(st);
-                return;
+                endCriticalEpisode(st, body);
+            } else {
+                PLANS.remove(body.getUUID());
             }
-            actCritical(body, st, now, attacker);
             return;
         }
 
-        // Not engaged. Start on EITHER a heavy hit at any HP (rule 1) or a recent hit while HP is critical
-        // (rule 2), from a still-live attacker.
-        if (attackerLive && (now - st.reflexAttackerSeenTick) <= ATTACKER_GONE_TICKS
-                && (heavyHit || hp < max * HP_CRITICAL_FRAC)) {
+        float max = body.getMaxHealth();
+        float hp = body.getHealth();
+
+        // Ask the deterministic engine (throttled to REASSESS_PERIOD) for the fight/flee verdict — it replaces
+        // the crude 25%-hit scalar with the real armor / DPS / decreasing-k survival math + one-shot guard.
+        ReflexPlan plan = planFor(body, attacker, now);
+        boolean dangerous = plan.decision() != Decision.ENGAGE;   // the engine says fighting is not a clean win
+        boolean wounded = hp < max * HP_CRITICAL_FRAC;
+
+        if (st.reflexCriticalEpisode) {
+            // A dangerous verdict never ends on an HP rebound — one more blow can be lethal; it ends only when
+            // the attacker is gone (handled above). A clean-ENGAGE verdict ends the episode on HP recovery.
+            boolean recovered = !dangerous && hp > max * HP_RECOVER_FRAC;
+            if (recovered) {
+                if (st.reflexFleeUntil != 0) InputDriver.halt(body);
+                endCriticalEpisode(st, body);
+                return;
+            }
+            actCritical(body, st, now, attacker, plan.decision());
+            return;
+        }
+
+        // Not engaged yet. Start when the engine says the fight is not a clean win (dangerous — heavy hitter /
+        // pile / one-shot risk), or the body is already wounded. A clean ENGAGE at healthy HP is left to the
+        // brain / hunt task (informs, never consults — the reflex only steps in when survival is in question).
+        if (dangerous || wounded) {
             st.reflexCriticalEpisode = true;
             st.reflexFleeUntil = 0;
-            emit(body, "本能反应:生命垂危,已本能反击/撤离(攻击者:"
-                    + Perceptions.safe(attacker.getName().getString()) + ")。");
-            actCritical(body, st, now, attacker);
+            emit(body, "本能反应:遭遇威胁,已本能反击/撤离(攻击者:"
+                    + Perceptions.safe(attacker.getName().getString())
+                    + (plan.limiting().isEmpty() ? "" : ";评估:" + plan.limiting()) + ")。");
+            actCritical(body, st, now, attacker, plan.decision());
         }
     }
 
     /**
-     * One tick of the engaged behaviour. Small hitter within melee reach → fight back (v1). Heavy hitter
-     * at ANY distance, or a small hitter out of reach → flee. Yields movement to a live creeper sprint,
-     * which outranks a melee exchange (an explosion is instant death).
+     * The engagement verdict for this body, refreshed at most once per {@link #REASSESS_PERIOD} ticks. The
+     * engine ({@link McCombatAdapter#assessNearby}) is O(entities) arithmetic plus one hostile scan, so it must
+     * not run every tick; the result is cached in {@link #PLANS} keyed by body UUID and dropped by
+     * {@link #endCriticalEpisode} (and when the attacker leaves). The recorded {@code attacker} is passed as the
+     * provoked entity so a currently-attacking neutral (iron golem / enderman) is scored as the threat it is.
      */
-    private static void actCritical(NumenPlayer body, PerceptionState st, long now, Entity attacker) {
+    private static ReflexPlan planFor(NumenPlayer body, Entity attacker, long now) {
+        UUID key = body.getUUID();
+        ReflexPlan cached = PLANS.get(key);
+        if (cached != null && now < cached.nextReassess()) return cached;
+        EngagementAssessment a = McCombatAdapter.assessNearby(body, attacker, THREAT_SCAN_RADIUS);
+        ReflexPlan plan = new ReflexPlan(now + REASSESS_PERIOD, a.decision(), a.limitingFactor());
+        PLANS.put(key, plan);
+        return plan;
+    }
+
+    /**
+     * One tick of the engaged behaviour, steered by the engine's {@code decision}. {@link Decision#ENGAGE} or
+     * {@link Decision#CORNERED} → fight back when the attacker is within {@link #MELEE_RANGE} (CORNERED means
+     * flight is not viable, so 打得赢就打 — fighting beats standing frozen). Every other verdict
+     * ({@link Decision#FLEE}/{@link Decision#KITE}/{@link Decision#AVOID}), or an out-of-reach attacker → flee.
+     * Yields movement to a live creeper sprint, which outranks a melee exchange (an explosion is instant death).
+     */
+    private static void actCritical(NumenPlayer body, PerceptionState st, long now, Entity attacker, Decision decision) {
         if (now < st.reflexCreeperFleeUntil) return;   // creeper panic sprint owns movement this tick
 
         double dist = body.distanceTo(attacker);
         // Keep "last seen" fresh while the attacker is still nearby so the gone-timer only runs once it leaves.
         if (dist <= TRACK_RADIUS) st.reflexAttackerSeenTick = now;
 
-        boolean heavyHit = st.reflexLastHitDamage >= body.getMaxHealth() * HEAVY_HIT_FRAC;
-        if (!heavyHit && dist <= MELEE_RANGE) {
+        boolean fight = decision == Decision.ENGAGE || decision == Decision.CORNERED;
+        if (fight && dist <= MELEE_RANGE) {
             fightBack(body, st, now, attacker);
         } else {
             flee(body, st, now, attacker);
@@ -328,11 +389,12 @@ public final class Reflexes {
         }
     }
 
-    private static void endCriticalEpisode(PerceptionState st) {
+    private static void endCriticalEpisode(PerceptionState st, NumenPlayer body) {
         st.reflexCriticalEpisode = false;
         st.reflexFleeUntil = 0;
         st.reflexAttacker = null;       // don't pin a possibly-removed entity; the next hit re-arms it
-        st.reflexLastHitDamage = 0.0f;  // clear the heavy-hitter latch with the attacker
+        st.reflexLastHitDamage = 0.0f;  // clear the last-hit latch with the attacker
+        PLANS.remove(body.getUUID());   // the cached verdict only lives as long as the episode does
     }
 
     // ============================================================ reflex 3: creeper panic sprint

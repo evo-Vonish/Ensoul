@@ -145,6 +145,11 @@ public final class NumenCore {
         // model inference as a persistent cognition event. Appended LAST, after
         // RecallRegionTool, so all prior tool ordering — and prompt caching — stays stable.
         ToolRegistry.register(new com.dwinovo.numen.core.tools.CommitInferenceTool());
+
+        // Engagement engine (§3.1 consumer c): brain-facing front door to the deterministic combat
+        // assessment. Appended LAST, after CommitInferenceTool, so all prior tool ordering — and prompt
+        // caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.AssessThreatTool());
     }
 
 

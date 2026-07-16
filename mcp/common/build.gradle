@@ -10,7 +10,7 @@ neoForge {
 dependencies {
     // The numen-api engine. compileOnly: the api classes are provided at runtime
     // by the numen-api mod (bundled inside numen-core), never by this jar.
-    compileOnly "com.dwinovo.numen:numen-api-common-1.21.1:0.0.2-SNAPSHOT"
+    compileOnly "com.dwinovo.numen:numen-api-common-26.1.2:0.0.1-SNAPSHOT"
 }
 
 configurations {

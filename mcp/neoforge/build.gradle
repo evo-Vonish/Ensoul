@@ -7,7 +7,7 @@ dependencies {
     // The numen-api engine, a mod dependency at runtime. NeoForge is
     // Mojang-mapped natively, so no remap step is needed. NOT jarJar'd — the
     // player already has the engine via numen-core.
-    implementation "com.dwinovo.numen:numen-api-neoforge-1.21.1:0.0.2-SNAPSHOT"
+    implementation "com.dwinovo.numen:numen-api-neoforge-26.1.2:0.0.1-SNAPSHOT"
 }
 
 neoForge {

@@ -53,6 +53,19 @@ public final class LookController {
     private long hardAimTick = Long.MIN_VALUE;
     private long bodyControlTick = Long.MIN_VALUE;
 
+    /**
+     * The smoother's OWN persisted head yaw. {@code Player.aiStep} clobbers the entity's
+     * {@code yHeadRot} back to {@code yRot} every tick (and locomotion's faceYaw re-affirms it),
+     * so stepping from {@code body.getYHeadRot()} could never accumulate: each tick restarted
+     * from "facing travel" and shipped a single ≤ω step — a dead gaze while walking (field
+     * evidence: liveliness only visible when idle, where the BODY yaw accumulates instead).
+     * Stepping from this persisted pose makes the glance actually progress across ticks;
+     * invalidated whenever a hard-aim or a no-intent mover tick owns the real head, so the
+     * smoother resumes from the true pose instead of a stale one.
+     */
+    private float smoothHead;
+    private boolean smoothHeadValid;
+
     public LookController(ServerPlayer body) {
         this.body = body;
     }
@@ -112,6 +125,7 @@ public final class LookController {
         if (hardAim) {
             // The aim (yRot/xRot/yHeadRot) is already snapped by the caller and re-affirmed by
             // aiStep (yHeadRot = yRot). Fully yield; the smoother resumes from this pose next tick.
+            smoothHeadValid = false;
             return;
         }
 
@@ -119,22 +133,31 @@ public final class LookController {
         boolean intentLive = hasIntent && (now - intentTick) <= LookTunables.INTENT_TTL_TICKS;
 
         float bodyYaw = body.getYRot();
-        float headYaw = body.getYHeadRot();
+        // Step from the smoother's persisted pose, NOT the entity field aiStep just clobbered
+        // back to yRot — otherwise the glance restarts from "facing travel" every tick and
+        // never accumulates (the walking-gaze deadness this field exists to fix).
+        float headYaw = smoothHeadValid ? smoothHead : body.getYHeadRot();
         float pitch = body.getXRot();
 
         if (!intentLive) {
-            // Relax: only when idle (a mover owning yRot keeps aiStep's head-faces-travel default).
             if (!bodyControlled) {
+                // Relax: idle with no intent — ease the head back to the body, level the pitch.
                 float relaxedHead = LookMath.approachAngle(headYaw, bodyYaw,
                         LookTunables.HEAD_OMEGA_DEG, LookTunables.HEAD_K,
                         LookTunables.DEADZONE_DEG, 0.0f);
                 relaxedHead = LookMath.clampHeadToBody(relaxedHead, bodyYaw, LookTunables.MAX_HEAD_REL_DEG);
                 body.setYHeadRot(relaxedHead);
+                smoothHead = relaxedHead;
+                smoothHeadValid = true;
 
                 float leveled = LookMath.approachAngle(pitch, 0.0f,
                         LookTunables.PITCH_OMEGA_DEG, LookTunables.PITCH_K,
                         LookTunables.DEADZONE_DEG, 0.0f);
                 body.setXRot(leveled);
+            } else {
+                // A mover owns the body and there is nothing to look at: aiStep's
+                // head-faces-travel default is correct — resync from it next tick.
+                smoothHeadValid = false;
             }
             return;
         }
@@ -156,6 +179,8 @@ public final class LookController {
                     LookTunables.DEADZONE_DEG, LookTunables.HEAD_MIN_STEP_DEG);
             newHead = LookMath.clampHeadToBody(newHead, bodyYaw, LookTunables.MAX_HEAD_REL_DEG);
             body.setYHeadRot(newHead);
+            smoothHead = newHead;
+            smoothHeadValid = true;
         } else {
             // Idle: head leads; body lazily follows once the offset is large enough. This mirrors
             // vanilla BodyRotationControl's "static head-lead / delayed body-follow" feel (§A2),
@@ -173,6 +198,8 @@ public final class LookController {
                     LookTunables.DEADZONE_DEG, LookTunables.HEAD_MIN_STEP_DEG);
             newHead = LookMath.clampHeadToBody(newHead, newBody, LookTunables.MAX_HEAD_REL_DEG);
             body.setYHeadRot(newHead);
+            smoothHead = newHead;
+            smoothHeadValid = true;
         }
 
         float newPitch = LookMath.approachAngle(pitch, desiredPitch,

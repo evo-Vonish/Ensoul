@@ -1,5 +1,6 @@
 package com.dwinovo.numen.core.pathing.exec;
 
+import com.dwinovo.numen.entity.NumenPlayer;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
@@ -30,9 +31,37 @@ public final class InputDriver {
         p.setSprinting(sprint && !p.isShiftKeyDown());
     }
 
-    /** Aim the eyes at a point (yaw + pitch) — e.g. a block being mined or placed. */
+    /**
+     * Aim the eyes at a point (yaw + pitch) — e.g. a block being mined/placed, or a combat/reflex
+     * target. This is a HARD aim: it snaps the whole aim immediately (unchanged behaviour for every
+     * existing tool/combat caller). It additionally latches the companion's look engine to
+     * {@code hardAim}, so the smoother yields the head to this snap for a few ticks instead of
+     * swivelling it off to an idle attention target (priority ladder: hard-aim outranks all).
+     */
     public static void lookAt(ServerPlayer p, Vec3 point) {
         p.lookAt(EntityAnchorArgument.Anchor.EYES, point);
+        if (p instanceof NumenPlayer np) {
+            np.getLook().markHardAim();
+        }
+    }
+
+    /**
+     * Register a SMOOTH gaze intent — the attention brain's "please look here" for idle/walking.
+     * Unlike {@link #lookAt}, this does not move the body at all this tick; the look engine eases the
+     * head (and, when idle, the body) toward {@code point} over the coming ticks, honouring the 50°
+     * head/body cap and the quantization deadzone. No-op for a non-companion body.
+     */
+    public static void setLookIntent(ServerPlayer p, Vec3 point) {
+        if (p instanceof NumenPlayer np) {
+            np.getLook().lookAt(point.x, point.y, point.z);
+        }
+    }
+
+    /** Drop any smooth gaze intent — the head relaxes back toward the body over the coming ticks. */
+    public static void clearLookIntent(ServerPlayer p) {
+        if (p instanceof NumenPlayer np) {
+            np.getLook().clearIntent();
+        }
     }
 
     /**
@@ -62,12 +91,23 @@ public final class InputDriver {
         p.setSprinting(false);
     }
 
-    /** Turn the body (and head) to face {@code target} horizontally — travel goes where yaw points. */
+    /**
+     * Turn the body to face {@code target} horizontally — travel goes where {@code yRot} points, so
+     * locomotion (pathing / flee) OWNS the body yaw and it is set every tick. We latch the look
+     * engine to {@code bodyControlled}: while a mover owns {@code yRot}, the smoother must not fight
+     * it for the body — it drives ONLY the head (borrowing ±50° of this travel yaw) toward whatever
+     * the attention brain wants, so the companion can glance around while it walks. {@code yHeadRot}
+     * is still set here to the travel yaw as the safe default; the look engine overrides it later the
+     * same tick when it has a gaze intent. (26.1.2 study §B4: path active → yRot is the path's.)
+     */
     private static void faceYaw(ServerPlayer p, Vec3 target) {
         double dx = target.x - p.getX();
         double dz = target.z - p.getZ();
         float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
         p.setYRot(yaw);
         p.setYHeadRot(yaw);
+        if (p instanceof NumenPlayer np) {
+            np.getLook().markBodyControlled();
+        }
     }
 }

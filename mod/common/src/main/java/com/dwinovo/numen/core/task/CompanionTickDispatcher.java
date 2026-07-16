@@ -1,6 +1,7 @@
 package com.dwinovo.numen.core.task;
 
 import com.dwinovo.numen.entity.NumenPlayer;
+import com.dwinovo.numen.core.look.LookBrain;
 import com.dwinovo.numen.core.net.TaskResultPayload;
 import com.dwinovo.numen.platform.Services;
 import com.dwinovo.numen.task.TaskResult;
@@ -44,6 +45,10 @@ public final class CompanionTickDispatcher {
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             if (p instanceof NumenPlayer ap) {
                 tickOne(ap);
+                // Lively-look attention brain: pick what this companion looks at and feed the body's
+                // look engine a smooth gaze intent. Runs every tick (idle AND walking); the engine
+                // itself yields to any fresher hard-aim / locomotion, so this can push unconditionally.
+                LookBrain.tick(ap);
             }
         }
     }
@@ -88,6 +93,7 @@ public final class CompanionTickDispatcher {
             drainResults(player);
         }
         QUEUES.remove(id);   // the body is gone; don't leak its queue
+        LookBrain.forget(id);   // drop the companion's attention state with its queue
     }
 
     private static void tickOne(NumenPlayer player) {

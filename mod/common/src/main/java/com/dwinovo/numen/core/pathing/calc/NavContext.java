@@ -10,6 +10,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.Container;
 import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.BlockGetter;
@@ -50,6 +51,17 @@ public final class NavContext {
     /** True if the entity holds at least one scaffolding block. */
     public final boolean hasScaffold;
 
+    /**
+     * True if the pathing entity is in creative mode (instabuild). Snapshotted at
+     * construction from the live {@link Inventory}'s owner (same frozen-snapshot model
+     * as {@link #hasScaffold}, read on the main thread before any off-thread hand-off).
+     * In creative every block instabreaks regardless of tool, so {@link #costOfBreaking}
+     * skips the correct-tool harvest gate and the tool-aware mining duration — but keeps
+     * the unbreakable / hazard / fluid-flow / do-not-grief vetoes (creative doesn't die,
+     * but a released lava flow or a smashed chest still wrecks the world).
+     */
+    public final boolean isCreative;
+
     /** Max blocks the entity may fall without taking dangerous damage. */
     public final int maxFallHeight;
 
@@ -80,11 +92,13 @@ public final class NavContext {
     /** Best hotbar tool for a block: its destroy speed and whether it harvests drops. */
     private record BestTool(float speed, boolean canHarvest) {}
 
-    private NavContext(Level level, BlockGetter view, Container inventory, boolean safeForThreadedUse) {
+    private NavContext(Level level, BlockGetter view, Container inventory, boolean safeForThreadedUse,
+                       boolean isCreative) {
         this.level = level;
         this.view = view;
         this.inventory = inventory;
         this.safeForThreadedUse = safeForThreadedUse;
+        this.isCreative = isCreative;
         this.hasScaffold = hasAnyScaffold(inventory);
 
         // Survivable fall: Baritone's maxFallHeightNoWater (3) — vanilla fall
@@ -99,7 +113,7 @@ public final class NavContext {
      * changed), so this reads live and is NOT safe to hand to a worker thread.
      */
     public static NavContext forExecution(Level level, Container liveInventory) {
-        return new NavContext(level, new NavSnapshot(level), liveInventory, false);
+        return new NavContext(level, new NavSnapshot(level), liveInventory, false, isCreative(liveInventory));
     }
 
     /**
@@ -121,7 +135,18 @@ public final class NavContext {
         BlockGetter view = loaded != null
                 ? new com.dwinovo.numen.core.pathing.cache.CachedNavView(loaded, level)
                 : new NavSnapshot(level);
-        return new NavContext(level, view, snapshotInventory(liveInventory), loaded != null);
+        // Read creative off the LIVE inventory's owner now (main thread), before the snapshot
+        // copy severs the player link — the flag is then a frozen boolean safe for the worker.
+        return new NavContext(level, view, snapshotInventory(liveInventory), loaded != null,
+                isCreative(liveInventory));
+    }
+
+    /** Whether the container is a player {@link Inventory} whose owner is in creative mode.
+     *  The pathing factories are handed {@code player.getInventory()} (a live {@link Inventory}),
+     *  so we recover the entity's instabuild flag without widening the factory signature (its
+     *  callers live in region-owned pathing code). A non-player container reads as survival. */
+    private static boolean isCreative(Container inv) {
+        return inv instanceof Inventory playerInv && playerInv.player.getAbilities().instabuild;
     }
 
     /** A point-in-time copy of {@code live} (same slot layout, copied stacks) — read-only fodder for
@@ -214,6 +239,23 @@ public final class NavContext {
         if (BlockHelper.isHazard(view, pos)) return ActionCosts.COST_INF;
         if (BlockHelper.breakWouldCreateFlow(view, pos)) return ActionCosts.COST_INF;
         if (BlockHelper.shouldAvoidBreaking(view, pos)) return ActionCosts.COST_INF;
+
+        if (isCreative) {
+            // Creative instabreaks ANY block in a single tick, no tool required — so skip the
+            // correct-tool harvest gate and the tool-aware mining duration below (they'd wrongly
+            // price stone/ore at INF or a slow grind when the body has no pickaxe). The safety
+            // vetoes above (unbreakable / hazard / released-flow / do-not-grief) still apply.
+            double cost = 1.0 + PathSettings.BLOCK_BREAK_ADDITIONAL_PENALTY;
+            if (includeFalling) {
+                BlockPos above = pos.above();
+                while (view.getBlockState(above).getBlock()
+                        instanceof net.minecraft.world.level.block.FallingBlock) {
+                    cost += 1.0 + PathSettings.BLOCK_BREAK_ADDITIONAL_PENALTY;
+                    above = above.above();
+                }
+            }
+            return cost;
+        }
 
         BlockState state = view.getBlockState(pos);
         if (state.requiresCorrectToolForDrops() && !bestTool(state).canHarvest()) {
@@ -308,7 +350,8 @@ public final class NavContext {
         if (BlockHelper.shouldAvoidBreaking(view, pos)) {
             return blockId(state) + " (a functional block I won't destroy)";
         }
-        if (state.requiresCorrectToolForDrops() && !bestTool(state).canHarvest()) {
+        // Creative ignores the tool gate (costOfBreaking does too), so don't blame the tool here.
+        if (!isCreative && state.requiresCorrectToolForDrops() && !bestTool(state).canHarvest()) {
             return blockId(state) + " (needs the correct tool and I have none in my "
                     + "hotbar — equip_item the right pickaxe first)";
         }

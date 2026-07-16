@@ -7,6 +7,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
@@ -111,9 +112,16 @@ public final class BlockDigger {
                     ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, side, level.getMaxY(), -1);
             player.swing(InteractionHand.MAIN_HAND);
             if (player.getAbilities().instabuild) {
+                // Creative: START_DESTROY_BLOCK routed straight through ServerPlayerGameMode
+                // .destroyBlock, which REFUSES (leaves the block intact) when the held item
+                // can't destroy in creative — a sword/trident (canDestroyBlocksInCreative=false).
+                // switchToBestTool already swaps such an item out, but VERIFY the block actually
+                // changed before claiming the break: the old optimistic `return targetBreak` made
+                // callers drop an unbroken target from their list and thrash on it every few ticks.
+                boolean broke = !level.getBlockState(pos).equals(state);
                 blockHitDelay = BLOCK_HIT_DELAY;
                 reset();
-                return targetBreak;                  // creative: START broke it
+                return broke && targetBreak;         // creative: START broke it (verified)
             }
             if (!state.isAir()) {
                 state.attack(level, pos, player);    // left-click punch
@@ -160,16 +168,35 @@ public final class BlockDigger {
      *  break cost still matches the tool actually used. */
     private void switchToBestTool(BlockState state) {
         Inventory inv = player.getInventory();
+        boolean creative = player.getAbilities().instabuild;
         int best = inv.getSelectedSlot();
         float bestSpeed = inv.getItem(best).getDestroySpeed(state);
+        // In creative, destroy speed is irrelevant (any VALID item instabreaks) but a held
+        // sword/trident (canDestroyBlocksInCreative=false) makes ServerPlayerGameMode.destroyBlock
+        // refuse the break outright. So: never pick such an item — if the current slot can't
+        // destroy this block in creative, force a switch (bare hand, i.e. an empty slot, destroys
+        // everything in creative), and skip every sword/trident candidate in the scan below.
+        if (creative && !canDestroyWith(inv.getItem(best), state)) {
+            bestSpeed = -1.0f;
+        }
         for (int i = 0; i < inv.getContainerSize(); i++) {
-            float s = inv.getItem(i).getDestroySpeed(state);
-            if (s > bestSpeed) {
-                bestSpeed = s;
+            ItemStack s = inv.getItem(i);
+            if (creative && !canDestroyWith(s, state)) continue;
+            float speed = s.getDestroySpeed(state);
+            if (speed > bestSpeed) {
+                bestSpeed = speed;
                 best = i;
             }
         }
         player.holdInHand(best);
+    }
+
+    /** Whether holding {@code stack} would let the server actually destroy {@code state} at the
+     *  current {@link #pos}: in creative a sword/trident returns {@code false}
+     *  ({@code canDestroyBlocksInCreative}), while bare hand and mining tools return {@code true};
+     *  in survival it is always {@code true}. Consulted only on the creative branch above. */
+    private boolean canDestroyWith(ItemStack stack, BlockState state) {
+        return stack.canDestroyBlock(state, player.level(), pos, player);
     }
 
     /** Abandon an IN-PROGRESS dig: ABORT it server-side and clear the crack (Carpet

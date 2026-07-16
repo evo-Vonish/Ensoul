@@ -93,6 +93,11 @@ public final class MineCompanionTask implements CompanionTask {
     /** Matching items already in the inventory when the task began — the count is the DELTA above this
      *  (companion semantics: "gather N more", not Baritone's absolute "have N"). */
     private int baseline;
+    /** Creative-only tally: TARGET blocks actually cleared. Creative gets no natural drops
+     *  (preventsBlockDrops), so the item-delta count would sit at 0 forever and every run would false-
+     *  FAIL; instead we count real breaks and simulate the drops into the pack (see mineProgress).
+     *  This is the progress metric while {@link #isCreative()}. */
+    private int creativeBroken;
     /** Nearby dropped items to collect (Baritone droppedItemsScan), refreshed per tick. */
     private List<BlockPos> drops = List.of();
 
@@ -120,20 +125,26 @@ public final class MineCompanionTask implements CompanionTask {
 
     @Override
     public void start() {
-        // Fail fast if NO requested target is harvestable with the current inventory — mining it
-        // would destroy the block for no drop. Same gate as break_block / the cost model
-        // (BlockHelper.canHarvest, whole-inventory). prune() then drops any individual unharvestable
-        // cell, so a mixed request (e.g. coal we can mine + diamond we can't) still works.
-        boolean anyHarvestable = r.targets.stream().anyMatch(
-                b -> BlockHelper.canHarvest(player.getInventory(), b.defaultBlockState()));
-        if (!anyHarvestable) {
-            doneReason = "can't harvest " + r.label + " with the current tools — mining it would"
-                    + " destroy it without any drop. Equip a suitable tool (e.g. a pickaxe) first.";
-            r.setState(TaskState.FAILED);
-            return;
+        // Creative instabreaks any block regardless of tool, so the survival harvest precheck (which
+        // fail-fasts when no pickaxe is held) simply doesn't apply — skip it. In survival, fail fast
+        // if NO requested target is harvestable with the current inventory — mining it would destroy
+        // the block for no drop. Same gate as break_block / the cost model (BlockHelper.canHarvest,
+        // whole-inventory). prune() then drops any individual unharvestable cell, so a mixed request
+        // (e.g. coal we can mine + diamond we can't) still works.
+        if (!isCreative()) {
+            boolean anyHarvestable = r.targets.stream().anyMatch(
+                    b -> BlockHelper.canHarvest(player.getInventory(), b.defaultBlockState()));
+            if (!anyHarvestable) {
+                doneReason = "can't harvest " + r.label + " with the current tools — mining it would"
+                        + " destroy it without any drop. Equip a suitable tool (e.g. a pickaxe) first.";
+                r.setState(TaskState.FAILED);
+                return;
+            }
         }
         // Count toward `count` by ITEMS gathered (Baritone), not blocks broken: resolve what these
         // blocks drop, and snapshot how many we already hold so the tally is the delta above it.
+        // (Creative counts by BLOCKS cleared instead — see tick()/mineProgress — since it gets no
+        // natural drops; dropItems/baseline are still resolved for the loot sim that refills the pack.)
         dropItems = computeDropItems();
         baseline = inventoryMatch();
         rescan();
@@ -141,10 +152,13 @@ public final class MineCompanionTask implements CompanionTask {
 
     @Override
     public TaskState tick() {
-        int gathered = Math.max(0, inventoryMatch() - baseline);   // matching items gained so far
+        boolean creative = isCreative();
+        // Creative gets no natural drops (preventsBlockDrops), so the item-delta would never move —
+        // count TARGET blocks actually cleared instead (mineProgress simulates the loot into the pack).
+        int gathered = creative ? creativeBroken : Math.max(0, inventoryMatch() - baseline);
         r.setMined(gathered);
         if (gathered >= r.count) {
-            doneReason = "gathered all requested";
+            doneReason = creative ? "cleared all requested" : "gathered all requested";
             return TaskState.SUCCESS;
         }
 
@@ -171,7 +185,7 @@ public final class MineCompanionTask implements CompanionTask {
             rescanTimer = RESCAN_INTERVAL;
             if (scan == null) kickScan();
         }
-        drops = droppedItems();
+        drops = creative ? List.of() : droppedItems();   // creative has no natural drops to collect
 
         // 1) Mine any target we can already reach + see from here (no pathing) —
         //    a tree gets mined from beside, never by digging under it.
@@ -360,8 +374,39 @@ public final class MineCompanionTask implements CompanionTask {
      *  drop it from the ore list. The progress count is read from the inventory each tick, not here —
      *  one block can yield several items, and the drops take a moment to be picked up. */
     private void mineProgress(BlockPos pos) {
+        // In creative the break yields NO natural drops, so capture the block state BEFORE the dig
+        // and, on the tick it actually breaks, count it and simulate its loot into the pack — keeping
+        // the "gather N" contract (auto_mine 10 coal still ends with coal in the inventory). digger.dig
+        // returns true ONLY when the TARGET itself breaks (not an occluder cleared to reach it).
+        BlockState before = isCreative() ? player.level().getBlockState(pos) : null;
         if (digger.dig(pos)) {
             knownOres.remove(pos);
+            if (before != null) {
+                creativeBroken++;
+                simulateDropsToInventory(before, pos);
+            }
+        }
+    }
+
+    /** Creative-only: put the loot {@code brokenState} WOULD have dropped straight into the pack.
+     *  Creative breaking sets preventsBlockDrops (zero natural drops), so we roll the same loot table
+     *  a survival break would (with the best harvesting tool we carry — Fortune/Silk Touch respected),
+     *  via the exact {@code Block.getDrops} overload {@link #computeDropItems} uses, and
+     *  {@link Inventory#add} each stack. Only the requested TARGET blocks refill the pack (an occluder
+     *  cleared to open line of sight doesn't). */
+    private void simulateDropsToInventory(BlockState brokenState, BlockPos pos) {
+        if (brokenState == null || brokenState.isAir()) return;
+        if (!r.targets.contains(brokenState.getBlock())) return;
+        if (!(player.level() instanceof ServerLevel level)) return;
+        List<ItemStack> loot;
+        try {
+            loot = Block.getDrops(brokenState, level, pos, null, player, bestToolFor(brokenState));
+        } catch (RuntimeException broken) {
+            loot = List.of();
+        }
+        Inventory inv = player.getInventory();
+        for (ItemStack stack : loot) {
+            if (!stack.isEmpty()) inv.add(stack);
         }
     }
 
@@ -480,12 +525,15 @@ public final class MineCompanionTask implements CompanionTask {
     private void prune() {
         Level level = player.level();
         BlockPos feet = player.blockPosition();
-        knownOres.removeIf(p ->
-                level.getBlockState(p).isAir()
-                        || !r.targets.contains(level.getBlockState(p).getBlock())
-                        || blacklist.contains(p)
-                        || BlockMiningProgress.fluidBreakHazard(level, p) != null
-                        || !BlockHelper.canHarvest(player.getInventory(), level.getBlockState(p)));
+        boolean creative = isCreative();   // creative breaks anything: don't drop targets on the tool gate
+        knownOres.removeIf(p -> {
+            BlockState s = level.getBlockState(p);
+            return s.isAir()
+                    || !r.targets.contains(s.getBlock())
+                    || blacklist.contains(p)
+                    || BlockMiningProgress.fluidBreakHazard(level, p) != null
+                    || (!creative && !BlockHelper.canHarvest(player.getInventory(), s));
+        });
         knownOres.sort(Comparator.comparingDouble(feet::distSqr));
         if (knownOres.size() > MAX_ORES) {
             knownOres.subList(MAX_ORES, knownOres.size()).clear();
@@ -504,6 +552,12 @@ public final class MineCompanionTask implements CompanionTask {
 
     private boolean withinReach(BlockPos pos) {
         return player.distanceToSqr(Vec3.atCenterOf(pos)) <= REACH_SQR;
+    }
+
+    /** The body is in creative mode (instabuild): instabreaks any block, needs no tool, and gets no
+     *  natural block drops (preventsBlockDrops). Drives every creative branch in this task. */
+    private boolean isCreative() {
+        return player.getAbilities().instabuild;
     }
 
     private void stopNav() {
@@ -530,9 +584,14 @@ public final class MineCompanionTask implements CompanionTask {
         data.put("target", r.label);
         data.put("requested", r.count);
         data.put("gathered", r.getMined());
+        boolean creative = isCreative();
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(
-                    "gathered " + r.getMined() + "/" + r.count + " " + r.label + " (" + doneReason + ")", data);
+                    creative
+                        ? "creative mode: cleared " + r.getMined() + " " + r.label
+                            + " block(s) and placed the drops in the inventory"
+                        : "gathered " + r.getMined() + "/" + r.count + " " + r.label + " (" + doneReason + ")",
+                    data);
             case TIMEOUT -> new TaskResult(false,
                     "timed out after gathering " + r.getMined() + "/" + r.count + " " + r.label, true, false, data);
             case CANCELLED -> new TaskResult(false,

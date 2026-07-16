@@ -35,6 +35,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.GameType;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -474,10 +475,56 @@ public final class NumenScreen extends Screen {
             add(new SimpleButton(left + PANEL_W - PAD - 64 - 4 - reasonW - 4 - usageW,
                     top + PANEL_H - PAD - 18, usageW, 18, Component.literal("Usage"),
                     b -> { preserveKeyUrl(); usageView = true; balanceLine = null; exportLine = null; rebuild(); }));
+            // Per-companion capability toggles on the free LEFT half of the action row. The rest of this tab is
+            // GLOBAL config (Services.CONFIG); these two act on the CURRENTLY SELECTED companion (the rail's
+            // active uuid), so they appear only when one is picked.
+            if (uuid != null) buildCompanionCapButtons(top + PANEL_H - PAD - 18);
         }
 
         add(new SimpleButton(left + PANEL_W - PAD - 64, top + PANEL_H - PAD - 18,
                 64, 18, Component.literal("Save"), b -> onSaveSettings()));
+    }
+
+    /**
+     * The two per-companion capability toggles: GAME MODE (survival ⇄ creative) and OP (the command-permission
+     * master switch). Current state is read from the server-authored {@link NumenRoster}; a click sends the flip
+     * to the server (which persists it and re-pushes the roster) and optimistically relabels — the owner is
+     * always authorised for their own panel, so the optimistic value and the confirming re-push agree. Each
+     * click reads the LATEST roster state (not a build-time snapshot), so repeated clicks stay correct.
+     */
+    private void buildCompanionCapButtons(int rowY) {
+        NumenRoster.Entry re = NumenRoster.instance().byUuid(uuid);
+        GameType mode = re != null ? re.gameType() : GameType.SURVIVAL;
+        boolean op = re != null && re.opEnabled();
+
+        int modeW = 62, opW = 42;
+        int modeX = left + PAD;
+        int opX = modeX + modeW + 4;
+
+        add(new SimpleButton(modeX, rowY, modeW, 18, Component.literal(modeLabel(mode)), b -> {
+            NumenRoster.Entry cur = NumenRoster.instance().byUuid(uuid);
+            GameType curMode = cur != null ? cur.gameType() : GameType.SURVIVAL;
+            GameType next = curMode == GameType.CREATIVE ? GameType.SURVIVAL : GameType.CREATIVE;
+            Services.NETWORK.sendToServer(
+                    new com.dwinovo.numen.network.payload.SetCompanionGameModePayload(uuid, next));
+            b.setMessage(Component.literal(modeLabel(next)));
+        }));
+
+        add(new SimpleButton(opX, rowY, opW, 18, Component.literal(opLabel(op)), b -> {
+            NumenRoster.Entry cur = NumenRoster.instance().byUuid(uuid);
+            boolean next = !(cur != null && cur.opEnabled());
+            Services.NETWORK.sendToServer(
+                    new com.dwinovo.numen.network.payload.SetCompanionOpPayload(uuid, next));
+            b.setMessage(Component.literal(opLabel(next)));
+        }));
+    }
+
+    private static String modeLabel(GameType mode) {
+        return "模式:" + (mode == GameType.CREATIVE ? "创造" : "生存");
+    }
+
+    private static String opLabel(boolean op) {
+        return "OP:" + (op ? "开" : "关");
     }
 
     /** Cycle auto → off → minimal → low → medium → high → auto (any unrecognised value re-enters at auto). */

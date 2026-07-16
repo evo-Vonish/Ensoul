@@ -8,6 +8,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
@@ -35,10 +36,20 @@ public final class CompanionRegistry extends SavedData {
     /** One companion's catalog entry. {@code diedAt > 0} = dead, awaiting a respawn-at-owner (the death
      *  state is persisted here so it SURVIVES a logout during the respawn window — see Companions). */
     public record Entry(String name, UUID owner, ResourceKey<Level> dimension, BlockPos pos,
-                        String deathCause, long diedAt) {
-        /** A live companion (not dead). */
+                        String deathCause, long diedAt, GameType gameType, boolean opEnabled) {
+        /** A live companion (not dead): survival + OP-off — today's default for a fresh summon. */
         public Entry(String name, UUID owner, ResourceKey<Level> dimension, BlockPos pos) {
-            this(name, owner, dimension, pos, "", 0L);
+            this(name, owner, dimension, pos, "", 0L, GameType.SURVIVAL, false);
+        }
+
+        /** This entry with a different per-companion game mode (survival/creative); all else unchanged. */
+        public Entry withGameType(GameType mode) {
+            return new Entry(name, owner, dimension, pos, deathCause, diedAt, mode, opEnabled);
+        }
+
+        /** This entry with the per-companion OP master switch flipped; all else unchanged. */
+        public Entry withOpEnabled(boolean op) {
+            return new Entry(name, owner, dimension, pos, deathCause, diedAt, gameType, op);
         }
 
         static final Codec<Entry> CODEC = RecordCodecBuilder.create(i -> i.group(
@@ -47,7 +58,11 @@ public final class CompanionRegistry extends SavedData {
                 ResourceKey.codec(Registries.DIMENSION).fieldOf("dimension").forGetter(Entry::dimension),
                 BlockPos.CODEC.fieldOf("pos").forGetter(Entry::pos),
                 Codec.STRING.optionalFieldOf("deathCause", "").forGetter(Entry::deathCause),
-                Codec.LONG.optionalFieldOf("diedAt", 0L).forGetter(Entry::diedAt)
+                Codec.LONG.optionalFieldOf("diedAt", 0L).forGetter(Entry::diedAt),
+                // Per-companion capabilities. Optional + defaulted so a pre-feature companions.dat reads as
+                // survival + OP-off — no migration needed, no disruption to existing companions.
+                GameType.CODEC.optionalFieldOf("gameType", GameType.SURVIVAL).forGetter(Entry::gameType),
+                Codec.BOOL.optionalFieldOf("opEnabled", false).forGetter(Entry::opEnabled)
         ).apply(i, Entry::new));
     }
 
@@ -119,7 +134,8 @@ public final class CompanionRegistry extends SavedData {
     public void markDead(UUID uuid, String cause, long diedAt) {
         Entry e = entries.get(uuid);
         if (e == null) return;
-        entries.put(uuid, new Entry(e.name(), e.owner(), e.dimension(), e.pos(), cause, diedAt));
+        entries.put(uuid, new Entry(e.name(), e.owner(), e.dimension(), e.pos(), cause, diedAt,
+                e.gameType(), e.opEnabled()));   // preserve per-companion caps across the death state
         setDirty();
     }
 
@@ -127,7 +143,8 @@ public final class CompanionRegistry extends SavedData {
     public void markAlive(UUID uuid) {
         Entry e = entries.get(uuid);
         if (e == null || e.diedAt() == 0L) return;
-        entries.put(uuid, new Entry(e.name(), e.owner(), e.dimension(), e.pos()));
+        entries.put(uuid, new Entry(e.name(), e.owner(), e.dimension(), e.pos(), "", 0L,
+                e.gameType(), e.opEnabled()));   // clear death, keep game mode + OP
         setDirty();
     }
 }

@@ -8,6 +8,7 @@ import com.dwinovo.numen.platform.Services;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
@@ -166,10 +167,59 @@ public final class Companions {
         List<CompanionListPayload.Entry> list = new ArrayList<>();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             if (p instanceof NumenPlayer a && a.isOwnedByPlayer(owner.getUUID())) {
-                list.add(new CompanionListPayload.Entry(a.getUUID(), a.getName().getString()));
+                // Game mode from the LIVE body (authoritative); OP flag from the persisted registry.
+                list.add(new CompanionListPayload.Entry(a.getUUID(), a.getName().getString(),
+                        a.gameMode(), isOpEnabled(server, a.getUUID())));
             }
         }
         Services.NETWORK.sendToPlayer(owner, new CompanionListPayload(list));
+    }
+
+    // ---- per-companion capabilities (game mode + OP master switch) ----
+    // Both are persisted in the CompanionRegistry entry (survive dormancy / logout) and exposed as static
+    // flips so the G-panel UI (via a C→S payload) and commands can drive them. The OP flag is consumed by
+    // the tool pack's run_command permission gate; the engine only stores it (the tier dial stays in the pack).
+
+    /**
+     * Set a companion's game mode (survival ⇄ creative), persisting it in the registry AND applying it to the
+     * live body if it is currently spawned. Dormant → registry only; it takes effect on the next spawn (see
+     * {@link CompanionFactory#spawn}). CREATIVE on the live body grants real invulnerability + flight +
+     * no-hunger via vanilla {@code ServerPlayer.setGameMode} (updatePlayerAbilities + onUpdateAbilities).
+     */
+    public static void setGameMode(MinecraftServer server, UUID companionUuid, GameType mode) {
+        if (mode == null) return;
+        CompanionRegistry reg = CompanionRegistry.get(server);
+        CompanionRegistry.Entry e = reg.find(companionUuid);
+        if (e != null) reg.put(companionUuid, e.withGameType(mode));
+        NumenPlayer body = NumenPlayer.findByUuid(server, companionUuid);
+        if (body != null) body.setGameMode(mode);
+    }
+
+    /** A companion's persisted game mode (survival if unknown). */
+    public static GameType getGameMode(MinecraftServer server, UUID companionUuid) {
+        CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
+        return e != null ? e.gameType() : GameType.SURVIVAL;
+    }
+
+    /** Flip a companion's OP master switch, persisted in the registry. Read back via {@link #isOpEnabled}. */
+    public static void setOpEnabled(MinecraftServer server, UUID companionUuid, boolean opEnabled) {
+        CompanionRegistry reg = CompanionRegistry.get(server);
+        CompanionRegistry.Entry e = reg.find(companionUuid);
+        if (e != null) reg.put(companionUuid, e.withOpEnabled(opEnabled));
+    }
+
+    /** Whether the companion's OP master switch is on (default false — the today-equivalent, no command privileges). */
+    public static boolean isOpEnabled(MinecraftServer server, UUID companionUuid) {
+        CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
+        return e != null && e.opEnabled();
+    }
+
+    /** True if {@code ownerUuid} owns the companion — resolved from the live body, else the registry entry. */
+    public static boolean isOwner(MinecraftServer server, UUID companionUuid, UUID ownerUuid) {
+        NumenPlayer live = NumenPlayer.findByUuid(server, companionUuid);
+        if (live != null) return live.isOwnedByPlayer(ownerUuid);
+        CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
+        return e != null && e.owner().equals(ownerUuid);
     }
 
     /**
@@ -203,7 +253,8 @@ public final class Companions {
         if (prev != null) {
             reg.put(body.getUUID(), new CompanionRegistry.Entry(
                     prev.name(), prev.owner(),
-                    ((ServerLevel) body.level()).dimension(), body.blockPosition()));
+                    ((ServerLevel) body.level()).dimension(), body.blockPosition())
+                    .withGameType(prev.gameType()).withOpEnabled(prev.opEnabled()));   // keep caps across dormancy
         }
         CompanionFactory.despawn(server, body);
     }

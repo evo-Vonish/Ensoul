@@ -52,11 +52,15 @@ public final class CompanionFactory {
         // it ourselves (Carpet's model): position, inventory, health, owner from
         // disk. Without this a respawned companion spawns at 0,0,0 with no items.
         loadPlayerData(server, player);
-        // Companions are always survival, whatever the world's default game type — their whole design
-        // (gather/drops, real combat, recoverable death) is survival-shaped, and placeNewPlayer would
-        // otherwise hand a creative world's body instabuild (no block drops, breaks auto_mine). Forced
-        // here after the .dat restore so a stale saved game type can't override it.
-        player.setGameMode(GameType.SURVIVAL);
+        // Apply the companion's PERSISTED per-companion game mode (survival by default; creative if the owner
+        // toggled it in the G panel — CompanionRegistry.Entry.gameType). Forced here AFTER the .dat restore so
+        // a stale saved game type can't override the owner's setting, and after placeNewPlayer so a creative
+        // world's default can't silently hand a survival companion instabuild. On a fresh summon the registry
+        // entry doesn't exist yet (it's put() right after spawn), so it reads as SURVIVAL — the correct default.
+        // ServerPlayer.setGameMode → changeGameModeForPlayer → GameType.updatePlayerAbilities + onUpdateAbilities,
+        // so CREATIVE here grants real invulnerability + mayfly + instabuild (verified, 26.1.2 sources).
+        CompanionRegistry.Entry regEntry = CompanionRegistry.get(server).find(companionUuid);
+        player.setGameMode(regEntry != null ? regEntry.gameType() : GameType.SURVIVAL);
         // First spawn has no .dat to restore the owner from; set it explicitly.
         if (player.getOwnerUuid() == null) {
             player.setOwnerUuid(ownerUuid);

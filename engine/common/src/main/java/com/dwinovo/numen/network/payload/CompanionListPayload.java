@@ -8,6 +8,7 @@ import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.GameType;
 
 import java.util.List;
 import java.util.UUID;
@@ -26,12 +27,14 @@ public record CompanionListPayload(List<Entry> companions) implements CustomPack
     /** Cap defends against absurd input; nobody owns hundreds of companions. */
     public static final int MAX = 64;
 
-    /** One companion's roster line. */
-    public record Entry(UUID uuid, String name) {
+    /** One companion's roster line: identity + per-companion capability state for the G-panel toggles. */
+    public record Entry(UUID uuid, String name, GameType gameType, boolean opEnabled) {
         static final StreamCodec<RegistryFriendlyByteBuf, Entry> CODEC =
                 StreamCodec.composite(
                         UUIDUtil.STREAM_CODEC, Entry::uuid,
                         ByteBufCodecs.stringUtf8(256), Entry::name,
+                        GameType.STREAM_CODEC, Entry::gameType,
+                        ByteBufCodecs.BOOL, Entry::opEnabled,
                         Entry::new);
     }
 
@@ -53,7 +56,7 @@ public record CompanionListPayload(List<Entry> companions) implements CustomPack
     public static void handle(CompanionListPayload p) {
         java.util.List<NumenRoster.Entry> snapshot = new java.util.ArrayList<>();
         for (Entry e : p.companions()) {
-            snapshot.add(new NumenRoster.Entry(e.uuid(), e.name()));
+            snapshot.add(new NumenRoster.Entry(e.uuid(), e.name(), e.gameType(), e.opEnabled()));
         }
         NumenRoster.instance().replaceAll(snapshot);
     }

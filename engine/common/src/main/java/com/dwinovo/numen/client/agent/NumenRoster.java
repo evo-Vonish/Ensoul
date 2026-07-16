@@ -1,5 +1,7 @@
 package com.dwinovo.numen.client.agent;
 
+import net.minecraft.world.level.GameType;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,8 +25,13 @@ import java.util.UUID;
  */
 public final class NumenRoster {
 
-    /** One live companion: identity + display name. */
-    public record Entry(UUID uuid, String name) {}
+    /** One live companion: identity + display name + per-companion capability state (for the G-panel toggles). */
+    public record Entry(UUID uuid, String name, GameType gameType, boolean opEnabled) {
+        /** Identity-only convenience (caps default to survival + OP-off) for callers that don't carry them. */
+        public Entry(UUID uuid, String name) {
+            this(uuid, name, GameType.SURVIVAL, false);
+        }
+    }
 
     private static NumenRoster instance;
 

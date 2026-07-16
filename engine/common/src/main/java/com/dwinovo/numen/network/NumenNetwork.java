@@ -98,5 +98,17 @@ public final class NumenNetwork {
                 com.dwinovo.numen.network.payload.DismissRequestPayload.TYPE,
                 com.dwinovo.numen.network.payload.DismissRequestPayload.STREAM_CODEC,
                 com.dwinovo.numen.network.payload.DismissRequestPayload::handle);
+
+        // C→S: the Settings tab's GAME MODE toggle — flip a companion between survival and creative.
+        Services.NETWORK.registerClientToServer(
+                com.dwinovo.numen.network.payload.SetCompanionGameModePayload.TYPE,
+                com.dwinovo.numen.network.payload.SetCompanionGameModePayload.STREAM_CODEC,
+                com.dwinovo.numen.network.payload.SetCompanionGameModePayload::handle);
+
+        // C→S: the Settings tab's OP toggle — flip a companion's command-permission master switch.
+        Services.NETWORK.registerClientToServer(
+                com.dwinovo.numen.network.payload.SetCompanionOpPayload.TYPE,
+                com.dwinovo.numen.network.payload.SetCompanionOpPayload.STREAM_CODEC,
+                com.dwinovo.numen.network.payload.SetCompanionOpPayload::handle);
     }
 }

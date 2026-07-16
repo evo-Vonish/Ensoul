@@ -83,10 +83,14 @@ public final class CorrectiveNotices {
     /**
      * Same-cause death stop-loss. Runs inside the engine's {@code fireDeath(body)}
      * (see {@code Companions.onDeath}: line 103 reads the death message, line 105
-     * fires this seam, line 115 defers the corpse despawn to after the tick) — so
-     * the combat tracker is still intact here and {@code resolveOwnerPlayer()} still
-     * resolves. We read the SAME {@code getCombatTracker().getDeathMessage()} the
-     * engine reads, normalize it to strip the companion's name, and count it.
+     * fires this seam, line 115 defers the corpse despawn to after the tick) — and
+     * {@code resolveOwnerPlayer()} still resolves here. Death cause comes from
+     * {@link NumenPlayer#lastDeathMessage()}: the engine snapshots the REAL message in
+     * {@code die()} (e.g. "Fenn淹死了"). We do NOT trust the live combat tracker — by this
+     * poll a fake player's tracker has decayed to a bare "Fennさん died", which normalizes to
+     * the single char "死", so a drowning stop-loss mis-recorded as "第 N 次死于死" (field
+     * evidence, 2026-07-17). The combat tracker read is kept only as a fallback for deaths that
+     * bypass {@code die()} (lastDeathMessage null). We normalize to strip the name, then count.
      */
     static void onDeath(NumenPlayer body) {
         try {
@@ -94,7 +98,11 @@ public final class CorrectiveNotices {
             // so it carries no survival-pattern to stop-loss against — don't count it or pollute the cause tolls.
             if (Perceptions.isCreative(body)) return;
             String name = body.getName().getString();
-            String cause = normalizeCause(body.getCombatTracker().getDeathMessage().getString(), name);
+            String raw = body.lastDeathMessage();   // die()-time snapshot of the true cause; null if die() was bypassed
+            if (raw == null || raw.isBlank()) {
+                raw = body.getCombatTracker().getDeathMessage().getString();   // fallback (degraded, but better than nothing)
+            }
+            String cause = normalizeCause(raw, name);
             int n = DeathTolls.record(name, cause);
             if (n <= 1) return;   // 1st death of this cause: the ordinary death event already covers it.
 

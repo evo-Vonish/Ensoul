@@ -1,5 +1,6 @@
 package com.dwinovo.numen.entity;
 
+import com.dwinovo.numen.entity.look.LookController;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.core.Holder;
 import net.minecraft.core.UUIDUtil;
@@ -68,9 +69,25 @@ public final class NumenPlayer extends ServerPlayer {
      */
     private final Map<Holder<MobEffect>, Integer> lastEffectAmplifier = new HashMap<>();
 
+    /**
+     * The lively-look engine: the per-tick kinematic writer that turns a gaze intent into smooth,
+     * owl-safe head/body motion. It is ticked at the tail of {@link #tick()} — the only window where
+     * an independent {@code yHeadRot} survives {@code Player.aiStep}'s per-tick {@code yHeadRot = yRot}
+     * overwrite and still ships to clients. Intent is fed by the tool pack's attention brain, and
+     * hard-aim / locomotion yielding rides through {@code InputDriver} automatically (see
+     * {@link LookController}). Body-scoped, dies with the body.
+     */
+    private final LookController look;
+
     public NumenPlayer(MinecraftServer server, ServerLevel level, GameProfile profile,
                         ClientInformation clientInformation) {
         super(server, level, profile, clientInformation);
+        this.look = new LookController(this);
+    }
+
+    /** The lively-look engine that owns this body's head/body/pitch smoothing. Never null. */
+    public LookController getLook() {
+        return look;
     }
 
     /** The loaded companion body with this UUID, or {@code null} if not spawned. */
@@ -163,6 +180,17 @@ public final class NumenPlayer extends ServerPlayer {
             this.doTick();
         } catch (Exception ignored) {
             // mirrors Carpet — fake-connection internals can NPE on edge cases
+        }
+        // The lively-look engine writes LAST, on purpose. super.tick() ran Player.aiStep (which
+        // hard-sets yHeadRot = yRot) and tickHeadTurn (which eases the body toward yRot); doTick()
+        // ran travel. Only here — after aiStep, before the end-of-tick ServerEntity rotation
+        // dispatch — does an independent head survive to the client. Writing it any earlier is
+        // clobbered; writing it in the end-of-server-tick phase ships a tick late and is then
+        // overwritten by the next aiStep. (26.1.2 rotation study §A4/§B2.)
+        try {
+            this.look.tick();
+        } catch (Exception ignored) {
+            // never let a look glitch break the body's tick
         }
     }
 

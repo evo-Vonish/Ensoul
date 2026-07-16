@@ -250,10 +250,11 @@ public final class PlayerNav {
             return Status.RUNNING;   // worker still planning — body waits (it was idle anyway)
         }
         Path path = searchFuture.getNow(null);
+        AStarSearch finished = searchObj;   // capture the terminal reason BEFORE clearing it
         searchFuture = null;
         searchObj = null;
         if (path == null || path.isEmpty()) {
-            failReason = "no path to target (obstructed or out of bridging blocks)";
+            failReason = describeEmptyPath(finished);
             return reached.getAsBoolean() ? Status.ARRIVED : Status.FAILED;
         }
         Path cut = path.staticCutoff();
@@ -317,6 +318,37 @@ public final class PlayerNav {
             pendingNext.stop();
             pendingNext = null;
         }
+    }
+
+    /**
+     * ⑤ Split the old three-in-one "no path (obstructed or out of bridging blocks)" message into its real
+     * cause, using the finished search's terminal reason:
+     * <ul>
+     *   <li><b>over budget</b> — A* hit its node cap before reaching the goal (too far / too complex);</li>
+     *   <li><b>blocked by X</b> — a concrete break-veto sits on the straight line (stone-with-a-sword,
+     *       lava, a functional block …), the actionable case;</li>
+     *   <li><b>no scaffold</b> — the frontier drained and the body carries no bridging blocks, so a
+     *       gap/pillar could never be crossed;</li>
+     *   <li><b>truly no path</b> — the frontier drained and the terrain is genuinely unreachable.</li>
+     * </ul>
+     */
+    private static String describeEmptyPath(AStarSearch s) {
+        if (s == null) {
+            return "no path to target (obstructed or out of bridging blocks)";
+        }
+        if (s.terminatedByBudget()) {
+            return "the target is too far or the route too complex — the pathfinder hit its search budget "
+                    + "before finding a way. Move to a nearer waypoint (or scan_blocks first), then retry.";
+        }
+        String veto = s.diagnose();
+        if (veto != null) {
+            return "no path: blocked by " + veto + ".";
+        }
+        if (!s.hasScaffold()) {
+            return "no path: the route needs to bridge a gap or pillar up, but you have no scaffolding "
+                    + "blocks (cobblestone/dirt) to place. Carry some and retry.";
+        }
+        return "no path to target: it's walled off or too broken up to reach from here.";
     }
 
     public String failReason() {

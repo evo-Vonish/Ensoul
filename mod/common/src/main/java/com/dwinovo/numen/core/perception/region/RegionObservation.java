@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -18,6 +19,8 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -70,7 +73,22 @@ public final class RegionObservation {
     /** Fixed sample offsets inside the 16-wide region — a deterministic 4×4 grid. */
     private static final int[] GRID = {1, 5, 9, 13};
 
+    /** How far below its column's surface the observer must be to switch to underground sampling. */
+    private static final int UNDERGROUND_MARGIN = 4;
+    /** Deterministic size caps for the underground stratum sample (bound canonical + diff size). */
+    private static final int UNDERGROUND_HAZARD_CAP = 16;
+    private static final int UNDERGROUND_ORE_CAP = 24;
+
     private final RegionKey key;
+    /**
+     * Which stratum this observation describes: {@code false} = the 4×4 surface sample (v1 behaviour),
+     * {@code true} = the region's underground stratum (the fix — see {@link #observe}). Render-only
+     * bookkeeping: it selects the prose in {@link #render()} and is persisted for round-trip fidelity,
+     * but is deliberately NOT part of {@link #canonicalString()} — the two strata already diverge on
+     * their <em>content</em> (rock walls / lava / ore vs surface block), so the hash separates them
+     * without a schema change (keeping v1 surface hashes byte-identical → no spurious diffs on reload).
+     */
+    private final boolean underground;
     private final String dominantSurface;
     private final String biome;
     private final int heightMin;
@@ -79,9 +97,10 @@ public final class RegionObservation {
     private final List<Hazard> hazards;     // canonically sorted
     private final String semanticHash;
 
-    private RegionObservation(RegionKey key, String dominantSurface, String biome,
+    private RegionObservation(RegionKey key, boolean underground, String dominantSurface, String biome,
                               int heightMin, int heightMax, List<Feature> features, List<Hazard> hazards) {
         this.key = key;
+        this.underground = underground;
         this.dominantSurface = dominantSurface;
         this.biome = biome;
         this.heightMin = heightMin;
@@ -96,11 +115,27 @@ public final class RegionObservation {
     // ================================================================= scan
 
     /**
-     * Observe {@code key} in {@code level}. Returns {@code null} if the region's
-     * chunk is not loaded (never force-loads — the companion standing in the
-     * region guarantees it is loaded when the crossing trigger fires).
+     * Observe {@code key} in {@code level} as seen by an observer at {@code body}. Returns {@code null}
+     * if the region's chunk is not loaded (never force-loads — the companion standing in the region
+     * guarantees it is loaded when a trigger fires).
+     *
+     * <p><b>The fix (换眼睛).</b> The content function now samples the observer's ACTUAL stratum. When
+     * the body sits well below its column's surface (or in a Y-band below the surface band), it takes a
+     * 3D underground sample of the region's own 16×64×16 box — rock walls, visible hazards
+     * (lava / fire / magma / water) and notable ores — instead of describing the sky-lit surface it is
+     * nowhere near. Otherwise it keeps the original 4×4 surface sample, byte-for-byte. Both feed the
+     * SAME canonical structure and the SAME hash, so the diff pipeline revives itself: an underground
+     * region now hashes to its real contents, and mining/flooding it moves the hash → REGION_DIFF.
+     *
+     * <p>Determinism (acceptance test #8): the underground sample iterates a fixed grid in a fixed order
+     * and sorts its output with the existing comparators, so the same world state yields byte-identical
+     * canonical regardless of iteration order. It is region-scoped (not body-centred), so re-observing an
+     * unchanged region from a different spot inside it produces the same hash → zero append (test #4).
+     *
+     * @param feltOverlay personally-verified hazards (② hurt-seam provenance) to union into the sample,
+     *                    deduped by token; may be {@code null}/empty.
      */
-    public static RegionObservation observe(ServerLevel level, RegionKey key) {
+    public static RegionObservation observe(ServerLevel level, RegionKey key, BlockPos body, List<Hazard> feltOverlay) {
         BlockPos center = key.centerPos();
         if (!level.hasChunkAt(center)) return null;
         ChunkAccess ca = level.getChunk(key.chunkX(), key.chunkZ(), ChunkStatus.FULL, false);
@@ -109,33 +144,49 @@ public final class RegionObservation {
         String biome = level.getBiome(center).unwrapKey()
                 .map(k -> k.identifier().toString()).orElse("unknown");
 
-        // Fixed 4×4 ground-surface sample: height band, dominant surface, surface hazards.
-        int hMin = Integer.MAX_VALUE, hMax = Integer.MIN_VALUE;
-        Map<String, Integer> surfaceCounts = new HashMap<>();
-        List<Hazard> hazards = new ArrayList<>();
-        int minY = level.getMinY();
-        for (int gx : GRID) {
-            for (int gz : GRID) {
-                int wx = key.chunkX() * RegionKey.SIZE_XZ + gx;
-                int wz = key.chunkZ() * RegionKey.SIZE_XZ + gz;
-                // Server maintains MOTION_BLOCKING_NO_LEAVES in FINAL_HEIGHTMAPS; it skips leaves and
-                // non-solid plants, filtering vegetation churn before it is ever sampled (test #9).
-                int surfaceY = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz) - 1;
-                if (surfaceY < minY) continue;   // void column — nothing to sample
-                if (surfaceY < hMin) hMin = surfaceY;
-                if (surfaceY > hMax) hMax = surfaceY;
-                BlockState st = level.getBlockState(new BlockPos(wx, surfaceY, wz));
-                String id = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
-                surfaceCounts.merge(id, 1, Integer::sum);
-                String hz = hazardType(id);
-                if (hz != null) hazards.add(new Hazard(hz, wx, surfaceY, wz));
-            }
-        }
-        if (hMin == Integer.MAX_VALUE) { hMin = 0; hMax = 0; }
-        String dominantSurface = majority(surfaceCounts);
+        boolean underground = isUnderground(chunk, key, body);
 
-        // Features: block entities within the region's Y band (stable infrastructure).
+        String dominantSurface;
+        int hMin, hMax;
         List<Feature> features = new ArrayList<>();
+        List<Hazard> hazards = new ArrayList<>();
+
+        if (underground) {
+            UndergroundSample us = sampleUnderground(level, key);
+            dominantSurface = us.dominantSolid();
+            hMin = us.solidMinY();
+            hMax = us.solidMaxY();
+            features.addAll(us.ores());
+            hazards.addAll(us.hazards());
+        } else {
+            // Fixed 4×4 ground-surface sample: height band, dominant surface, surface hazards.
+            int shMin = Integer.MAX_VALUE, shMax = Integer.MIN_VALUE;
+            Map<String, Integer> surfaceCounts = new HashMap<>();
+            int minY = level.getMinY();
+            for (int gx : GRID) {
+                for (int gz : GRID) {
+                    int wx = key.chunkX() * RegionKey.SIZE_XZ + gx;
+                    int wz = key.chunkZ() * RegionKey.SIZE_XZ + gz;
+                    // Server maintains MOTION_BLOCKING_NO_LEAVES in FINAL_HEIGHTMAPS; it skips leaves and
+                    // non-solid plants, filtering vegetation churn before it is ever sampled (test #9).
+                    int surfaceY = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, wx, wz) - 1;
+                    if (surfaceY < minY) continue;   // void column — nothing to sample
+                    if (surfaceY < shMin) shMin = surfaceY;
+                    if (surfaceY > shMax) shMax = surfaceY;
+                    BlockState st = level.getBlockState(new BlockPos(wx, surfaceY, wz));
+                    String id = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
+                    surfaceCounts.merge(id, 1, Integer::sum);
+                    String hz = hazardType(id);
+                    if (hz != null) hazards.add(new Hazard(hz, wx, surfaceY, wz));
+                }
+            }
+            if (shMin == Integer.MAX_VALUE) { shMin = 0; shMax = 0; }
+            hMin = shMin;
+            hMax = shMax;
+            dominantSurface = majority(surfaceCounts);
+        }
+
+        // Features: block entities within the region's Y band (stable infrastructure) — both strata.
         int yLo = key.minY(), yHi = key.maxY();
         for (Map.Entry<BlockPos, BlockEntity> e : chunk.getBlockEntities().entrySet()) {
             BlockPos p = e.getKey();
@@ -144,7 +195,72 @@ public final class RegionObservation {
             features.add(new Feature(featureType(id), id, p.getX(), p.getY(), p.getZ()));
         }
 
-        return new RegionObservation(key, dominantSurface, biome, hMin, hMax, features, hazards);
+        // ② Felt-hazard overlay: personally-verified hazards union in (deduped by token) so the next
+        // snapshot/diff naturally carries what the body was actually hurt by, even if the grid missed it.
+        if (feltOverlay != null && !feltOverlay.isEmpty()) {
+            Set<String> present = new HashSet<>();
+            for (Hazard h : hazards) present.add(h.token());
+            for (Hazard h : feltOverlay) if (present.add(h.token())) hazards.add(h);
+        }
+
+        return new RegionObservation(key, underground, dominantSurface, biome, hMin, hMax, features, hazards);
+    }
+
+    /** Whether the observer at {@code body} is below its column's surface (→ underground sampling). */
+    private static boolean isUnderground(LevelChunk chunk, RegionKey key, BlockPos body) {
+        int surfaceY = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, body.getX(), body.getZ()) - 1;
+        int surfaceBand = Math.floorDiv(surfaceY, RegionKey.SIZE_Y);
+        return (surfaceY - body.getY() > UNDERGROUND_MARGIN) || (key.ry() < surfaceBand);
+    }
+
+    /** Result of the 3D stratum sample over one region's own 16×64×16 box. */
+    private record UndergroundSample(String dominantSolid, int solidMinY, int solidMaxY,
+                                     List<Feature> ores, List<Hazard> hazards) {}
+
+    /**
+     * Sample the region's underground stratum: probe the region band vertically at each of the fixed
+     * 4×4 grid columns, recording visible hazards (lava / fire / magma / water — the topmost of each
+     * type per column), notable ores, and the dominant wall block. Region-scoped and fixed-order, so
+     * two samples of the same world state produce byte-identical canonical (sorted + capped here).
+     */
+    private static UndergroundSample sampleUnderground(ServerLevel level, RegionKey key) {
+        Map<String, Integer> solidCounts = new HashMap<>();
+        List<Hazard> hazards = new ArrayList<>();
+        List<Feature> ores = new ArrayList<>();
+        int solidMin = Integer.MAX_VALUE, solidMax = Integer.MIN_VALUE;
+        int yTop = Math.min(key.maxY() - 1, level.getMaxY());
+        int yBot = Math.max(key.minY(), level.getMinY());
+        BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+        for (int gx : GRID) {
+            for (int gz : GRID) {
+                int wx = key.chunkX() * RegionKey.SIZE_XZ + gx;
+                int wz = key.chunkZ() * RegionKey.SIZE_XZ + gz;
+                Set<String> hzThisColumn = new HashSet<>();
+                for (int y = yTop; y >= yBot; y--) {
+                    p.set(wx, y, wz);
+                    BlockState st = level.getBlockState(p);
+                    if (st.isAir()) continue;              // the cavity itself — nothing to record
+                    String id = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
+                    String hz = undergroundHazard(id, st);
+                    if (hz != null) {
+                        if (hzThisColumn.add(hz)) hazards.add(new Hazard(hz, wx, y, wz));
+                        continue;
+                    }
+                    if (isOre(id)) { ores.add(new Feature("ore", id, wx, y, wz)); continue; }
+                    if (st.getFluidState().isEmpty()) {    // a solid wall block — count it as the stratum rock
+                        solidCounts.merge(id, 1, Integer::sum);
+                        if (y < solidMin) solidMin = y;
+                        if (y > solidMax) solidMax = y;
+                    }
+                }
+            }
+        }
+        if (solidMin == Integer.MAX_VALUE) { solidMin = yBot; solidMax = yTop; }
+        hazards.sort(HAZARD_ORDER);
+        ores.sort(FEATURE_ORDER);
+        if (hazards.size() > UNDERGROUND_HAZARD_CAP) hazards = new ArrayList<>(hazards.subList(0, UNDERGROUND_HAZARD_CAP));
+        if (ores.size() > UNDERGROUND_ORE_CAP) ores = new ArrayList<>(ores.subList(0, UNDERGROUND_ORE_CAP));
+        return new UndergroundSample(majority(solidCounts), solidMin, solidMax, ores, hazards);
     }
 
     // ============================================================ accessors
@@ -278,7 +394,7 @@ public final class RegionObservation {
         for (Hazard h : hazards) if (!removedH.contains(h.token())) hz.add(h);
         hz.addAll(d.addedHazards);
 
-        return new RegionObservation(key, d.newSurface, d.newBiome,
+        return new RegionObservation(key, underground, d.newSurface, d.newBiome,
                 d.newBand != null ? d.newBand[0] : heightMin,
                 d.newBand != null ? d.newBand[1] : heightMax, feats, hz);
     }
@@ -287,6 +403,10 @@ public final class RegionObservation {
 
     /** Chinese summary rendered FROM the canonical structure (not the other way around). */
     public String render() {
+        return underground ? renderUnderground() : renderSurface();
+    }
+
+    private String renderSurface() {
         StringBuilder sb = new StringBuilder();
         sb.append("此处是 ").append(shortId(biome))
                 .append(",地表 ").append(shortId(dominantSurface))
@@ -300,6 +420,39 @@ public final class RegionObservation {
             sb.append("无明显危险。");
         } else {
             sb.append("危险:").append(renderHazards(hazards)).append("。");
+        }
+        return sb.toString();
+    }
+
+    /** Underground prose: a cave/mineshaft stratum — rock walls, visible hazards, and ore. */
+    private String renderUnderground() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("此处为地下(").append(shortId(biome)).append("),四周多为 ")
+                .append(shortId(dominantSurface))
+                .append(",y ").append(heightMin).append("~").append(heightMax).append("。");
+        String ores = renderOreCounts(features);
+        if (!ores.isEmpty()) sb.append("可见矿物:").append(ores).append("。");
+        List<Feature> infra = new ArrayList<>();
+        for (Feature f : features) if (!"ore".equals(f.type())) infra.add(f);
+        if (!infra.isEmpty()) sb.append("显著方块:").append(renderFeatures(infra)).append("。");
+        if (hazards.isEmpty()) {
+            sb.append("无明显危险。");
+        } else {
+            sb.append("危险:").append(renderHazards(hazards)).append("。");
+        }
+        return sb.toString();
+    }
+
+    /** Collapse ore features into "iron_ore×N、coal_ore×M" (insertion-ordered, deterministic). */
+    static String renderOreCounts(List<Feature> fs) {
+        LinkedHashMap<String, Integer> counts = new LinkedHashMap<>();
+        for (Feature f : fs) if ("ore".equals(f.type())) counts.merge(shortId(f.block()), 1, Integer::sum);
+        StringBuilder sb = new StringBuilder();
+        boolean first = true;
+        for (Map.Entry<String, Integer> e : counts.entrySet()) {
+            if (!first) sb.append("、");
+            sb.append(e.getKey()).append("×").append(e.getValue());
+            first = false;
         }
         return sb.toString();
     }
@@ -336,6 +489,7 @@ public final class RegionObservation {
     public JsonObject toJson() {
         JsonObject o = new JsonObject();
         o.addProperty("hash", semanticHash);
+        if (underground) o.addProperty("underground", true);   // omitted for surface → v1 files unchanged
         JsonObject terrain = new JsonObject();
         terrain.addProperty("dominant_surface", dominantSurface);
         terrain.addProperty("biome", biome);
@@ -365,6 +519,7 @@ public final class RegionObservation {
     }
 
     public static RegionObservation fromJson(RegionKey key, JsonObject o) {
+        boolean underground = o.has("underground") && o.get("underground").getAsBoolean();
         JsonObject terrain = o.getAsJsonObject("terrain");
         String surface = terrain.get("dominant_surface").getAsString();
         String biome = terrain.get("biome").getAsString();
@@ -385,7 +540,7 @@ public final class RegionObservation {
             hazards.add(new Hazard(ho.get("type").getAsString(),
                     p.get(0).getAsInt(), p.get(1).getAsInt(), p.get(2).getAsInt()));
         }
-        return new RegionObservation(key, surface, biome, hMin, hMax, features, hazards);
+        return new RegionObservation(key, underground, surface, biome, hMin, hMax, features, hazards);
     }
 
     private static JsonArray posArray(int x, int y, int z) {
@@ -431,6 +586,27 @@ public final class RegionObservation {
         if (p.equals("fire") || p.equals("soul_fire")) return "fire";
         if (p.equals("magma_block")) return "magma";
         return null;
+    }
+
+    /**
+     * Underground hazard label — the surface set plus water (drowning is a real cave hazard, and the
+     * flooded lava/water a mineshaft exposes matters). Water is deliberately NOT in {@link #hazardType}
+     * so the surface sampler stays byte-identical (a lakeside surface must not sprout water hazards).
+     */
+    private static String undergroundHazard(String id, BlockState st) {
+        String hz = hazardType(id);
+        if (hz != null) return hz;
+        if (!st.getFluidState().isEmpty()) {
+            if (st.getFluidState().is(FluidTags.LAVA)) return "lava";
+            if (st.getFluidState().is(FluidTags.WATER)) return "water";
+        }
+        return null;
+    }
+
+    /** Whether a block id names a notable ore (any *_ore variant, plus ancient_debris). */
+    private static boolean isOre(String id) {
+        String p = shortId(id);
+        return p.endsWith("_ore") || p.equals("ancient_debris");
     }
 
     /** Minimal JSON string escaping for the canonical form (block/biome ids are simple, but be safe). */

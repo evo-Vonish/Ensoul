@@ -2,6 +2,7 @@ package com.dwinovo.numen.core.perception.region;
 
 import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 
 /**
@@ -59,11 +60,14 @@ public final class RegionCognition {
      * and applied the per-region cooldown.
      */
     public static void observe(NumenPlayer body, ServerLevel level, RegionKey key, long now) {
-        RegionObservation obs = RegionObservation.observe(level, key);
-        if (obs == null) return;   // chunk not loaded — should not happen for the companion's own region
-
         RegionStore store = RegionStore.forCompanion(body.getUUID());
         RegionStore.Record rec = store.get(key);
+        // ② Carry any personally-verified (felt) hazards for this region into the sample so the next
+        //    snapshot/diff naturally reports them (stable across re-observations → no spurious removal).
+        java.util.List<RegionObservation.Hazard> felt =
+                rec != null ? rec.feltHazards() : java.util.List.of();
+        RegionObservation obs = RegionObservation.observe(level, key, body.blockPosition(), felt);
+        if (obs == null) return;   // chunk not loaded — should not happen for the companion's own region
 
         if (rec == null) {
             // First visit → snapshot v1 (首次进入区域 A → 只追加一个 snapshot).
@@ -115,6 +119,32 @@ public final class RegionCognition {
         } else {
             emit(body, "region_diff", key, 0, renderDiff(key, diff));
         }
+    }
+
+    /**
+     * ② Record a personally-verified (亲测) environmental hazard the body was just hurt by, at {@code at},
+     * into the region's memory so its next snapshot/diff carries it — provenance stays observed. Deduped
+     * "同区域同类型" by {@link RegionStore#addFeltHazard} (防刷屏): only the first felt hazard of each type
+     * per region is kept, and re-observing folds it in through the normal append-only pipeline (a new felt
+     * hazard → REGION_DIFF; one already seen → zero append). Server thread only.
+     */
+    public static void recordFeltHazard(NumenPlayer body, ServerLevel level, RegionKey key,
+                                        String type, BlockPos at, long now) {
+        RegionStore store = RegionStore.forCompanion(body.getUUID());
+        RegionStore.Record rec = store.get(key);
+        if (rec == null) {
+            // No baseline yet: snapshot the region first (its own sampler may already see the hazard),
+            // then attach the felt hazard so the follow-up observe carries it.
+            RegionObservation first = RegionObservation.observe(level, key, body.blockPosition(), java.util.List.of());
+            if (first == null) return;   // chunk not loaded — a later crossing will snapshot it
+            store.recordSnapshot(first, now);
+            emit(body, "region_snapshot", key, 1, first.render());
+        }
+        if (!store.addFeltHazard(rec != null ? rec : store.get(key),
+                type, at.getX(), at.getY(), at.getZ())) {
+            return;   // same-type felt hazard already recorded for this region — 去重防刷屏
+        }
+        observe(body, level, key, now);   // re-observe with the updated felt set → REGION_DIFF (or zero-append)
     }
 
     /** Whether a diff is a structural change per the §5.3 importance categories. */

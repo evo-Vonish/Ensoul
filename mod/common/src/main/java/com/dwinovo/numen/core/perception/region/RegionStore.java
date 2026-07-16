@@ -71,6 +71,9 @@ public final class RegionStore {
         RegionObservation canonical;
         int baselineVersion;
         final List<LogEntry> eventLog = new ArrayList<>();
+        /** ② Personally-verified hazards (亲测, provenance observed), deduped by type; folded into
+         *  every {@link RegionObservation#observe} of this region so a felt danger keeps being carried. */
+        final List<RegionObservation.Hazard> feltHazards = new ArrayList<>();
 
         Record(RegionKey key) { this.key = key; }
 
@@ -78,6 +81,9 @@ public final class RegionStore {
         public String semanticHash() { return semanticHash; }
         public long observedAtGameTime() { return observedAtGameTime; }
         public RegionObservation canonical() { return canonical; }
+
+        /** The felt-hazard overlay for this region (read-only view is fine — mutated only via the store). */
+        public List<RegionObservation.Hazard> feltHazards() { return feltHazards; }
 
         /** Diffs appended since the most recent snapshot baseline. */
         public int diffsSinceBaseline() {
@@ -171,6 +177,21 @@ public final class RegionStore {
     public void touch(Record rec, long now) {
         rec.observedAtGameTime = now;
         save();
+    }
+
+    /**
+     * ② Attach a personally-verified hazard to a region's felt overlay, deduped by type (同区域同类型
+     * 去重防刷屏 — only the first felt hazard of each type is kept). Returns {@code true} iff it was newly
+     * added (the caller then re-observes to fold it into a snapshot/diff); {@code false} = already present.
+     */
+    public boolean addFeltHazard(Record rec, String type, int x, int y, int z) {
+        if (rec == null) return false;
+        for (RegionObservation.Hazard h : rec.feltHazards) {
+            if (h.type().equals(type)) return false;
+        }
+        rec.feltHazards.add(new RegionObservation.Hazard(type, x, y, z));
+        save();
+        return true;
     }
 
     /**
@@ -277,6 +298,7 @@ public final class RegionStore {
         JsonArray log = new JsonArray();
         for (LogEntry e : rec.eventLog) log.add(logEntryToJson(e));
         o.add("eventLog", log);
+        if (!rec.feltHazards.isEmpty()) o.add("feltHazards", hazardsToJson(rec.feltHazards));
         return o;
     }
 
@@ -288,6 +310,9 @@ public final class RegionStore {
         rec.canonical = RegionObservation.fromJson(key, o.getAsJsonObject("canonical"));
         for (JsonElement el : o.getAsJsonArray("eventLog")) {
             rec.eventLog.add(logEntryFromJson(key, el.getAsJsonObject()));
+        }
+        if (o.has("feltHazards")) {
+            rec.feltHazards.addAll(hazardsFromJson(o.getAsJsonArray("feltHazards")));
         }
         return rec;
     }

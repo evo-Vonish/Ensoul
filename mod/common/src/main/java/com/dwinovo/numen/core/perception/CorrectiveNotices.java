@@ -143,6 +143,10 @@ public final class CorrectiveNotices {
      *                 (treated as a failure, matching the drain's own fallback JSON)
      */
     public static void onTaskResult(NumenPlayer body, String toolName, TaskResult result) {
+        // ③ 移动结算: mechanical region re-observation after any settled world-action task. Runs for
+        // successes too (a move_to that relocated the body), so it precedes the failure-only logic below.
+        // Self-contained + self-guarded; the crossing poll and zero-append keep it from double-logging.
+        com.dwinovo.numen.core.perception.region.MoveSettlement.onTaskSettled(body, toolName);
         try {
             if (result != null && result.interrupted()) return;   // owner Stop — not a method problem
             boolean failed = (result == null) || !result.success();

@@ -7,6 +7,7 @@ import com.dwinovo.numen.core.task.CompanionTask;
 import com.dwinovo.numen.task.TaskResult;
 import com.dwinovo.numen.core.task.TaskState;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -41,6 +42,9 @@ public final class MoveToCompanionTask implements CompanionTask {
      *  up — long enough for the body to passively drift onto a reachable underwater target,
      *  short enough to bail under an out-of-reach above-water one. */
     private static final int MAX_SETTLE_TICKS = 60;
+    /** A COLUMN move that ends this many blocks below its column's open-air surface is underground:
+     *  say so instead of the poisoning "standing on the ground at y=54" (⑤). */
+    private static final int UNDERGROUND_MARGIN = 4;
 
     private final NumenPlayer player;
     private final MoveToTaskRecord r;
@@ -201,11 +205,30 @@ public final class MoveToCompanionTask implements CompanionTask {
                         + (dy > 0 ? "up — likely mid-air" : "down — likely blocked")
                         + "); for a location, omit y and I resolve the surface.";
             }
-            case COLUMN -> "arrived at location x=" + bx + " z=" + bz
-                    + ", standing on the ground at y=" + gy + ".";
+            case COLUMN -> columnArrivedMessage(gy);
             case YLEVEL -> "reached elevation y=" + gy
                     + (gy == by ? "." : " (requested y=" + by + ").");
         };
+    }
+
+    /**
+     * ⑤ Honest COLUMN arrival. A location move (x+z, no y) reaches the FIRST ground it finds — which may
+     * be a cave floor far below the open-air surface, the exact trap that stranded the companion at y=54
+     * while the furnace sat at y=65. Compare the reached ground to the column's real surface and, when we
+     * are well below it, spell out that we're underground and how to actually surface — instead of the
+     * poisoning bare "standing on the ground at y=54". Success stays true (we DID reach x/z), but the
+     * message tells the whole truth.
+     */
+    private String columnArrivedMessage(int gy) {
+        String base = "arrived at location x=" + bx + " z=" + bz + ", standing on the ground at y=" + gy + ".";
+        int surfaceY = player.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz) - 1;
+        if (surfaceY - gy > UNDERGROUND_MARGIN) {
+            base += " But you're underground here (y=" + gy + "): the open-air surface at this column is y="
+                    + surfaceY + ", " + (surfaceY - gy) + " blocks above you. A location move only reaches "
+                    + "the first ground it finds — this cave/hollow floor, not the surface. To surface, "
+                    + "move_to with y=" + surfaceY + " (elevation-only move) or dig straight up.";
+        }
+        return base;
     }
 
     private String timeoutMessage(int gy) {

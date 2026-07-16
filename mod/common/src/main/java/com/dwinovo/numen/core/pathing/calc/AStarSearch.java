@@ -67,6 +67,13 @@ public final class AStarSearch {
     private State state = State.COMPUTING;
     private Path result;
 
+    /**
+     * Why the search terminated, for the caller's failure triage (⑤): {@code true} = the node cap
+     * ({@code maxNodes}) was hit with the frontier still non-empty (target too far / route too complex);
+     * {@code false} = the open set was exhausted (a definitive "no reachable path"). Written by the worker
+     * before the future completes, read by the tick thread after — the future's happens-before covers it. */
+    private boolean terminatedByBudget;
+
     /** Set from another thread to abandon an in-flight search (replan / stop). The expansion loop
      *  checks it and bails; the owner has already discarded this search's future. */
     private volatile boolean cancelled;
@@ -109,6 +116,33 @@ public final class AStarSearch {
      */
     public Path result() {
         return result;
+    }
+
+    /**
+     * ⑤ Failure triage — call only after {@link State#DONE}. True when the search stopped because it hit
+     * the node budget ({@code maxNodes}) rather than exhausting the frontier: the target is too far or the
+     * route too complex, distinct from a genuine "no path" (frontier drained).
+     */
+    public boolean terminatedByBudget() {
+        return terminatedByBudget;
+    }
+
+    /** ⑤ Whether the entity had any scaffolding block for this search (a gap/pillar needs one to bridge). */
+    public boolean hasScaffold() {
+        return ctx.hasScaffold;
+    }
+
+    /**
+     * ⑤ The first break-veto on the straight start→goal line, phrased for the model ("stone but I'm
+     * holding a sword", "lava behind it"), or {@code null} if that line is clean (the failure was
+     * geometric: gaps, fall limits, budget). Delegates to {@link NavContext#diagnoseObstruction}.
+     */
+    public String diagnose() {
+        try {
+            return ctx.diagnoseObstruction(start, goal.center());
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**
@@ -183,6 +217,9 @@ public final class AStarSearch {
         // Terminated (open exhausted or node cap hit) vs. just out of this tick's
         // budget. Only the former produces a result; otherwise resume next tick.
         if (open.isEmpty() || expansions >= maxNodes) {
+            // Open still has frontier but we stopped → the node cap bound us (over budget). Open drained
+            // → genuinely nothing left to reach. Prefer "exhausted" when both hold (a definitive no-path).
+            terminatedByBudget = !open.isEmpty() && expansions >= maxNodes;
             result = bestEffort();
             state = State.DONE;
         }

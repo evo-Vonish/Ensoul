@@ -1,6 +1,7 @@
 package com.dwinovo.numen.core.perception;
 
 import com.dwinovo.numen.core.Constants;
+import com.dwinovo.numen.core.perception.region.MoveSettlement;
 import com.dwinovo.numen.core.perception.region.RegionCognition;
 import com.dwinovo.numen.core.perception.region.RegionKey;
 import com.dwinovo.numen.core.perception.region.RegionStore;
@@ -8,6 +9,7 @@ import com.dwinovo.numen.entity.CompanionLifecycle;
 import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
 import com.dwinovo.numen.entity.PerceptionEvents;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -113,6 +115,7 @@ public final class Perceptions {
         CompanionLifecycle.onRemove(body -> {
             STATES.remove(body.getUUID());
             RegionStore.drop(body.getUUID());
+            MoveSettlement.drop(body.getUUID());   // ③ move-settlement baseline + block counter
         });
         Constants.LOG.info("[numen-core] L3 immediate perception + L2 regional observation registered");
     }
@@ -206,6 +209,7 @@ public final class Perceptions {
     private static void onHurt(PerceptionEvents.HurtInfo info) {
         NumenPlayer body = info.body();
         if (isCreative(body)) return;   // creative is invulnerable — no hurt / low-HP alerts (see isCreative)
+        recordFeltHazard(body, info.source());   // ② 亲测环境危险 → region memory (independent of the alert batching)
         PerceptionState st = stateFor(body);
         long now = body.level().getGameTime();
         float hpAfter = info.remainingHealth();
@@ -236,6 +240,35 @@ public final class Perceptions {
                         + ",情况危急,立即撤退或反击!", true);
             }
         }
+    }
+
+    /**
+     * ② If this hurt was an environmental hazard (lava / fire / magma / drowning), write a
+     * coordinate-tagged, personally-verified hazard into the region the body is standing in. It rides
+     * the region's next snapshot/diff (provenance stays observed); {@code RegionCognition} dedups it
+     * "同区域同类型" so a sustained burn can't spam the log.
+     */
+    private static void recordFeltHazard(NumenPlayer body, DamageSource source) {
+        if (!(body.level() instanceof ServerLevel level)) return;
+        String type = feltHazardType(source);
+        if (type == null) return;
+        BlockPos at = body.blockPosition();
+        if ("magma".equals(type)) at = at.below();   // the hot floor is the block beneath the feet
+        RegionKey key = RegionKey.of(level.dimension().identifier().toString(), body.blockPosition());
+        RegionCognition.recordFeltHazard(body, level, key, type, at, level.getGameTime());
+    }
+
+    /** Map a damage source's msg id to a felt-hazard type, or null for non-environmental damage. */
+    private static String feltHazardType(DamageSource source) {
+        String id = source.getMsgId();
+        if (id == null) return null;
+        return switch (id) {
+            case "lava" -> "lava";
+            case "inFire", "onFire" -> "fire";
+            case "hotFloor" -> "magma";
+            case "drown" -> "water";
+            default -> null;
+        };
     }
 
     /** Window closed: if more than the first hit landed, emit ONE merged non-urgent summary. */

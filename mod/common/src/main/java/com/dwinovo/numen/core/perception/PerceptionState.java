@@ -80,6 +80,16 @@ final class PerceptionState {
     /** Storage key of the region the companion was in last poll; null = not yet known. */
     String lastRegionKey;
 
+    // ---- §8 repeated-failure detector (see CorrectiveNotices) ----
+    /**
+     * Session-scope streak state per failure key ("{@code tool|message-prefix}"):
+     * {@code [lastFailureTick, consecutiveCount]}. A streak resets once the gap since
+     * the last identical failure exceeds the detector's window. Not persisted — a
+     * repeated-failure pattern is a live-loop signal, dropped with the body like the
+     * rest of this state.
+     */
+    final Map<String, long[]> failureStreaks = new HashMap<>();
+
     // ---- reflex layer (spinal cord) — see {@link Reflexes}. Server-thread only, like the rest. ----
 
     // Reflex 1: suffocation escape (the wall death).
@@ -99,4 +109,20 @@ final class PerceptionState {
     long reflexSwingUntil;
     /** Flee-drive deadline (≤ now+60t) while sprinting away; 0 = not currently fleeing. */
     long reflexFleeUntil;
+    /**
+     * Raw damage of the last hit from {@link #reflexAttacker} ({@code HurtInfo.amount}); v2
+     * heavy-hitter seam. A single hit ≥25% of max HP makes the critical reflex flee unconditionally
+     * (any distance, any HP) instead of trading blows — the iron-golem death. Reset with the episode.
+     */
+    float reflexLastHitDamage;
+
+    // Reflex 3 (v2): creeper panic sprint — HP-independent, pre-explosion (the looting one-shot death).
+    /**
+     * Nearest creeper remembered by the 20t proximity scan; null = none nearby. Gates the per-tick
+     * creeper distance check to near-zero cost (the live ref is only refreshed on the 20t cadence,
+     * so the every-tick reflex is a null-check + one {@code distanceTo} only while a creeper is close).
+     */
+    Entity reflexCreeper;
+    /** Creeper-sprint deadline (≤ now+40t) while sprinting away from a creeper; 0 = not creeper-fleeing. */
+    long reflexCreeperFleeUntil;
 }

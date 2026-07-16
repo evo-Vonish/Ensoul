@@ -132,6 +132,10 @@ public final class CompanionTickDispatcher {
         if (owner == null) return;   // owner offline — drop (the loop will re-ask)
         for (TaskRecord rec : completed) {
             TaskResult result = rec.getResult();
+            // §8 corrective-notice producer: mechanically watch for repeated identical failures on
+            // this companion's server tasks before we ship the result (owner-cancellations excluded
+            // inside). Placed after the owner null-check so it only counts results actually delivered.
+            com.dwinovo.numen.core.perception.CorrectiveNotices.onTaskResult(player, rec.getToolName(), result);
             String json = result == null
                     ? "{\"success\":false,\"message\":\"no result produced\"}"
                     : result.toJson();

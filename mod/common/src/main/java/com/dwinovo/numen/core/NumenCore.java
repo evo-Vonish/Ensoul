@@ -72,6 +72,11 @@ public final class NumenCore {
         // L3 immediate perception (Wave B): subscribe the PerceptionEvents seams +
         // lifecycle cleanup. The poll pass is registered per-loader (see loader entries).
         com.dwinovo.numen.core.perception.Perceptions.register();
+        // §8 system-generated corrective notices (numen-context-design-v1.md): a SECOND
+        // CompanionLifecycle.onDeath subscriber (alongside CompanionTickDispatcher::clearActiveTask
+        // below) drives the same-cause death stop-loss; the repeated-failure detector is invoked
+        // from CompanionTickDispatcher.drainResults. Mechanical, LLM-free — 凡承重,必机械.
+        com.dwinovo.numen.core.perception.CorrectiveNotices.register();
         Constants.LOG.info("[numen-core] registered {} tool(s), {} task type(s)",
                 ToolRegistry.size(), CompanionTaskFactory.size());
     }

@@ -167,6 +167,11 @@ public final class FabricNumenConfig implements INumenConfig {
         return data.emergencyEffort == null || data.emergencyEffort.isBlank() ? "off" : data.emergencyEffort;
     }
 
+    @Override
+    public boolean isAsyncCompaction() {
+        return data.asyncCompaction;
+    }
+
     // ---- mutations ----
 
     @Override
@@ -195,6 +200,11 @@ public final class FabricNumenConfig implements INumenConfig {
     @Override
     public void setEmergencyEffort(String value) {
         data.emergencyEffort = value == null || value.isBlank() ? "off" : value;
+    }
+
+    @Override
+    public void setAsyncCompaction(boolean value) {
+        data.asyncCompaction = value;
     }
 
     @Override
@@ -247,6 +257,12 @@ public final class FabricNumenConfig implements INumenConfig {
         // preempts a slow think in flight). Same value space as reasoningEffort;
         // defaults to "off" so the reaction is immediate. Config-file only (no GUI).
         public String emergencyEffort = "off";
+        // ICE Phase 1 — asynchronous context compaction. true (default): summarize the
+        // oldest ~90% of context in the BACKGROUND once it crosses a soft threshold
+        // (0.7x the model window) and splice it in at a turn boundary, so the companion
+        // never stalls for compaction. false: only the legacy blocking compaction at the
+        // hard limit runs. Config-file only (no GUI). A missing field keeps this default.
+        public boolean asyncCompaction = true;
 
         static ConfigData defaults() {
             return new ConfigData();

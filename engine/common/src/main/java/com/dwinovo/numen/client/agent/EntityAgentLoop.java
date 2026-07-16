@@ -85,6 +85,23 @@ public final class EntityAgentLoop {
     /** Circuit breaker: stop auto-retrying after this many consecutive failures. */
     private static final int MAX_COMPACT_FAILURES = 3;
 
+    /**
+     * ICE Phase 1 — <strong>soft water line</strong> (ICE §4.4). When the last request's
+     * true context size crosses this fraction of the model window, the loop dispatches a
+     * background (async) compaction — the doc's "long-track" recast (§4.3, §7) — and keeps
+     * running on the full context. Chosen well under the hard limit so the summary almost
+     * always lands before the window − 13k blocking gate is reached.
+     */
+    private static final double SOFT_COMPACT_FRACTION = 0.7;
+    /**
+     * ICE Phase 1 — fraction of the message list to retire in one recast. The retired region
+     * is {@code messages[0..cutIndex)} for the newest protocol-safe boundary at or below this
+     * fraction; the remaining ~10% stays as the live tail (the reorder-buffer analogue, ICE
+     * §4.1). Keeping a tail is what makes this a <em>partial</em> recast rather than the
+     * whole-history blocking one.
+     */
+    private static final double COMPACT_CUT_FRACTION = 0.9;
+
     private static final String COMPACT_SYSTEM_PROMPT =
             "You are a helpful AI assistant tasked with summarizing conversations "
             + "between a Minecraft companion entity (the Numen) and its owner.";
@@ -174,6 +191,42 @@ public final class EntityAgentLoop {
     /** Consecutive compaction failures — circuit breaker for the auto path. */
     private int compactFailures = 0;
 
+    // ---- ICE Phase 1: asynchronous (long-track) compaction ----
+    //
+    // The retired region [0..cutIndex) is summarized by a background HTTP call while the
+    // live loop keeps running on the FULL context. When the summary lands it is spliced in
+    // at the next turn boundary: new history = [summary] + messages[cutIndex..] AS THEY ARE
+    // NOW (kept tail + everything appended during the recast). Unlike the blocking path this
+    // never freezes the loop. State machine: IDLE → (soft trigger) IN_FLIGHT → (result)
+    // READY → (next turn boundary) IDLE. Guard: at most one recast in flight.
+
+    /** ICE: a background (async) compaction HTTP call is outstanding. Does NOT make the loop busy. */
+    private boolean asyncCompacting = false;
+    /** Cut index snapshotted when the in-flight async compaction was dispatched (−1 = none). */
+    private int asyncCutIndex = -1;
+    /** {@link ConvoState#structuralEpoch()} at dispatch — the retired region's identity token (−1 = none). */
+    private long asyncEpoch = -1;
+
+    /**
+     * A completed async summary staged for the splice, waiting for the next turn boundary
+     * (null = none). Held raw; the {@link #SUMMARY_HEADER} wrap + landmark snapshot fold are
+     * done at apply time so the post-recast baseline is current.
+     */
+    private String readyAsyncSummary = null;
+    /** Cut index for the staged {@link #readyAsyncSummary}. */
+    private int readyAsyncCutIndex = -1;
+    /** Structural epoch captured for the staged {@link #readyAsyncSummary} — re-checked at splice. */
+    private long readyAsyncEpoch = -1;
+
+    /**
+     * Set when the hard limit was reached while an async compaction was still in flight and
+     * the loop FROZE to wait for it (rather than dispatching a second). Tells the async
+     * completion path that a turn is pending and must be resumed once the summary is spliced
+     * (or, on async failure, that the blocking fallback must run now). Mirrors the {@code auto}
+     * flag of the blocking path: "a turn was interrupted; resume it."
+     */
+    private boolean resumeTurnAfterAsync = false;
+
     /**
      * Set while the body is DEAD and awaiting its timed respawn (see {@link #onEntityDied} /
      * {@link #onRespawned}). The loop is frozen — no LLM turn starts — until the body comes back.
@@ -184,6 +237,19 @@ public final class EntityAgentLoop {
     private String deathCause;
     /** Tool calls that were in flight when the body died — resolved on respawn, not before. */
     private List<String> deathInterruptedCalls = List.of();
+
+    /**
+     * §3 event/note tail entries carried across a death freeze and re-queued on respawn.
+     * A pack producer emits a death-time {@code <system_notice>} from
+     * {@code CompanionLifecycle.onDeath} — fired <em>before</em> the death payload — so the
+     * note is either already sitting in {@link #bufferedPrompts} when {@link #onEntityDied}
+     * runs, or arrives at {@link #injectEvent} just after {@code dead} latches. Either way the
+     * pre-fix code lost it (blanket {@code bufferedPrompts.clear()} / the {@code dead} guard).
+     * Death-time notices are meant to ride the RESPAWN turn, so we stash event/note entries
+     * here and re-queue them in {@link #onRespawned}. Owner prompts are NOT carried (discarded
+     * at death, as before). Main-thread only.
+     */
+    private final List<String> pendingPostThaw = new ArrayList<>();
 
     /**
      * Bumped every time the owner interrupts a turn ({@link #abort}). Each LLM
@@ -346,6 +412,19 @@ public final class EntityAgentLoop {
     public UUID entityUuid() { return entityUuid; }
     public ConvoState convo() { return convo; }
 
+    /**
+     * Release transient per-loop state when this loop is permanently dropped (dismiss / unload
+     * without a respawn) — called by {@link AgentLoopRegistry#dispose}. Clears the death-carry
+     * queue so notes stashed for a respawn that will never come don't linger. The loop object is
+     * itself removed from the registry and GC'd, so this is belt-and-suspenders, but it keeps the
+     * "carried across death" contract explicit.
+     */
+    public void dispose() {
+        pendingPostThaw.clear();
+    }
+    /** Context size of the last request as the API counted it (0 = unknown yet) — read by the chat panel's ctx bar. */
+    public int lastPromptTokens() { return lastPromptTokens; }
+
     /** The current turn's live reasoning transcript ({@code ""} when none) — read by the chat panel. */
     public String liveReasoning() { return liveReasoning; }
 
@@ -498,6 +577,7 @@ public final class EntityAgentLoop {
             turnGeneration++; // any in-flight LLM response is now stale → discarded on arrival
             preemptedGenerations.clear(); // owner interrupt → drop any pending harvest, don't fold it in
             pendingUrgent = false;        // an owner interrupt cancels a pending urgent classification
+            resumeTurnAfterAsync = false; // no frozen turn to resume once the async recast lands
             boolean wasAwaitingLlm = awaitingLlmResponse;
             awaitingLlmResponse = false;
             awaitingEmergency = false;   // interrupt ends any emergency refractory
@@ -563,9 +643,24 @@ public final class EntityAgentLoop {
         pendingUrgent = false;
         awaitingLlmResponse = false;
         compacting = false;
+        resumeTurnAfterAsync = false;   // any turn frozen waiting on an async recast is abandoned by death
         liveReasoning = "";        // the dead turn's live thinking is gone too
+        // Carry queued EVENT/NOTE entries across the freeze (e.g. a death-time <system_notice>
+        // a pack producer emitted from onDeath just before this payload) so they ride the
+        // respawn turn instead of being wiped. Owner prompts are still discarded here (their
+        // image attachments too) — an owner directive typed mid-death has no meaning post-respawn.
+        int carried = 0;
+        for (String queued : bufferedPrompts) {
+            if (isEventNote(queued)) {
+                pendingPostThaw.add(queued);
+                carried++;
+            }
+        }
         bufferedPrompts.clear();
         bufferedAttachments.clear();
+        if (carried > 0) {
+            Constants.LOG.info("[numen-entity#{}] {} note(s) carried across death freeze", entityUuid, carried);
+        }
         dead = true;
         Constants.LOG.info("[numen-entity#{}] body died ({}) — loop frozen ({} call(s) in flight)",
                 entityUuid, cause, deathInterruptedCalls.size());
@@ -598,6 +693,22 @@ public final class EntityAgentLoop {
         // urgent only when it died mid-task (react now); a fresh post-login revival waits for the owner.
         injectEvent("<event kind=\"death\">你刚才死了(" + cause
                 + "),物品掉落在死亡地点,手头的任务中断了;现已在主人身边复活。先看看状况,继续或重新规划。</event>", wasFrozen);
+        // Re-queue any death-time notices carried across the freeze, in original order, AFTER the
+        // engine's death <event>. They ride the same respawn turn (the death event above is urgent
+        // when wasFrozen, so a turn will run and flush the whole merged tail). queueEventNote is
+        // idempotent for already-stamped notes and stamps the (rare) unstamped one, so identity/seq
+        // are preserved.
+        // pendingPostThaw is only ever populated while dead (onEntityDied / the dead-guard below),
+        // so a non-empty list implies wasFrozen: the urgent death <event> above already drives the
+        // respawn turn that flushes these. No extra nudge needed.
+        if (!pendingPostThaw.isEmpty()) {
+            Constants.LOG.info("[numen-entity#{}] re-queuing {} carried note(s) onto the respawn turn",
+                    entityUuid, pendingPostThaw.size());
+            for (String note : pendingPostThaw) {
+                queueEventNote(note);
+            }
+            pendingPostThaw.clear();
+        }
     }
 
     /**
@@ -608,7 +719,18 @@ public final class EntityAgentLoop {
      * owner-driven turn (no extra LLM call, no unprompted chatter). Dropped while frozen by death.
      */
     public void injectEvent(String xml, boolean urgent) {
-        if (dead) return;
+        if (dead) {
+            // Frozen by death, but a death-time notice must not be lost: stash event/note XML to
+            // ride the respawn turn (see pendingPostThaw / onRespawned). Non-note text is still
+            // dropped — nothing can be fed to the model while the body is dead. Urgency is moot
+            // here; the respawn <event> carries the wake-up.
+            if (isEventNote(xml)) {
+                pendingPostThaw.add(xml);
+                Constants.LOG.info("[numen-entity#{}] event carried across death freeze (dead): {}",
+                        entityUuid, truncate(xml, 120));
+            }
+            return;
+        }
         queueEventNote(xml);
         Constants.LOG.info("[numen-entity#{}] event queued{}: {}",
                 entityUuid, urgent ? " (urgent)" : "", truncate(xml, 120));
@@ -712,6 +834,16 @@ public final class EntityAgentLoop {
         return s.replace("&", "&amp;").replace("<", "&lt;");
     }
 
+    /**
+     * True when a buffered tail entry is an event/note (an XML element open tag: {@code '<'} +
+     * letter) rather than a plain owner prompt. Every producer that routes through
+     * {@link #queueEventNote} emits such XML (stamped or not); owner prompts are plain text. Used
+     * to decide which buffered entries survive a death freeze (carried) versus are discarded.
+     */
+    private static boolean isEventNote(String s) {
+        return s != null && s.length() >= 2 && s.charAt(0) == '<' && Character.isLetter(s.charAt(1));
+    }
+
     // ---- internals ----
 
     /**
@@ -758,6 +890,12 @@ public final class EntityAgentLoop {
         // Safe point: no assistant reply in flight and no tool results
         // outstanding, so the conversation ends with either a tool result or a
         // final assistant message — a user message can now be appended legally.
+        // ICE: this is also THE turn boundary at which a completed async (long-track)
+        // recast is spliced in — retire the oldest ~90% and reset the token gate BEFORE
+        // this turn is composed, so the gates below see the reduced context.
+        if (readyAsyncSummary != null) {
+            applyReadyCompaction();
+        }
         // Fold in world-cognition tail notes (first-session snapshot / landmark
         // events / date rollover) only when a turn is actually going to run.
         if (!bufferedPrompts.isEmpty() || !convo.snapshot().isEmpty()) {
@@ -776,27 +914,243 @@ public final class EntityAgentLoop {
             return;
         }
 
-        // Auto-compaction gate: the last request's true context size (as the
-        // API counted it) is within the buffer of the window — summarize FIRST,
-        // then this method re-runs and dispatches the turn on the compacted
-        // history. Mirrors Claude Code's autoCompactIfNeeded.
         int window = com.dwinovo.numen.agent.model.ModelRegistry.contextWindow(
                 com.dwinovo.numen.client.screen.LlmProviders.normalize(com.dwinovo.numen.platform.Services.CONFIG.getProvider()),
                 com.dwinovo.numen.platform.Services.CONFIG.getModel());
+
+        // HARD gate (window − 13k): the last request's true context size is within the buffer
+        // of the window — the recast can no longer be deferred. Mirrors Claude Code's
+        // autoCompactIfNeeded, extended for ICE:
+        //   • an async recast is already in flight → FREEZE and WAIT for it (don't dispatch a
+        //     second); it splices + resumes this turn when it lands (finishAsyncCompaction);
+        //   • none in flight (async disabled or failed) → the legacy BLOCKING path, unchanged.
         if (lastPromptTokens >= window - AUTO_COMPACT_BUFFER_TOKENS
                 && convo.snapshot().size() >= MIN_COMPACT_MESSAGES
                 && compactFailures < MAX_COMPACT_FAILURES) {
-            Constants.LOG.info("[numen-entity#{}] auto-compacting: last prompt {} tokens >= {} - {}",
+            if (asyncCompacting) {
+                resumeTurnAfterAsync = true;
+                Constants.LOG.info("[numen-entity#{}] hard limit ({} tokens >= {} - {}) with async recast in flight — freezing to wait",
+                        entityUuid, lastPromptTokens, window, AUTO_COMPACT_BUFFER_TOKENS);
+                return;
+            }
+            Constants.LOG.info("[numen-entity#{}] auto-compacting (blocking): last prompt {} tokens >= {} - {}",
                     entityUuid, lastPromptTokens, window, AUTO_COMPACT_BUFFER_TOKENS);
             startCompaction(true);
             return;
         }
+
+        // SOFT gate (0.7 × window): ICE early trigger — dispatch a background recast and
+        // KEEP RUNNING on the full context. Non-blocking, guarded to one in flight.
+        maybeStartAsyncCompaction(window);
 
         // This turn runs at emergency effort iff it was started by an urgent event
         // (consume the flag — any continuation turns after it are ordinary/base effort).
         boolean emergency = pendingUrgent;
         pendingUrgent = false;
         dispatchLlmTurn(emergency);
+    }
+
+    // ---- ICE Phase 1: async (long-track) compaction — trigger / cut / dispatch / splice ----
+
+    /**
+     * ICE soft trigger. When enabled and the last request crossed the soft water line
+     * ({@link #SOFT_COMPACT_FRACTION} × window), dispatch ONE background compaction of the
+     * retired region and keep running. Guarded so it fires at most once per crossing:
+     * skipped while a recast is in flight, while a blocking compaction runs, while a summary
+     * is already staged, and once the circuit breaker has tripped. Only reached below the hard
+     * gate, so it never races the blocking path.
+     */
+    private void maybeStartAsyncCompaction(int window) {
+        if (!Services.CONFIG.isAsyncCompaction()) return;
+        if (asyncCompacting || compacting || readyAsyncSummary != null) return;
+        if (compactFailures >= MAX_COMPACT_FAILURES) return;
+        if (lastPromptTokens < (int) (window * SOFT_COMPACT_FRACTION)) return;
+        if (convo.snapshot().size() < MIN_COMPACT_MESSAGES) return;
+        startAsyncCompaction();
+    }
+
+    /**
+     * Dispatch the background summarization of the retired region {@code [0..cutIndex)} — the
+     * ICE "long-track" recast (§4.3, §7). Reuses the blocking compaction plumbing (minimal
+     * system prompt, no tools) but WITHOUT freezing the loop and WITHOUT touching turn
+     * generations: the live loop continues on the FULL context; the recast is orthogonal to
+     * turns, and its staleness is caught by the {@link ConvoState#structuralEpoch() structural
+     * epoch}, not the turn generation.
+     *
+     * <p>The retired region is context the model already processed live this session, so the
+     * summarization re-reads the already-warm prefix — under prefix caching its input bills
+     * mostly at cache-read price, a hidden win (ICE §6.1 cache economics). {@code companion=null}
+     * keeps the context exporter's wire capture pinned to the LIVE conversation, not this
+     * background summarizer.
+     */
+    private void startAsyncCompaction() {
+        List<ConvoState.Msg> full = convo.snapshot();
+        int cutIndex = protocolSafeCutIndex(full, COMPACT_CUT_FRACTION);
+        if (cutIndex < MIN_COMPACT_MESSAGES) {
+            // No protocol-safe boundary retires enough yet (e.g. one long open tool chain).
+            // Not an error — retry at the next soft crossing.
+            Constants.LOG.debug("[numen-entity#{}] async recast skipped: no protocol-safe cut >= {} in {} msgs",
+                    entityUuid, MIN_COMPACT_MESSAGES, full.size());
+            return;
+        }
+        asyncCompacting = true;
+        asyncCutIndex = cutIndex;
+        asyncEpoch = convo.structuralEpoch();
+
+        List<ConvoState.Msg> request = new ArrayList<>(full.subList(0, cutIndex));
+        request.add(new ConvoState.Msg.User(COMPACT_PROMPT));
+        Constants.LOG.info("[numen-llm] async compaction dispatched (ICE long-track recast): retiring {} of {} msgs "
+                        + "at protocol-safe cut (epoch {}) — re-reads warm prefix, loop continues",
+                cutIndex, full.size(), asyncEpoch);
+        NumenLlmClient.instance()
+                .chatStreaming(null, request, List.of(), COMPACT_SYSTEM_PROMPT, null, null, null)
+                .whenComplete((res, err) -> Minecraft.getInstance().execute(
+                        () -> finishAsyncCompaction(res, err)));
+    }
+
+    /**
+     * The newest PROTOCOL-SAFE cut boundary retiring roughly the first {@code fraction} of
+     * {@code msgs}: the largest index {@code c ≤ floor(fraction · n)} such that
+     * <ul>
+     *   <li>{@code messages[0..c)} is self-contained — every {@code assistant(tool_calls)} in
+     *       it has all its matching {@code tool} results in it (no open call straddles the
+     *       cut), so retiring it leaves no orphan tool result at the head of the tail; and</li>
+     *   <li>{@code messages[c]} (the tail's first message) is an {@code assistant} turn — so
+     *       the spliced history {@code [summary_user, assistant, …]} stays protocol-valid and
+     *       never produces back-to-back {@code user} messages that some backends reject.</li>
+     * </ul>
+     * Returns {@code 0} when no such boundary exists (caller then skips the recast).
+     */
+    private static int protocolSafeCutIndex(List<ConvoState.Msg> msgs, double fraction) {
+        int n = msgs.size();
+        int target = (int) Math.floor(n * fraction);
+        int pending = 0;   // open (unanswered) tool_call count across messages[0..c)
+        int best = 0;
+        for (int c = 1; c <= target; c++) {
+            ConvoState.Msg prev = msgs.get(c - 1);
+            if (prev instanceof ConvoState.Msg.Assistant a) {
+                pending += a.turn().toolCalls().size();
+            } else if (prev instanceof ConvoState.Msg.Tool && pending > 0) {
+                pending--;
+            }
+            if (pending == 0 && msgs.get(c) instanceof ConvoState.Msg.Assistant) {
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The background recast landed (main thread). Validate, then move to the READY state and
+     * either splice now or defer to the next turn boundary:
+     * <ul>
+     *   <li><b>frozen (dead)</b> → drop the result (the loop restores its own context on
+     *       respawn);</li>
+     *   <li><b>transport error / empty summary</b> → clear the in-flight flag, log, do NOT
+     *       trip the circuit breaker (that guards the blocking safety net), retry at the next
+     *       soft crossing. If we were frozen at the hard limit, fall back to blocking now;</li>
+     *   <li><b>stale</b> (a blocking compaction or a death replaceAll bumped the structural
+     *       epoch) → DISCARD the summary (ICE §4.5: never splice over a history that moved);</li>
+     *   <li><b>valid</b> → stage it; splice immediately if the loop is idle, resume a frozen
+     *       turn if one was waiting, else leave it for {@link #tryStartTurn} to apply.</li>
+     * </ul>
+     */
+    private void finishAsyncCompaction(NumenLlmClient.ChatResult res, Throwable err) {
+        recordUsage(res);   // background summarization is billed like any other call — count it
+        asyncCompacting = false;
+        int cutIndex = asyncCutIndex;
+        long epoch = asyncEpoch;
+        asyncCutIndex = -1;
+        asyncEpoch = -1;
+        boolean resume = resumeTurnAfterAsync;
+        resumeTurnAfterAsync = false;
+
+        if (dead) {
+            Constants.LOG.info("[numen-entity#{}] async recast result dropped — body frozen (dead)", entityUuid);
+            return;
+        }
+
+        String summary = (err == null && res != null && res.turn() != null) ? res.turn().content() : null;
+        if (summary == null || summary.isBlank()) {
+            Constants.LOG.warn("[numen-entity#{}] async recast failed: {} — retry at next soft threshold",
+                    entityUuid, err != null ? unwrap(err) : "empty summary");
+            if (resume) tryStartTurn();   // frozen at hard limit → fall back to the blocking path now
+            return;
+        }
+
+        if (convo.structuralEpoch() != epoch) {
+            Constants.LOG.info("[numen-entity#{}] discarding stale async recast (epoch {} != {}) — a blocking compaction or death intervened",
+                    entityUuid, epoch, convo.structuralEpoch());
+            if (resume) tryStartTurn();   // context already reduced by the intervening path; just resume
+            return;
+        }
+
+        // Valid — stage it for the splice.
+        readyAsyncSummary = summary;
+        readyAsyncCutIndex = cutIndex;
+        readyAsyncEpoch = epoch;
+
+        if (resume) {
+            // A turn froze at the hard limit waiting for this: splice + resume it now.
+            tryStartTurn();
+        } else if (!awaitingLlmResponse && !dispatcher.busy() && !compacting) {
+            // Idle at a turn boundary: retire the region now (cut the token cost immediately),
+            // but do NOT start an unprompted turn — the loop only dispatches on real triggers.
+            applyReadyCompaction();
+        }
+        // else: a turn is in flight — leave it staged; tryStartTurn splices at the next boundary.
+    }
+
+    /**
+     * Splice a staged async summary in at the current (turn-boundary) point: retire
+     * {@code messages[0..cutIndex)} into {@code [summary]} and keep the tail — the kept messages
+     * PLUS everything appended while the recast was in flight — byte-identical after it. Mirrors
+     * the tail of {@link #finishCompaction}: re-lay the world-cognition baseline into the summary
+     * message, persist the boundary (a {@code compact} divider + a fresh copy of the surviving
+     * tail so a relaunch replays {@code [summary] + tail}), renumber (clear per-turn reasoning),
+     * and reset the token gate. Re-checks the structural epoch first and discards if it moved.
+     */
+    private void applyReadyCompaction() {
+        String summary = readyAsyncSummary;
+        int cutIndex = readyAsyncCutIndex;
+        long epoch = readyAsyncEpoch;
+        clearReadyCompaction();
+
+        if (convo.structuralEpoch() != epoch) {
+            Constants.LOG.info("[numen-entity#{}] async recast not spliced (epoch {} != {}) — history moved before the boundary",
+                    entityUuid, epoch, convo.structuralEpoch());
+            return;
+        }
+        List<ConvoState.Msg> before = convo.snapshot();
+        if (cutIndex <= 0 || cutIndex > before.size()) {
+            Constants.LOG.warn("[numen-entity#{}] async recast cutIndex {} invalid for {} msgs — discarding",
+                    entityUuid, cutIndex, before.size());
+            return;
+        }
+
+        String wrapped = SUMMARY_HEADER + summary.strip();
+        // Re-lay the world-cognition baseline into the SAME summary user message (a lone
+        // snapshot after it would be back-to-back user) — the model regains full landmark
+        // state; diffs resume from here. Exactly as finishCompaction does.
+        wrapped = wrapped + "\n\n" + stampIfEvent(buildContextSnapshotNote(resolveEntity()));
+        lastKnownDate = LocalDate.now();
+
+        List<ConvoState.Msg> tail = new ArrayList<>(before.subList(cutIndex, before.size()));
+        // Persist the boundary first (relaunch replays [summary] + tail), then swap in memory.
+        log.appendCompactPrefixBoundary(wrapped, tail);
+        convo.replacePrefix(cutIndex, new ConvoState.Msg.User(wrapped));
+        turnReasoning.clear();   // snapshot indices renumbered by the recast — stored reasoning no longer maps
+        lastPromptTokens = 0;    // unknown until the next request reports usage
+        compactFailures = 0;     // a clean recast proves the path works
+        Constants.LOG.info("[numen-llm] async compaction spliced: {} msgs -> summary + {} tail msgs",
+                cutIndex, tail.size());
+    }
+
+    /** Clear the staged async summary. */
+    private void clearReadyCompaction() {
+        readyAsyncSummary = null;
+        readyAsyncCutIndex = -1;
+        readyAsyncEpoch = -1;
     }
 
     /**

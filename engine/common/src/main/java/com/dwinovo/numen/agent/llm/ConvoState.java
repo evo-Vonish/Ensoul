@@ -51,6 +51,17 @@ public final class ConvoState {
     private final List<Msg> messages = new ArrayList<>();
     private int turnCount = 0;
 
+    /**
+     * Monotonic <strong>structural</strong> epoch — the identity token an ICE async
+     * (long-track) compaction snapshots to detect that the retired region moved under
+     * it. Bumped ONLY by the whole-history rewrites ({@link #replaceAll} / {@link #clear})
+     * and the partial recast ({@link #replacePrefix}); plain {@link #push appends} leave
+     * it untouched. Because {@link Msg} records are immutable and existing indices are
+     * never mutated in place, "same epoch since snapshot" is a sound proof that
+     * {@code messages[0..cutIndex)} is still byte-identical to what was summarized.
+     */
+    private long structuralEpoch = 0;
+
     /** Notified after every append — the persistence hook ({@link ConvoLog#append}). */
     private final Consumer<Msg> sink;
 
@@ -82,7 +93,44 @@ public final class ConvoState {
     public void replaceAll(List<Msg> replacement) {
         messages.clear();
         messages.addAll(replacement);
+        structuralEpoch++;
         resetTurnCount();
+    }
+
+    /**
+     * ICE §7 sanctioned recast, <em>partial</em> form (the field implementation of the
+     * doc's "long-track" retirement): retire the messages {@code [0, cutIndex)} — the
+     * "已退休区 / retired region" — replacing them with the single {@code summary} user
+     * message, while keeping {@code messages[cutIndex..]} — the live tail plus everything
+     * appended while the async summarization was in flight — <strong>byte-identical</strong>
+     * (the exact same immutable {@link Msg} records, in order).
+     *
+     * <p>Mirrors {@link #replaceAll}'s persistence semantics: the sink is NOT notified here.
+     * The caller records the boundary through {@link ConvoLog#appendCompactPrefixBoundary}
+     * (a {@code compact} divider followed by a fresh copy of the surviving tail) so a
+     * relaunch replays {@code [summary] + tail}. Bumps {@link #structuralEpoch} so any
+     * async snapshot taken before this recast is recognised as stale.
+     */
+    public void replacePrefix(int cutIndex, Msg summary) {
+        if (cutIndex < 0 || cutIndex > messages.size()) {
+            throw new IndexOutOfBoundsException(
+                    "cutIndex " + cutIndex + " out of [0," + messages.size() + "]");
+        }
+        List<Msg> tail = new ArrayList<>(messages.subList(cutIndex, messages.size()));
+        messages.clear();
+        messages.add(summary);
+        messages.addAll(tail);
+        structuralEpoch++;
+        resetTurnCount();
+    }
+
+    /**
+     * The current structural epoch — snapshot it alongside a cut index before dispatching
+     * an async compaction; if it has changed by splice time, a whole-history rewrite
+     * (blocking compaction / reset) intervened and the async result must be discarded.
+     */
+    public long structuralEpoch() {
+        return structuralEpoch;
     }
 
     public void addUser(String content) {
@@ -135,6 +183,7 @@ public final class ConvoState {
      *  resurrects everything just cleared. */
     public void clear() {
         messages.clear();
+        structuralEpoch++;
         resetTurnCount();
     }
 }

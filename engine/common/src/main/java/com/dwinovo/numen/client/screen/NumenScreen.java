@@ -77,6 +77,10 @@ public final class NumenScreen extends Screen {
     private static final int PAD = 8;
     private static final int LINE_H = 10;
     private static final int PLAN_W = 122;
+    /** Context-usage bar (CHAT tab): thin fill strip thickness, and the full reserved band above
+     *  it (one text line + a 1px gap + the strip) — mirrors {@code cardsBandH()}'s reserve-when-shown idiom. */
+    private static final int CTX_BAR_H = 3;
+    private static final int CTX_BAND_H = 12;
     private static final int MAX_PROMPT = 1024;
     private static final int TOOL_ARG_CHARS = 44;
 
@@ -867,7 +871,7 @@ public final class NumenScreen extends Screen {
     /** If a chat fold-toggle row sits under (mx,my), flip its expanded state. Mirrors renderChat geometry. */
     private boolean toggleFoldAt(int mx, int my) {
         int bodyY = top + HEADER_H + 4;
-        int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6 - cardsBandH();
+        int bodyBottom = top + PANEL_H - INPUT_H - PAD - 6 - ctxBandH() - cardsBandH();
         int transX = left + PAD;
         int transW = PANEL_W - PAD * 2 - PLAN_W - 8;
         if (mx < transX || mx >= transX + transW || my < bodyY || my >= bodyBottom) return false;
@@ -1188,8 +1192,9 @@ public final class NumenScreen extends Screen {
 
     private void renderChat(GuiGraphicsExtractor g) {
         int bodyY = top + HEADER_H + 4;
-        int planBottom = top + PANEL_H - INPUT_H - PAD - 6;      // plan panel keeps full height
-        int bodyBottom = planBottom - cardsBandH();              // transcript yields room for the card row
+        int ctxH = ctxBandH();                                    // live token-usage strip, reserved when shown
+        int planBottom = top + PANEL_H - INPUT_H - PAD - 6 - ctxH; // plan panel keeps full height (minus the ctx band)
+        int bodyBottom = planBottom - cardsBandH();               // transcript yields room for the card row
         int transX = left + PAD;
         int transW = PANEL_W - PAD * 2 - PLAN_W - 8;
         int viewH = bodyBottom - bodyY;
@@ -1239,6 +1244,9 @@ public final class NumenScreen extends Screen {
             g.blitSprite(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED, SCROLL_THUMB, sbX, thumbY, 4, thumbH);
         }
 
+        // Live context-usage strip, in the band this frame reserved for it (0 height when hidden).
+        if (ctxH > 0) renderCtxBar(g, transX, planX + PLAN_W - transX, planBottom);
+
         // Pending-attachment cards, in the reserved band just above the input.
         if (!pendingImages.isEmpty()) {
             renderAttachmentCards(g, transX, cardsBandTop());
@@ -1247,6 +1255,38 @@ public final class NumenScreen extends Screen {
         if (attachHintUntil > System.currentTimeMillis()) {
             txt(g, colored(attachHintText, TXT_MUTED), transX, cardsBandTop() - 11, TXT_MUTED);
         }
+    }
+
+    // ---- live context-usage bar ----
+
+    /** Height of the reserved ctx-bar band — 0 (hidden) until the companion has a measured prompt size. */
+    private int ctxBandH() {
+        return uuid != null && loop().lastPromptTokens() > 0 ? CTX_BAND_H : 0;
+    }
+
+    /**
+     * One label line ("ctx 63.0k / 200k · 31%") over a thin fill strip, read straight off
+     * {@link EntityAgentLoop#lastPromptTokens()} and {@link ModelRegistry#contextWindow} every
+     * frame — zero stored state, like the rest of this poll-rendered panel. Fill colour steps
+     * through the existing OK/RUN/FAIL palette by how close the last request came to the model's
+     * context window (mirrors the tool-row status colouring just above).
+     */
+    private void renderCtxBar(GuiGraphicsExtractor g, int x, int w, int y) {
+        int tokens = loop().lastPromptTokens();
+        if (tokens <= 0) return;
+        int window = ModelRegistry.contextWindow(
+                LlmProviders.normalize(Services.CONFIG.getProvider()), Services.CONFIG.getModel());
+        if (window <= 0) return;
+        double frac = tokens / (double) window;
+        int pct = (int) Math.round(frac * 100);
+        int fill = frac < 0.60 ? AI : (frac < 0.85 ? RUN : FAIL);
+
+        txt(g, Component.literal("ctx " + fmtTok(tokens) + " / " + fmtTok(window) + " · " + pct + "%"),
+                x, y, TXT_MUTED);
+        int barY = y + (CTX_BAND_H - CTX_BAR_H);   // strip sits flush at the bottom of the reserved band
+        g.fill(x, barY, x + w, barY + CTX_BAR_H, FIELD);                          // empty track
+        int fillW = (int) Math.round(w * Math.min(1.0, frac));
+        if (fillW > 0) g.fill(x, barY, x + fillW, barY + CTX_BAR_H, fill);        // filled portion
     }
 
     // ---- pending image attachments ----

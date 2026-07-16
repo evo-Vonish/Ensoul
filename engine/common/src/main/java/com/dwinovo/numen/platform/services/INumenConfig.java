@@ -90,6 +90,20 @@ public interface INumenConfig {
      */
     String getEmergencyEffort();
 
+    /**
+     * ICE Phase 1 — <em>asynchronous context compaction</em>. When {@code true}
+     * (default), the agent loop dispatches a summarization of the oldest ~90% of the
+     * context (the ICE "long-track" recast) in the <strong>background</strong> as soon
+     * as the live context crosses a soft water line (0.7 × the model window), and splices
+     * the summary in at the next turn boundary — so the companion never stalls for a
+     * compaction round-trip. When {@code false}, only the legacy blocking auto-compaction
+     * at the hard limit (window − 13k) runs.
+     *
+     * <p>Config-file only for now — there is no settings-GUI control (follow-up), same as
+     * {@link #getEmergencyEffort()}.
+     */
+    boolean isAsyncCompaction();
+
     // ---- write surface (client-side: invoked by SettingsScreen) ----
 
     /**
@@ -113,6 +127,9 @@ public interface INumenConfig {
 
     /** Mutate the in-memory emergency-effort knob. Null/blank normalised to {@code "off"}. */
     void setEmergencyEffort(String value);
+
+    /** Toggle {@link #isAsyncCompaction()}. Config-file only (no settings GUI). */
+    void setAsyncCompaction(boolean value);
 
     /**
      * Flush in-memory changes to the loader-native config file. Best-effort:

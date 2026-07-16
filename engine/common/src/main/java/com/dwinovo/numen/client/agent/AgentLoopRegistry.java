@@ -90,7 +90,8 @@ public final class AgentLoopRegistry {
 
     /** Drop one entity's loop (e.g. when it dies / unloads). */
     public static void dispose(UUID entityUuid) {
-        ENTITY_LOOPS.remove(entityUuid);
+        EntityAgentLoop loop = ENTITY_LOOPS.remove(entityUuid);
+        if (loop != null) loop.dispose();
     }
 
     /** Clear everything — called on world-disconnect / explicit reset. */

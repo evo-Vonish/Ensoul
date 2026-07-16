@@ -100,7 +100,16 @@ public final class Companions {
         MinecraftServer server = body.level().getServer();
         if (server == null) return;
         UUID uuid = body.getUUID();
-        String cause = body.getCombatTracker().getDeathMessage().getString();
+        // Prefer the die()-tick snapshot: this poll runs a tick after the lethal hit, by which
+        // point the fake player's combat tracker has degraded to the generic "X死了" (which a
+        // pack producer's normalizer reduced to the useless cause "死"). The snapshot carries
+        // the real per-source message ("X被僵尸杀死了"); when it equals the tracker's generic
+        // message, either pick yields the same string, so the non-blank snapshot always wins.
+        // Consumed (cleared) on read; tracker → "未知原因" fallbacks unchanged.
+        String cause = body.consumeLastDeathMessage();
+        if (cause == null || cause.isBlank()) {
+            cause = body.getCombatTracker().getDeathMessage().getString();
+        }
         if (cause == null || cause.isBlank()) cause = "未知原因";
         CompanionLifecycle.fireDeath(body);   // no result shipped — the death payload drives the client
         ServerPlayer owner = body.resolveOwnerPlayer();

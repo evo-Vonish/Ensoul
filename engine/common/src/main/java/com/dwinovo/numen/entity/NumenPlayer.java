@@ -51,6 +51,16 @@ public final class NumenPlayer extends ServerPlayer {
     private boolean deathHandled;
 
     /**
+     * The REAL localized death message ("Fenn被僵尸杀死了"), snapshotted in {@link #die} on the
+     * damage tick. Needed because the death poll in {@link #tick} reads the cause on a LATER
+     * tick, by which point the fake player's combat tracker has degraded to the generic
+     * message ("Fenn死了") — which a pack producer's cause-normalizer then reduced to the
+     * single character "死" (field evidence: "你已第 3 次死于死", useless as a stop-loss key).
+     * Transient, body-scoped; consumed (cleared) by {@link #consumeLastDeathMessage}.
+     */
+    private String lastDeathMessage;
+
+    /**
      * Last amplifier seen per active effect, so the {@link #onEffectUpdated} perception seam can
      * tell a real "effect got stronger" change from the harmless per-tick re-syncs vanilla fires
      * for the same instance (duration ticking down, periodic refresh every 600 ticks). Transient,
@@ -154,6 +164,32 @@ public final class NumenPlayer extends ServerPlayer {
         } catch (Exception ignored) {
             // mirrors Carpet — fake-connection internals can NPE on edge cases
         }
+    }
+
+    /**
+     * Snapshot the real per-source death message BEFORE vanilla death handling runs. Vanilla
+     * {@code ServerPlayer.die} (verified in the 26.1.2 decompiled sources, ServerPlayer.java:927)
+     * runs synchronously on the lethal-damage tick with the authoritative {@link DamageSource};
+     * {@code source.getLocalizedDeathMessage(this)} (DamageSource.java:69) renders the same
+     * contextual message a real player's death screen would show. The death poll at the top of
+     * {@link #tick} — which always runs on a later tick — hands this to
+     * {@link Companions#onDeath} instead of the by-then-generic combat-tracker message.
+     */
+    @Override
+    public void die(DamageSource source) {
+        this.lastDeathMessage = source.getLocalizedDeathMessage(this).getString();
+        super.die(source);
+    }
+
+    /**
+     * The death-tick message snapshot, cleared on read ({@code null} when death happened without
+     * {@link #die} — e.g. a direct {@code setHealth(0)} — then the caller falls back to the
+     * combat tracker exactly as before).
+     */
+    public String consumeLastDeathMessage() {
+        String s = lastDeathMessage;
+        lastDeathMessage = null;
+        return s;
     }
 
     @Override

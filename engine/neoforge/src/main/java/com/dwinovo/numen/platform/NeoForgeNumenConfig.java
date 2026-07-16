@@ -29,6 +29,7 @@ public final class NeoForgeNumenConfig implements INumenConfig {
     public static final ModConfigSpec.ConfigValue<String> SYSTEM_PROMPT;
     public static final ModConfigSpec.ConfigValue<String> REASONING_EFFORT;
     public static final ModConfigSpec.ConfigValue<String> EMERGENCY_EFFORT;
+    public static final ModConfigSpec.BooleanValue ASYNC_COMPACTION;
     public static final ModConfigSpec SPEC;
 
     static {
@@ -80,6 +81,13 @@ public final class NeoForgeNumenConfig implements INumenConfig {
                 "off (default) → react immediately with no thinking. Same value space as reasoning_effort.",
                 "Ignored by providers / models that don't support it.")
                 .define("emergency_effort", "off");
+        ASYNC_COMPACTION = b.comment(
+                "ICE Phase 1 — asynchronous context compaction.",
+                "true (default) → when the context crosses a soft threshold (0.7x the model window),",
+                "  summarize the oldest ~90% in the BACKGROUND and splice it in at a turn boundary,",
+                "  so the companion never freezes for the compaction round-trip.",
+                "false → only the legacy blocking compaction at the hard limit (window - 13k) runs.")
+                .define("async_compaction", true);
         b.pop();
 
         SPEC = b.build();
@@ -131,6 +139,11 @@ public final class NeoForgeNumenConfig implements INumenConfig {
         return s.isEmpty() ? "off" : s;
     }
 
+    @Override
+    public boolean isAsyncCompaction() {
+        return safeBool(ASYNC_COMPACTION, true);
+    }
+
     // ---- mutations ----
 
     @Override
@@ -173,6 +186,11 @@ public final class NeoForgeNumenConfig implements INumenConfig {
         EMERGENCY_EFFORT.set(value == null || value.isBlank() ? "off" : value);
     }
 
+    @Override
+    public void setAsyncCompaction(boolean value) {
+        ASYNC_COMPACTION.set(value);
+    }
+
     /**
      * Flush the in-memory config to disk. The setters above only mutate the
      * loaded NightConfig in memory — {@link ModConfigSpec.ConfigValue#set}'s
@@ -208,6 +226,16 @@ public final class NeoForgeNumenConfig implements INumenConfig {
             return s == null ? "" : s;
         } catch (IllegalStateException ex) {
             return "";
+        }
+    }
+
+    /** {@link #safe} for a boolean value — returns {@code dflt} if read before the spec is bound. */
+    private static boolean safeBool(ModConfigSpec.ConfigValue<Boolean> v, boolean dflt) {
+        try {
+            Boolean b = v.get();
+            return b == null ? dflt : b;
+        } catch (IllegalStateException ex) {
+            return dflt;
         }
     }
 }

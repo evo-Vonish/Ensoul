@@ -99,6 +99,24 @@ public final class ConvoLog {
         }
     }
 
+    /**
+     * Record an ICE async (partial / long-track) compaction boundary: the {@code compact}
+     * summary divider, immediately followed by a fresh copy of the surviving tail. Because
+     * {@link #load} restarts its replay from the newest {@code compact} line, and the tail's
+     * <em>original</em> lines sit <em>above</em> that divider in this append-only file, the
+     * tail must be re-appended <em>below</em> it — otherwise a relaunch would replay
+     * {@code [summary]} alone and lose everything the live loop appended during the recast.
+     * On reload this reconstructs {@code [summary] + tail}; the pre-recast lines and the
+     * tail's earlier copy remain above the divider as an archive, exactly like
+     * {@link #appendCompactSummary}.
+     */
+    public void appendCompactPrefixBoundary(String wrappedSummary, List<ConvoState.Msg> tail) {
+        appendCompactSummary(wrappedSummary);
+        for (ConvoState.Msg m : tail) {
+            append(m);
+        }
+    }
+
     /** Remove the file (conversation reset). */
     public void delete() {
         try {

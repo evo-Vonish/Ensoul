@@ -1528,19 +1528,26 @@ public final class NumenScreen extends Screen {
         for (int i = 0; i < snap.size(); i++) {
             switch (snap.get(i)) {
                 case ConvoState.Msg.User u -> {
-                    if (isCognitiveNote(u.content())) {
-                        // Machine-facing cognition events (region snapshots, landmark events, system
-                        // notices, …) are context for the MODEL, not owner speech — they belong to the
-                        // interval's step timeline (system 见闻), not the top-level flow.
+                    // The engine merges buffered cognition events WITH an owner prompt into one
+                    // user message at a turn boundary ("<region_snapshot …>…</…>正常通关MC挑战!"),
+                    // so a message can be events-only, speech-only, or MIXED. Split first: the
+                    // event prefix belongs to the interval's step timeline (system 见闻), and only
+                    // the human remainder renders as owner speech — the raw-XML wall the owner
+                    // reported came from mixed messages falling through the all-or-nothing gate.
+                    String[] parts = splitCognitivePrefix(u.content());
+                    String events = parts[0];
+                    String speech = parts[1];
+                    if (!events.isEmpty()) {
                         if (intervalStart < 0) intervalStart = i;
                         pushGroup(interval, group);              // close the open tool run (keep time order)
-                        interval.add(new Proc.Events("events-" + i, u.content()));
-                    } else {
+                        interval.add(new Proc.Events("events-" + i, events));
+                    }
+                    if (!speech.isBlank()) {
                         // Owner speaks → a top-level boundary: seal the interval as a digest, then the message.
                         pushGroup(interval, group);
                         emitDigest(out, interval, intervalStart, failed, width);
                         interval = new ArrayList<>(); intervalStart = -1;
-                        wrapPlain(out, u.content(), YOU, width); // user = teal body, no label
+                        wrapPlain(out, speech, YOU, width);      // user = teal body, no label
                         int nAtt = u.attachments().size();       // muted "N image(s)" note under the text
                         if (nAtt > 0) {
                             wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
@@ -1741,6 +1748,39 @@ public final class NumenScreen extends Screen {
 
     /** True when a user-role message is machine-facing cognition XML (and only that) —
      *  owner prompts are plain text; mixed messages stay fully visible to be safe. */
+    /**
+     * Split a user message into {@code [cognition-event prefix, human remainder]}. Complete
+     * {@code <tag …>…</tag>} (or self-closing) cognition elements are peeled from the head;
+     * whatever follows — typically the owner's own words merged into the same message at a
+     * turn boundary — is returned as speech. Either part may be empty. A malformed/unclosed
+     * tag stops the peel, leaving the rest as speech (never drops content).
+     */
+    private static String[] splitCognitivePrefix(String s) {
+        if (s == null) return new String[]{"", ""};
+        String rest = s;
+        StringBuilder events = new StringBuilder();
+        while (true) {
+            String t = rest.stripLeading();
+            var m = EVENT_ROOT.matcher(t);
+            if (!m.lookingAt()) break;                    // head is no longer a cognition element
+            String tag = m.group(1);
+            int selfClose = t.indexOf("/>");
+            int open = t.indexOf('>');
+            int end;
+            if (selfClose >= 0 && selfClose < open) {
+                end = selfClose + 2;                      // <tag …/>
+            } else {
+                String close = "</" + tag + ">";
+                int at = t.indexOf(close);
+                if (at < 0) break;                        // unclosed — treat the rest as speech
+                end = at + close.length();
+            }
+            events.append(t, 0, end).append('\n');
+            rest = t.substring(end);
+        }
+        return new String[]{events.toString().strip(), rest.strip()};
+    }
+
     private static boolean isCognitiveNote(String s) {
         if (s == null) return false;
         String t = s.strip();

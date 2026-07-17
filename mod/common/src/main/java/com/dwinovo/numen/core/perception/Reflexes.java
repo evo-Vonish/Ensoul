@@ -253,6 +253,9 @@ public final class Reflexes {
         boolean drowning;        // a drowning episode is live (gates the once-per-episode note)
         long drownRetargetAt;    // next allowed air-column search
         Vec3 drownTarget;        // cached horizontal swim target under a ceiling; null = swim straight up
+        long lastAirPos = Long.MIN_VALUE;   // packed BlockPos of the last cell breathed at full air — the
+                                            // free "way I came in" memory the escape falls back to when no
+                                            // air pocket is in scan range (the flooded-cave death)
 
         // fire / lava
         boolean heatEpisode;     // gates the once-per-episode note
@@ -848,6 +851,9 @@ public final class Reflexes {
         if (air >= DROWN_AIR_SAFE) {                 // 280+/300 → not drowning (the near-universal case): cheapest bail
             ExtraState ex = EXTRA.get(body.getUUID());
             if (ex != null && ex.drowning) ex.drowning = false;   // an episode that just resolved (surfaced / re-oxygenated)
+            // Free breadcrumb: while breathing at FULL air, remember where — this cell (or its brink)
+            // is guaranteed breathable, and it's exactly "the way I came in" when a dive goes wrong.
+            if (air >= body.getMaxAirSupply()) extra(body).lastAirPos = body.blockPosition().asLong();
             return;
         }
         boolean submerged = body.isInWater() || body.isUnderWater();
@@ -879,6 +885,14 @@ public final class Reflexes {
             }
             if (ex.drownTarget != null) {
                 InputDriver.stepToward(body, ex.drownTarget, false);   // swim horizontally toward open air (no sprint underwater)
+            } else if (ex.lastAirPos != Long.MIN_VALUE) {
+                // No air pocket in scan range (a big flooded cave — the death Fenn actually died): swim
+                // back the way it came. The last full-air cell is (near-)guaranteed breathable and was
+                // recorded for free while entering the water. Straight-line steer; the jump stroke below
+                // keeps buoyancy so the vertical and horizontal components combine.
+                BlockPos p = BlockPos.of(ex.lastAirPos);
+                InputDriver.stepToward(body,
+                        new Vec3(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5), false);
             } else {
                 InputDriver.halt(body);              // no reachable air found — hold horizontal, still stroke up
             }

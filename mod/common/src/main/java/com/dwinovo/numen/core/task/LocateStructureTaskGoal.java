@@ -337,15 +337,21 @@ public final class LocateStructureTaskGoal implements CompanionTask {
                                 + " blocks of here (" + dim + ") — extremely unlucky seed; "
                                 + "travel a few thousand blocks and retry", data);
             }
-            case TIMEOUT -> TaskResult.timeout("search deadline hit after covering ~"
-                    + searchedRadiusBlocks() + " blocks outward with no " + r.structure
-                    + " — it is at least that far. Retrying immediately is fine (results "
-                    + "are cached, the search resumes fast), or travel toward unexplored "
-                    + "land first");
-            case CANCELLED -> TaskResult.cancelled("locate_structure interrupted");
+            case TIMEOUT -> TaskResult.timeout("locate_structure 超时 —— " + progressSummary()
+                    + ",它至少在此之外;可立即重试(结果有缓存,恢复很快),或先向未探索方向移动", data);
+            case CANCELLED -> TaskResult.cancelled("locate_structure 被打断 —— " + progressSummary(), data);
             case FAILED -> TaskResult.fail(failReason, data);
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
+    }
+
+    /** 结算时刻的实时进度:已向外搜了多远、有没有暂得的最近点。 */
+    @Override
+    public String progressSummary() {
+        String s = "已向外搜 ~" + searchedRadiusBlocks() + " 格";
+        return best != null
+                ? s + ",暂得最近 " + best.getX() + "," + best.getY() + "," + best.getZ()
+                : s + ",未命中 " + r.structure;
     }
 
     /** How far outward (blocks) the random-spread spirals have covered so far. */

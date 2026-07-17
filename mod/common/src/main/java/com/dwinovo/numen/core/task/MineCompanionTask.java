@@ -971,4 +971,10 @@ public final class MineCompanionTask implements CompanionTask {
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
     }
+
+    /** 结算时刻的实时进度(契约方法):已采几件、破坏几块。start() 早退时计数为零,安全。 */
+    @Override
+    public String progressSummary() {
+        return "已采 " + r.getMined() + "/" + r.count + " " + r.label + "(破坏 " + brokenCount + " 块)";
+    }
 }

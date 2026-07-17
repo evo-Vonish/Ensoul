@@ -76,4 +76,10 @@ public final class DropCompanionTask implements CompanionTask {
             default -> TaskResult.fail(doneReason, data);
         };
     }
+
+    /** 契约方法占位:one-tick 任务在 start() 内即时结算,TIMEOUT/CANCELLED 不可达。 */
+    @Override
+    public String progressSummary() {
+        return "已即时完成";
+    }
 }

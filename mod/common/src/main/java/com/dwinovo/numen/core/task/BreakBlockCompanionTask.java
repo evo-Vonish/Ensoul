@@ -117,9 +117,18 @@ public final class BreakBlockCompanionTask implements CompanionTask {
         data.put("block", brokenBlock);
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason, data);
-            case TIMEOUT -> TaskResult.timeout("timed out before breaking " + posLabel());
-            case CANCELLED -> TaskResult.cancelled("break_block interrupted");
+            case TIMEOUT -> TaskResult.timeout("break_block 超时 —— " + progressSummary(), data);
+            case CANCELLED -> TaskResult.cancelled("break_block 被打断 —— " + progressSummary(), data);
             default -> TaskResult.fail(doneReason, data);
         };
+    }
+
+    /** 结算时刻的实时进度:身在何处、目标块还没破、是否已在挖。 */
+    @Override
+    public String progressSummary() {
+        var feet = player.blockPosition();
+        return "停在 " + feet.getX() + "," + feet.getY() + "," + feet.getZ()
+                + "," + brokenBlock + "@" + posLabel() + " 未破坏"
+                + (breaking != null ? "(挖掘中)" : "");
     }
 }

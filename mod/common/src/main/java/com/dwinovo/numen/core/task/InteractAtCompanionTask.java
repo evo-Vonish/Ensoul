@@ -220,9 +220,18 @@ public final class InteractAtCompanionTask implements CompanionTask {
         }
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason, data);
-            case TIMEOUT -> TaskResult.timeout("timed out before interacting at " + (r.aim != null ? aimLabel() : "forward"));
-            case CANCELLED -> TaskResult.cancelled("interact_at interrupted");
+            case TIMEOUT -> TaskResult.timeout("interact_at 超时 —— " + progressSummary(), data);
+            case CANCELLED -> TaskResult.cancelled("interact_at 被打断 —— " + progressSummary(), data);
             default -> TaskResult.fail(doneReason, data);
         };
+    }
+
+    /** 结算时刻的实时进度:身在何处、对哪个目标的哪种点击没做完。 */
+    @Override
+    public String progressSummary() {
+        var feet = player.blockPosition();
+        String click = r.button == InteractAtTaskRecord.Button.LEFT ? "左击" : "右击";
+        return "停在 " + feet.getX() + "," + feet.getY() + "," + feet.getZ()
+                + ",对" + (r.aim != null ? " " + aimLabel() + " " : "前方") + "的" + click + "未完成";
     }
 }

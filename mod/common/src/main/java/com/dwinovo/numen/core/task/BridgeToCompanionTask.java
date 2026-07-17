@@ -120,4 +120,13 @@ public final class BridgeToCompanionTask implements CompanionTask {
                     + " (" + used + " scaffold used)", data);
         };
     }
+
+    /** 结算时刻的实时进度(契约方法):停在哪、目标哪、用了多少脚手架。start() 早退时零/初值安全。 */
+    @Override
+    public String progressSummary() {
+        BlockPos feet = feet();
+        return "停在 " + feet.getX() + "," + feet.getY() + "," + feet.getZ()
+                + ",目标 " + target.getX() + "," + target.getY() + "," + target.getZ()
+                + ",用 " + Math.max(0, startScaffold - scaffoldCount(player.getInventory())) + " 脚手架";
+    }
 }

@@ -164,9 +164,19 @@ public final class InteractEntityCompanionTask implements CompanionTask {
         data.put("entity_id", r.entityId);
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason, data);
-            case TIMEOUT -> TaskResult.timeout("timed out before interacting with " + name());
-            case CANCELLED -> TaskResult.cancelled("interact_entity interrupted");
+            case TIMEOUT -> TaskResult.timeout("interact_entity 超时 —— " + progressSummary(), data);
+            case CANCELLED -> TaskResult.cancelled("interact_entity 被打断 —— " + progressSummary(), data);
             default -> TaskResult.fail(doneReason, data);
         };
+    }
+
+    /** 结算时刻的实时进度:出过手没有;还没够到时报告身在何处。 */
+    @Override
+    public String progressSummary() {
+        if (acted) {
+            return "已对 " + name() + " 出手,未确认了结";
+        }
+        var feet = player.blockPosition();
+        return "尚未够到 " + name() + "(停在 " + feet.getX() + "," + feet.getY() + "," + feet.getZ() + ")";
     }
 }

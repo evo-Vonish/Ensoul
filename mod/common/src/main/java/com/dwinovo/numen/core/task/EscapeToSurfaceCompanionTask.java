@@ -107,7 +107,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
                 return TaskState.RUNNING;
             }
             case NEED_SCAFFOLD -> {
-                return fail("out of scaffold blocks after " + progress()
+                return fail("out of scaffold blocks after " + progressSummary()
                         + " — carry cobblestone/dirt and call escape_to_surface again");
             }
             case CEILING_FLUID, CEILING_UNBREAKABLE -> {
@@ -120,7 +120,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
     /** Find a neighbour column with a safe ceiling to shift into, and start walking there. */
     private TaskState beginSidestep() {
         if (sidesteps >= MAX_SIDESTEPS) {
-            return fail("boxed in by lava/water/bedrock overhead after " + progress()
+            return fail("boxed in by lava/water/bedrock overhead after " + progressSummary()
                     + " and " + sidesteps + " sidesteps — no safe way up from here");
         }
         Level level = player.level();
@@ -138,7 +138,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
                 return TaskState.RUNNING;
             }
         }
-        return fail("blocked by lava/water/bedrock overhead after " + progress()
+        return fail("blocked by lava/water/bedrock overhead after " + progressSummary()
                 + " — no adjacent column has a safe ceiling to climb through");
     }
 
@@ -148,7 +148,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
         return switch (sideNav.tick()) {
             case RUNNING -> TaskState.RUNNING;
             case ARRIVED -> resumeClimb();
-            case FAILED -> fail("couldn't sidestep away from the fluid/bedrock ceiling after " + progress()
+            case FAILED -> fail("couldn't sidestep away from the fluid/bedrock ceiling after " + progressSummary()
                     + " (" + sideNav.failReason() + ")");
         };
     }
@@ -165,7 +165,9 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
         return player.onGround() && feet().equals(sideFoot);
     }
 
-    private String progress() {
+    /** 结算时刻的实时进度(契约方法):起点 y → 当前 y、该柱地表 y。start() 早退时也安全(零/初值)。 */
+    @Override
+    public String progressSummary() {
         return "rose from y=" + startY + " to y=" + player.blockPosition().getY() + " (surface y=" + targetY + ")";
     }
 
@@ -205,9 +207,9 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
                 + used + " scaffold used, " + sidesteps + " sidestep(s))";
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason + settle, data);
-            case TIMEOUT -> TaskResult.timeout("escape_to_surface timed out — " + progress()
+            case TIMEOUT -> TaskResult.timeout("escape_to_surface timed out — " + progressSummary()
                     + "; call again to resume");
-            case CANCELLED -> TaskResult.cancelled("escape_to_surface interrupted — " + progress());
+            case CANCELLED -> TaskResult.cancelled("escape_to_surface interrupted — " + progressSummary());
             default -> TaskResult.fail((failed ? doneReason : "escape_to_surface failed") + settle, data);
         };
     }

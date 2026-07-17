@@ -82,23 +82,24 @@ public final class PillarUpCompanionTask implements CompanionTask {
                 return TaskState.RUNNING;
             }
             case NEED_SCAFFOLD -> {
-                return fail("out of scaffold blocks (cobblestone/dirt/…) after " + progress()
+                return fail("out of scaffold blocks (cobblestone/dirt/…) after " + progressSummary()
                         + " — carry more and call pillar_up again to finish");
             }
             case CEILING_FLUID -> {
                 return fail("blocked by lava/water overhead at y=" + (player.blockPosition().getY() + 2)
-                        + " after " + progress() + " — clear it or move aside, then retry");
+                        + " after " + progressSummary() + " — clear it or move aside, then retry");
             }
             case CEILING_UNBREAKABLE -> {
-                return fail("blocked by an unbreakable block overhead after " + progress()
+                return fail("blocked by an unbreakable block overhead after " + progressSummary()
                         + " — nothing can be dug through here");
             }
         }
         return TaskState.RUNNING;
     }
 
-    /** "rose X/height (y A→B)". */
-    private String progress() {
+    /** "rose X/height (y A→B)" — 结算时刻的实时进度(契约方法),start() 早退时零/初值安全。 */
+    @Override
+    public String progressSummary() {
         return "rose " + risen + "/" + r.height + " (y=" + startY + "→" + player.blockPosition().getY() + ")";
     }
 
@@ -132,8 +133,8 @@ public final class PillarUpCompanionTask implements CompanionTask {
                 + data.get("scaffold_used") + " scaffold used)";
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason + settle, data);
-            case TIMEOUT -> TaskResult.timeout("pillar_up timed out — " + progress());
-            case CANCELLED -> TaskResult.cancelled("pillar_up interrupted — " + progress());
+            case TIMEOUT -> TaskResult.timeout("pillar_up timed out — " + progressSummary());
+            case CANCELLED -> TaskResult.cancelled("pillar_up interrupted — " + progressSummary());
             default -> TaskResult.fail((failed ? doneReason : "pillar_up failed") + settle, data);
         };
     }

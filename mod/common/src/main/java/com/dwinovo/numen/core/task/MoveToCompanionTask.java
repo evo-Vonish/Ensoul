@@ -255,11 +255,28 @@ public final class MoveToCompanionTask implements CompanionTask {
 
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(arrivedMessage(gy), data);
-            case TIMEOUT -> new TaskResult(false, timeoutMessage(gy), true, false, data);
-            case CANCELLED -> new TaskResult(false, "cancelled before reaching target", false, true, data);
+            case TIMEOUT -> TaskResult.timeout("move_to 超时 —— " + progressSummary()
+                    + ";可用相同目标再次调用 move_to 继续", data);
+            case CANCELLED -> TaskResult.cancelled("move_to 被打断 —— " + progressSummary(), data);
             case FAILED -> blockedResult(gy, failReason, data);
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
+    }
+
+    /** 结算时刻的实时进度:现在在哪、距目标还多远;COLUMN 移动落在地下时如实补一句。 */
+    @Override
+    public String progressSummary() {
+        BlockPos pos = player.blockPosition();
+        String s = "推进到 " + pos.getX() + "," + pos.getY() + "," + pos.getZ()
+                + ",距目标还 " + String.format("%.1f", repDistance()) + " 格";
+        if (r.kind == MoveToTaskRecord.Kind.COLUMN) {
+            int surfaceY = player.level().getHeight(
+                    Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, pos.getX(), pos.getZ()) - 1;
+            if (surfaceY - pos.getY() > UNDERGROUND_MARGIN) {
+                s += ",仍在地下(此柱地表 y=" + surfaceY + ")";
+            }
+        }
+        return s;
     }
 
     /** Success copy — always names the real position so the model learns the terrain. */
@@ -301,16 +318,6 @@ public final class MoveToCompanionTask implements CompanionTask {
                     + "move_to with y=" + surfaceY + " (elevation-only move) or dig straight up.";
         }
         return base;
-    }
-
-    private String timeoutMessage(int gy) {
-        double remaining = repDistance();
-        return "timed out " + String.format("%.1f", remaining) + " blocks from target (now at "
-                + bx(gy) + "); call move_to again with the same target to resume.";
-    }
-
-    private String bx(int gy) {
-        return String.format("%.0f,%d,%.0f", player.getX(), gy, player.getZ());
     }
 
     /** A planner failure that wasn't close enough to count as arrival. */

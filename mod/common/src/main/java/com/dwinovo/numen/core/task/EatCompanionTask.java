@@ -115,9 +115,15 @@ public final class EatCompanionTask implements CompanionTask {
         data.put("hunger", player.getFoodData().getFoodLevel());
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason, data);
-            case TIMEOUT -> TaskResult.timeout("couldn't finish eating " + r.label);
-            case CANCELLED -> TaskResult.cancelled("eating " + r.label + " interrupted — no effect");
+            case TIMEOUT -> TaskResult.timeout("eat_item 超时 —— " + progressSummary(), data);
+            case CANCELLED -> TaskResult.cancelled("eat_item 被打断 —— " + progressSummary(), data);
             default -> TaskResult.fail(doneReason, data);
         };
+    }
+
+    /** 结算时刻的实时进度:没吃成、饥饿值几何(实时读取,始终安全)。 */
+    @Override
+    public String progressSummary() {
+        return "未吃下 " + r.label + ",饥饿 " + player.getFoodData().getFoodLevel() + "/20 未变";
     }
 }

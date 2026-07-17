@@ -101,4 +101,11 @@ public final class TurtleUpCompanionTask implements CompanionTask {
             default -> TaskResult.fail("turtle_up 失败 " + settle, data);
         };
     }
+
+    /** 结算时刻的实时进度(契约方法):下挖几格、是否封顶。drive 未建时零值安全。 */
+    @Override
+    public String progressSummary() {
+        int depth = drive == null ? 0 : drive.depthReached();
+        return "下挖 " + depth + " 格," + (drive != null && drive.capped() ? "已封顶" : "仅蹲坑");
+    }
 }

@@ -30,4 +30,10 @@ public final class UnsupportedCompanionTask implements CompanionTask {
         return TaskResult.fail(toolName + " is not available on the companion yet "
                 + "(it's mid-migration to the new player body)");
     }
+
+    /** 契约方法占位:该工具尚未迁移,恒 FAILED,无进度可言。 */
+    @Override
+    public String progressSummary() {
+        return "尚未迁移到玩家身体";
+    }
 }

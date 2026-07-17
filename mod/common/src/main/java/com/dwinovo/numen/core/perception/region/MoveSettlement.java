@@ -71,6 +71,10 @@ public final class MoveSettlement {
      */
     public static void onTaskSettled(NumenPlayer body, String toolName) {
         try {
+            // ④ 周边视觉: instant, deduped valuables sighting at every settlement — self-guarded and
+            // zero-append, so a re-scan of the same spot costs a (palette-short-circuited) scan and
+            // appends nothing. Runs unconditionally so it can never miss the first world action.
+            ValuablesSweep.onSettled(body);
             if (!(body.level() instanceof ServerLevel level)) return;
             State st = state(body.getUUID());
             Vec3 pos = body.position();

@@ -1,17 +1,24 @@
 package com.dwinovo.numen.entity;
 
+import com.dwinovo.numen.Constants;
 import com.dwinovo.numen.network.payload.NumenDeathPayload;
 import com.dwinovo.numen.network.payload.NumenEventPayload;
 import com.dwinovo.numen.network.payload.NumenRespawnPayload;
 import com.dwinovo.numen.network.payload.CompanionListPayload;
 import com.dwinovo.numen.platform.Services;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.vehicle.DismountHelper;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -27,6 +34,23 @@ public final class Companions {
 
     /** Ticks a dead companion stays down before respawning at its owner (~30 s). */
     private static final long RESPAWN_DELAY_TICKS = 30 * 20;
+
+    // ---- 复活安全门 (刀④): don't respawn a companion straight into a meat-grinder around the owner ----
+    /** Radius (blocks) the hostile density around the owner (and each candidate offset cell) is measured over. */
+    private static final int RESPAWN_DANGER_RADIUS = 16;
+    /** This many live hostiles within {@link #RESPAWN_DANGER_RADIUS} → the spot is "dangerous", trigger the gate. */
+    private static final int RESPAWN_DANGER_THRESHOLD = 3;
+    /** Look this far (blocks) around the owner for a hostile-sparse, better-lit safe cell to offset-respawn into. */
+    private static final int RESPAWN_OFFSET_RADIUS = 24;
+    /** When no safe cell exists, delay the respawn and re-check the owner's surroundings this often. */
+    private static final long RESPAWN_RECHECK_TICKS = 100;
+
+    /**
+     * Per-companion "held" respawn deadline: a dead companion whose owner is surrounded and for whom no safe
+     * offset cell was found waits until this game-time before the next re-check (so the density scan runs on the
+     * {@link #RESPAWN_RECHECK_TICKS} cadence, not every tick). Cleared the moment it respawns. Server-thread only.
+     */
+    private static final Map<UUID, Long> respawnHoldUntil = new HashMap<>();
 
     private Companions() {}
 
@@ -135,6 +159,8 @@ public final class Companions {
         for (Map.Entry<UUID, CompanionRegistry.Entry> e : CompanionRegistry.get(server).pendingDead()) {
             CompanionRegistry.Entry entry = e.getValue();
             if (now - entry.diedAt() < RESPAWN_DELAY_TICKS) continue;
+            Long hold = respawnHoldUntil.get(e.getKey());
+            if (hold != null && now < hold) continue;               // 复活安全门: owner still surrounded — re-check later
             ServerPlayer owner = server.getPlayerList().getPlayer(entry.owner());
             if (owner == null) continue;                            // owner offline — wait for login
             respawnDead(server, e.getKey(), entry, owner);
@@ -142,16 +168,75 @@ public final class Companions {
     }
 
     /** Respawn a dead companion at its owner, clear the death state, and tell the brain it died + why
-     *  (the cause rides the respawn payload, so it works even after a logout cleared the client's memory). */
+     *  (the cause rides the respawn payload, so it works even after a logout cleared the client's memory).
+     *
+     *  <p>复活安全门 (刀④): if the owner is standing in a hostile meat-grinder (≥{@link #RESPAWN_DANGER_THRESHOLD}
+     *  hostiles within {@link #RESPAWN_DANGER_RADIUS}), the body is NOT dropped straight into it. Default policy:
+     *  first try to OFFSET into a hostile-sparse, better-lit safe cell nearby ({@link #findSafeRespawnPos}); if
+     *  none exists, DELAY the respawn and re-check on the {@link #RESPAWN_RECHECK_TICKS} cadence. Death drops are
+     *  unaffected (they already landed where the companion died). */
     private static void respawnDead(MinecraftServer server, UUID uuid, CompanionRegistry.Entry entry,
                                     ServerPlayer owner) {
         ServerLevel level = (ServerLevel) owner.level();
-        NumenPlayer body = CompanionFactory.spawn(server, uuid, entry.name(), entry.owner(), level, owner.position());
+        Vec3 pos = findSafeRespawnPos(level, owner);
+        if (pos == null) {
+            // No safe cell around a surrounded owner → delay and re-check later (owner has no live body to notify,
+            // so this is logged; the client shows the companion still down until it can come back safely).
+            respawnHoldUntil.put(uuid, level.getGameTime() + RESPAWN_RECHECK_TICKS);
+            Constants.LOG.info("[numen-respawn] 复活暂缓:{} 的主人身边过于危险,{}t 后重试",
+                    entry.name(), RESPAWN_RECHECK_TICKS);
+            return;
+        }
+        respawnHoldUntil.remove(uuid);
+        NumenPlayer body = CompanionFactory.spawn(server, uuid, entry.name(), entry.owner(), level, pos);
         body.setHealth(body.getMaxHealth());
         body.clearFire();
         CompanionRegistry.get(server).markAlive(uuid);
         syncRosterToOwner(server, owner);
         Services.NETWORK.sendToPlayer(owner, new NumenRespawnPayload(uuid, entry.deathCause()));
+    }
+
+    /**
+     * The respawn position: beside the owner when it's safe enough, else a hostile-sparse + better-lit standable
+     * cell within {@link #RESPAWN_OFFSET_RADIUS}, else {@code null} to signal "delay, nowhere safe yet".
+     */
+    private static Vec3 findSafeRespawnPos(ServerLevel level, ServerPlayer owner) {
+        if (hostilesWithin(level, owner.position(), RESPAWN_DANGER_RADIUS) < RESPAWN_DANGER_THRESHOLD) {
+            return owner.position();   // owner's surroundings are calm — respawn right beside them (unchanged)
+        }
+        // Surrounded: scan candidate columns outward for the safest reachable surface cell.
+        BlockPos o = owner.blockPosition();
+        Vec3 best = null;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int radius = 8; radius <= RESPAWN_OFFSET_RADIUS; radius += 4) {
+            for (int i = 0; i < 8; i++) {
+                double ang = (2.0 * Math.PI * i) / 8.0;
+                int x = o.getX() + (int) Math.round(Math.cos(ang) * radius);
+                int z = o.getZ() + (int) Math.round(Math.sin(ang) * radius);
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                // Vanilla safe-placement (rejects lava/fire/cactus etc.); null → this column has no fit.
+                Vec3 safe = DismountHelper.findSafeDismountLocation(owner.getType(), level, new BlockPos(x, y, z), true);
+                if (safe == null) continue;
+                int hostiles = hostilesWithin(level, safe, RESPAWN_DANGER_RADIUS);
+                if (hostiles >= RESPAWN_DANGER_THRESHOLD) continue;   // not actually safer — skip
+                int light = level.getMaxLocalRawBrightness(BlockPos.containing(safe));
+                // Fewest nearby hostiles dominates, then brighter (fewer spawns), then closer to the owner.
+                double score = -hostiles * 1000.0 + light * 10.0 + (RESPAWN_OFFSET_RADIUS - radius);
+                if (score > bestScore) { bestScore = score; best = safe; }
+            }
+        }
+        return best;   // null → nowhere sparse within range → caller delays
+    }
+
+    /** Count live hostile {@link Monster}s within {@code radius} blocks of {@code center}. */
+    private static int hostilesWithin(ServerLevel level, Vec3 center, double radius) {
+        AABB box = new AABB(center.x - radius, center.y - radius, center.z - radius,
+                center.x + radius, center.y + radius, center.z + radius);
+        int n = 0;
+        for (Monster m : level.getEntitiesOfClass(Monster.class, box)) {
+            if (m.isAlive()) n++;
+        }
+        return n;
     }
 
     /**

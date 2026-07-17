@@ -63,7 +63,14 @@ public final class Perceptions {
     private static final float HP_QUARTER = 0.25f;     // crossing below this re-arms an urgent alert
 
     // ---- item pickup ----
-    private static final int PICKUP_BATCH_TICKS = 100; // aggregate pickups over this window
+    private static final int PICKUP_BATCH_TICKS = 100; // tumbling window: aggregate a burst of pickups into one note
+    /**
+     * Buffer-full early flush: once the batch spans this many distinct item kinds, emit the summary now instead
+     * of waiting out {@link #PICKUP_BATCH_TICKS} — bounds both the note's length and its latency during a fast,
+     * varied haul. A single item type mined continuously never trips this, so the window timer is the backstop
+     * that still guarantees a flush (nothing starves).
+     */
+    private static final int PICKUP_MAX_KINDS = 8;
 
     // ---- hunger (poll divisor 10) ----
     private static final int HUNGER_LOW = 6;           // ≤6 → non-urgent
@@ -360,6 +367,12 @@ public final class Perceptions {
         long now = body.level().getGameTime();
         String name = safe(info.stack().getHoverName().getString());
         st.pickupBatch.merge(name, info.count(), Integer::sum);
+        // A fast, varied haul already spanning PICKUP_MAX_KINDS distinct items flushes now (bounded size/latency);
+        // otherwise the burst rides the tumbling window. Same-item pickups keep accumulating their count either way.
+        if (st.pickupBatch.size() >= PICKUP_MAX_KINDS) {
+            flushPickups(body, st);
+            return;
+        }
         if (st.pickupFlushAt == 0) st.pickupFlushAt = now + PICKUP_BATCH_TICKS;
     }
 

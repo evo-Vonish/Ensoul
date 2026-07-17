@@ -13,6 +13,7 @@ import com.dwinovo.numen.core.task.CompanionTask;
 import com.dwinovo.numen.task.TaskResult;
 import com.dwinovo.numen.core.task.TaskState;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
@@ -28,8 +29,10 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -82,11 +85,49 @@ public final class MineCompanionTask implements CompanionTask {
      *  rescanning forever (scans finish in well under a tick; this only fires if
      *  something is truly stuck). */
     private static final int SCAN_TIMEOUT_TICKS = 200;
+    /** (A) Consecutive GENUINE "no path" nav failures against one ore before it is
+     *  blacklisted — a single transient failure no longer condemns an ore forever
+     *  (the diamond 7/8 root cause). Transient causes never accrue a strike. */
+    private static final int BLACKLIST_STRIKES = 3;
+    /** (A/裁决①) Body displacement (squared) that revives the whole blacklist:
+     *  tunnelling changes what's reachable, so "unreachable" from 8+ blocks ago is
+     *  stale. The blacklist also clears outright on every successful mine. */
+    private static final double BLACKLIST_REVIVE_SQR = 8.0 * 8.0;
+    /** (B②/F8) Radius for the per-tick "collect drops as I go" pickup — wider than
+     *  the old 5.0 so mined loot a few blocks away isn't abandoned. */
+    private static final double DROP_PICKUP_RADIUS = 8.0;
+    /** (B③) Cleanup-sweep radius + budget: before declaring the deposit done, spend
+     *  up to this many ticks pathing over target drops in a wider radius so a scatter
+     *  of dropped ore isn't left on the ground. */
+    private static final double SWEEP_RADIUS = 16.0;
+    private static final int SWEEP_MAX_TICKS = 200;
+    /** (E) Vein-mode safety cap: when {@code vein} is on, {@code count} is only an
+     *  upper bound (raised to this so a small count can't truncate a connected vein);
+     *  the real stop is vein exhaustion. */
+    private static final int VEIN_MIN_CAP = 64;
 
     private final NumenPlayer player;
     private final MineBlockTaskRecord r;
     private final List<BlockPos> knownOres = new ArrayList<>();
+    /** (A) Ores judged genuinely unreachable — excluded from mining, but REVIVED
+     *  (cleared) on every successful mine or ≥8-block body move. Never permanent. */
     private final Set<BlockPos> blacklist = new HashSet<>();
+    /** (A) Per-ore consecutive genuine-unreachable strike counts; an ore is moved to
+     *  {@link #blacklist} only once it reaches {@link #BLACKLIST_STRIKES}. */
+    private final Map<BlockPos, Integer> failStrikes = new HashMap<>();
+    /** (A) Body position when the blacklist was last cleared — an ≥8-block move revives it. */
+    private BlockPos blacklistAnchor;
+    /** (B①) TARGET blocks actually broken this run, counted independently of the item
+     *  delta so the settlement can distinguish "mined enough but lost M drops"
+     *  (physical loss) from "never found/reached the ore". */
+    private int brokenCount;
+    /** (E) Connected-vein target cells — a 26-adjacency flood-fill over the scan hit
+     *  set, seeded from each block broken in vein mode. Empty ⇒ mine normally. */
+    private final Set<BlockPos> veinTargets = new HashSet<>();
+    /** (B③) Cleanup-sweep tick budget consumed. */
+    private int sweepTicks;
+    /** True while {@link #nav} is running the wide drop-collection sweep. */
+    private boolean navIsSweep;
     /** Items the target blocks drop (loot-table simulated, Baritone BlockOptionalMeta.drops). The
      *  count is over THESE in the inventory, not blocks broken — redstone_ore yields ~4 redstone. */
     private Set<Item> dropItems = Set.of();
@@ -147,6 +188,7 @@ public final class MineCompanionTask implements CompanionTask {
         // natural drops; dropItems/baseline are still resolved for the loot sim that refills the pack.)
         dropItems = computeDropItems();
         baseline = inventoryMatch();
+        blacklistAnchor = player.blockPosition();
         rescan();
     }
 
@@ -157,9 +199,21 @@ public final class MineCompanionTask implements CompanionTask {
         // count TARGET blocks actually cleared instead (mineProgress simulates the loot into the pack).
         int gathered = creative ? creativeBroken : Math.max(0, inventoryMatch() - baseline);
         r.setMined(gathered);
-        if (gathered >= r.count) {
+        if (gathered >= effectiveCount()) {
             doneReason = creative ? "cleared all requested" : "gathered all requested";
             return TaskState.SUCCESS;
+        }
+
+        // (A) Revive the blacklist once the body has tunnelled ≥8 blocks from where it
+        //     was last cleared — the geometry that made an ore unreachable has changed.
+        maybeReviveBlacklistOnMove();
+
+        // (F2) A full pack means every further break just destroys ore we can't pick up.
+        //      Stop before wrecking the deposit (survival only; creative doesn't drop).
+        if (!creative && !inventoryHasRoom()) {
+            doneReason = "inventory full — stopped so I don't destroy " + r.label
+                    + " I can't carry. Free up space (deposit or drop items), then run auto_mine again.";
+            return finishByCount();
         }
 
         Level level = player.level();
@@ -197,42 +251,66 @@ public final class MineCompanionTask implements CompanionTask {
             // cleared the overlay, so re-publish the ore field boxes — otherwise the
             // boxes vanish the instant shaft-mining starts (the "boxes disappear after
             // two logs" bug). No path line while shaft-mining, just the goal.
-            PathVizPublisher.publishTargets(player, new ArrayList<>(knownOres));
+            PathVizPublisher.publishTargets(player, new ArrayList<>(activeOres()));
             mineProgress(reachable);
             return TaskState.RUNNING;
         }
 
         // 2) Head for the ore field + nearby drops (GoalComposite), arriving when a
         //    shaft opens up; drops are collected by walking over them (native pickup).
-        if (!knownOres.isEmpty() || !drops.isEmpty()) {
+        //    In vein mode, "the ore field" is the committed connected vein (activeOres).
+        List<BlockPos> ores = activeOres();
+        if (!ores.isEmpty() || !drops.isEmpty()) {
             branchTicks = 0;
-            if (nav == null || navIsBranch) {
+            sweepTicks = 0;
+            if (nav == null || navIsBranch || navIsSweep) {
                 stopNav();
                 nav = PlayerNav.toGoal(player, this::oreFieldGoal, MINE_SPEED,
                         () -> reachableTarget() != null);
-                nav.setHighlights(() -> new ArrayList<>(knownOres));   // box every known target
+                nav.setHighlights(() -> new ArrayList<>(activeOres()));   // box every active target
                 navIsBranch = false;
             }
             switch (nav.tick()) {
                 case RUNNING -> { return TaskState.RUNNING; }
                 case ARRIVED -> { stopNav(); return TaskState.RUNNING; } // shaft handled next tick
                 case FAILED -> {
-                    if (!knownOres.isEmpty()) blacklistNearest();
+                    // (A) Only a GENUINE, persistent "no path" strikes an ore, and only after
+                    //     BLACKLIST_STRIKES consecutive strikes is it blacklisted. Transient
+                    //     causes (over budget / out of scaffolding / replan give-up) don't count.
+                    if (!activeOres().isEmpty()) registerNavFailure(nav.failReason());
                     stopNav();
                     return TaskState.RUNNING;
                 }
             }
         }
 
-        // 3) No ore known and nothing dropped nearby. Baritone's default stops here
+        // 2.5) (B③/F8) Cleanup sweep: we've broken target blocks but haven't collected
+        //      enough items (drops fell in a gap / rolled away / an earlier pass missed
+        //      them). Before giving up, spend a bounded budget pathing over target drops
+        //      in a wider radius so mined loot isn't abandoned on the ground.
+        if (!creative && gathered < effectiveCount() && brokenCount > 0) {
+            List<BlockPos> far = wideTargetDrops();
+            if (!far.isEmpty() && ++sweepTicks <= SWEEP_MAX_TICKS) {
+                if (nav == null || !navIsSweep) {
+                    stopNav();
+                    nav = PlayerNav.toGoal(player, this::sweepGoal, MINE_SPEED,
+                            () -> wideTargetDrops().isEmpty());
+                    nav.setHighlights(this::wideTargetDrops);
+                    navIsSweep = true;
+                }
+                switch (nav.tick()) {
+                    case RUNNING -> { return TaskState.RUNNING; }
+                    case ARRIVED, FAILED -> { stopNav(); return TaskState.RUNNING; }
+                }
+            }
+        }
+
+        // 3) No ore reachable and nothing left to sweep. Baritone's default stops here
         //    (cancel); only its opt-in explore mode branch-mines. Match the default:
-        //    finish with whatever we gathered (the tool's contract: "fewer than count
-        //    in range still succeeds"), rather than running off across the world.
+        //    finish with an HONEST settlement of what's still in range and why.
         if (!EXPLORE_FOR_BLOCKS) {
-            doneReason = r.getMined() > 0
-                    ? "gathered " + r.getMined() + "/" + r.count + ", no more " + r.label + " in range"
-                    : "no reachable " + r.label + " found within " + r.maxRadius + " blocks";
-            return r.getMined() > 0 ? TaskState.SUCCESS : TaskState.FAILED;
+            doneReason = terminalMessage();
+            return finishByCount();
         }
 
         // 3b) Opt-in explore (Baritone exploreForBlocks) — branch-mine outward (bounded).
@@ -241,16 +319,14 @@ public final class MineCompanionTask implements CompanionTask {
             branchY = branchPoint.getY();
         }
         if (++branchTicks > MAX_BRANCH_TICKS) {
-            doneReason = r.getMined() > 0
-                    ? "gathered " + r.getMined() + "/" + r.count + ", no more " + r.label + " in range"
-                    : "no reachable " + r.label + " found within " + r.maxRadius + " blocks";
-            return r.getMined() > 0 ? TaskState.SUCCESS : TaskState.FAILED;
+            doneReason = terminalMessage();
+            return finishByCount();
         }
         if (nav == null || !navIsBranch) {
             stopNav();
             nav = PlayerNav.toGoal(player, () -> NavGoal.runAway(branchPoint, branchY),
                     MINE_SPEED, () -> false);
-            nav.setHighlights(() -> new ArrayList<>(knownOres));   // (empty while branch-exploring)
+            nav.setHighlights(() -> new ArrayList<>(activeOres()));   // (empty while branch-exploring)
             navIsBranch = true;
         }
         switch (nav.tick()) {
@@ -260,19 +336,80 @@ public final class MineCompanionTask implements CompanionTask {
         return TaskState.RUNNING;
     }
 
+    /** The stop cap for {@code gathered}. Normal mode: the user's item {@code count}.
+     *  Vein mode (E): {@code count} is only an upper-bound safety cap (raised to
+     *  {@link #VEIN_MIN_CAP} so a small count can't truncate a connected vein) — the
+     *  real stop is vein exhaustion (activeOres drains). */
+    private int effectiveCount() {
+        return r.isVein() ? Math.max(r.count, VEIN_MIN_CAP) : r.count;
+    }
+
+    /** (B④) Terminal return honouring the honest settlement: SUCCESS if we gathered
+     *  anything OR broke at least {@code count} target blocks (so the ore WAS mined,
+     *  only some drops were physically lost) — never an infinite loop, never a false
+     *  full-SUCCESS. FAILED only when nothing was mined at all. */
+    private TaskState finishByCount() {
+        return (r.getMined() > 0 || brokenCount >= r.count) ? TaskState.SUCCESS : TaskState.FAILED;
+    }
+
     // ---- goals ----
 
     /** GoalComposite over a mining stance per ore, plus a walk-over goal per nearby
      *  drop — one A* search heads for the closest of either. */
     private NavGoal oreFieldGoal() {
-        List<NavGoal> goals = new ArrayList<>(knownOres.size() + drops.size());
-        for (BlockPos ore : knownOres) {
+        List<BlockPos> ores = activeOres();
+        List<NavGoal> goals = new ArrayList<>(ores.size() + drops.size());
+        for (BlockPos ore : ores) {
             goals.add(coalesce(ore));
         }
         for (BlockPos drop : drops) {
             goals.add(NavGoal.near(drop, 1.0));   // walk over it; native pickup grabs it
         }
         return goals.isEmpty() ? NavGoal.exact(player.blockPosition()) : NavGoal.composite(goals);
+    }
+
+    /** (E) The ore cells we should currently be mining. Normal mode: the whole known
+     *  field ({@link #knownOres}). Vein mode once a vein is committed: only the members
+     *  of that connected vein still standing (knownOres ∩ {@link #veinTargets}), so the
+     *  body mines the hit vein to exhaustion rather than wandering to another deposit.
+     *  Returns the live {@code knownOres} list unchanged when vein mode is off/uncommitted,
+     *  so the default (non-vein) execution path is byte-for-byte the old behaviour. */
+    private List<BlockPos> activeOres() {
+        if (r.isVein() && !veinTargets.isEmpty()) {
+            List<BlockPos> out = new ArrayList<>();
+            for (BlockPos p : knownOres) {
+                if (veinTargets.contains(p)) out.add(p);
+            }
+            return out;
+        }
+        return knownOres;
+    }
+
+    /** Nearby target-drop item entities within {@code radius} (Baritone droppedItemsScan,
+     *  FILTERED to the target's own drops — F8 — so the body never detours for a
+     *  skeleton's bones or fills its pack with junk). Walking over them lets native
+     *  pickup collect them. */
+    private List<BlockPos> targetDropsWithin(double radius) {
+        AABB box = new AABB(player.blockPosition()).inflate(radius);
+        List<BlockPos> out = new ArrayList<>();
+        for (ItemEntity ie : player.level().getEntitiesOfClass(ItemEntity.class, box)) {
+            if (dropItems.contains(ie.getItem().getItem())) out.add(ie.blockPosition());
+        }
+        return out;
+    }
+
+    /** (B③) Wider-radius scan of target drops, used only by the terminal cleanup sweep. */
+    private List<BlockPos> wideTargetDrops() {
+        return targetDropsWithin(SWEEP_RADIUS);
+    }
+
+    /** (B③) Walk-over goal composite for the cleanup sweep. */
+    private NavGoal sweepGoal() {
+        List<BlockPos> far = wideTargetDrops();
+        if (far.isEmpty()) return NavGoal.exact(player.blockPosition());
+        List<NavGoal> goals = new ArrayList<>(far.size());
+        for (BlockPos d : far) goals.add(NavGoal.near(d, 1.0));
+        return NavGoal.composite(goals);
     }
 
     /**
@@ -319,16 +456,12 @@ public final class MineCompanionTask implements CompanionTask {
         return r.targets.contains(state.getBlock());
     }
 
-    /** Nearby dropped items (Baritone droppedItemsScan). Tight radius — mining drops
-     *  land next to the body; walking over them lets native pickup collect them, and
-     *  a small radius keeps the body from detouring across the cave for stray items. */
+    /** Nearby target drops to collect as we mine (Baritone droppedItemsScan). Radius
+     *  widened from 5.0 to {@link #DROP_PICKUP_RADIUS} (B②) so mined loot a few blocks
+     *  off isn't left behind, and filtered to the target's own drops (F8) so the body
+     *  doesn't detour for unrelated items. Walking over them lets native pickup grab them. */
     private List<BlockPos> droppedItems() {
-        AABB box = new AABB(player.blockPosition()).inflate(5.0);
-        List<BlockPos> out = new ArrayList<>();
-        for (ItemEntity ie : player.level().getEntitiesOfClass(ItemEntity.class, box)) {
-            out.add(ie.blockPosition());
-        }
-        return out;
+        return targetDropsWithin(DROP_PICKUP_RADIUS);
     }
 
     /**
@@ -345,7 +478,7 @@ public final class MineCompanionTask implements CompanionTask {
         Vec3 eyes = player.getEyePosition();
         BlockPos best = null;
         double bestD = Double.MAX_VALUE;
-        for (BlockPos ore : knownOres) {
+        for (BlockPos ore : activeOres()) {
             if (ore.getX() != feet.getX() || ore.getZ() != feet.getZ()) continue;   // same column
             if (ore.getY() < feet.getY()) continue;                                  // at or above feet
             if (level.getBlockState(ore).isAir()) continue;
@@ -374,18 +507,30 @@ public final class MineCompanionTask implements CompanionTask {
      *  drop it from the ore list. The progress count is read from the inventory each tick, not here —
      *  one block can yield several items, and the drops take a moment to be picked up. */
     private void mineProgress(BlockPos pos) {
-        // In creative the break yields NO natural drops, so capture the block state BEFORE the dig
-        // and, on the tick it actually breaks, count it and simulate its loot into the pack — keeping
-        // the "gather N" contract (auto_mine 10 coal still ends with coal in the inventory). digger.dig
+        // Capture the block state BEFORE the dig: creative needs it to simulate the loot the break
+        // won't naturally drop, and vein mode needs its block to grow the connected vein. digger.dig
         // returns true ONLY when the TARGET itself breaks (not an occluder cleared to reach it).
-        BlockState before = isCreative() ? player.level().getBlockState(pos) : null;
+        BlockState before = player.level().getBlockState(pos);
+        boolean creative = isCreative();
         if (digger.dig(pos)) {
             knownOres.remove(pos);
-            if (before != null) {
+            brokenCount++;                          // (B①) independent broken-target tally
+            onOreMined(pos, before.getBlock());     // (A) revive blacklist; (E) grow the vein
+            if (creative) {
                 creativeBroken++;
                 simulateDropsToInventory(before, pos);
             }
         }
+    }
+
+    /** A target block just broke: (A) the terrain changed, so wipe the "unreachable"
+     *  memory — newly exposed ore deserves a fresh try; (E) extend the committed vein
+     *  across the block we broke. */
+    private void onOreMined(BlockPos pos, Block minedBlock) {
+        blacklist.clear();
+        failStrikes.clear();
+        blacklistAnchor = player.blockPosition();
+        if (r.isVein()) growVein(pos, minedBlock);
     }
 
     /** Creative-only: put the loot {@code brokenState} WOULD have dropped straight into the pack.
@@ -532,6 +677,9 @@ public final class MineCompanionTask implements CompanionTask {
                     || !r.targets.contains(s.getBlock())
                     || blacklist.contains(p)
                     || BlockMiningProgress.fluidBreakHazard(level, p) != null
+                    // (F3) sand/gravel column sitting directly on the ore — shaft-mining it
+                    // would drop the falling column into the dig and onto the body's head.
+                    || BlockHelper.breakReleasesFallingBlock(level, p)
                     || (!creative && !BlockHelper.canHarvest(player.getInventory(), s));
         });
         knownOres.sort(Comparator.comparingDouble(feet::distSqr));
@@ -540,14 +688,193 @@ public final class MineCompanionTask implements CompanionTask {
         }
     }
 
-    private void blacklistNearest() {
+    /** (A) A composite nav search failed to reach the whole active field. Strike the
+     *  nearest active ore, but ONLY for a genuine persistent cause, and blacklist it
+     *  only after {@link #BLACKLIST_STRIKES} consecutive genuine strikes. */
+    private void registerNavFailure(String failReason) {
+        if (!isGenuineUnreachable(failReason)) return;   // transient — retry later, never condemn
         BlockPos feet = player.blockPosition();
-        knownOres.stream()
+        BlockPos nearest = activeOres().stream()
                 .min(Comparator.comparingDouble(feet::distSqr))
-                .ifPresent(p -> {
-                    blacklist.add(p);
-                    knownOres.remove(p);
-                });
+                .orElse(null);
+        if (nearest == null) return;
+        int strikes = failStrikes.merge(nearest, 1, Integer::sum);
+        if (strikes >= BLACKLIST_STRIKES) {
+            blacklist.add(nearest);
+            failStrikes.remove(nearest);
+            knownOres.remove(nearest);
+            veinTargets.remove(nearest);
+        }
+    }
+
+    /**
+     * (A③) Does {@link PlayerNav#failReason()} name a GENUINE, persistent "no way
+     * there" — walls / broken terrain / a hard break-veto on the line — as opposed to
+     * a TRANSIENT cause that mining or moving would resolve? Only genuine failures
+     * accrue a blacklist strike; over-budget searches and out-of-scaffolding stalls
+     * are retried. Matches the wording {@code PlayerNav.describeEmptyPath} emits — this
+     * only CONSUMES the string; PlayerNav is owned by another refactor wave and is not
+     * touched here.
+     */
+    private static boolean isGenuineUnreachable(String reason) {
+        if (reason == null) return false;
+        return !(reason.contains("search budget")      // over-budget A* — move nearer and retry
+                || reason.contains("no scaffolding")    // out of bridging blocks — carry cobblestone
+                || reason.contains("replans")           // gave up after N replans — transient wedge
+                || reason.contains("target lost"));     // goal supplier blipped null — transient
+    }
+
+    /** (A/裁决①) Clear the blacklist once the body has moved ≥8 blocks from where it was
+     *  last cleared — tunnelling changes reachability, so stale "unreachable" verdicts
+     *  shouldn't outlive the geometry that caused them. */
+    private void maybeReviveBlacklistOnMove() {
+        BlockPos feet = player.blockPosition();
+        if (blacklistAnchor == null || (blacklist.isEmpty() && failStrikes.isEmpty())) {
+            blacklistAnchor = feet;   // nothing to revive; keep the anchor at the current spot
+            return;
+        }
+        if (feet.distSqr(blacklistAnchor) >= BLACKLIST_REVIVE_SQR) {
+            blacklist.clear();
+            failStrikes.clear();
+            blacklistAnchor = feet;
+        }
+    }
+
+    /** (F2) Survival only: is there room to store at least one more of the target's
+     *  drops — an empty slot, or a not-yet-full stack of a drop item? A full pack means
+     *  mining just destroys ore we can't carry. */
+    private boolean inventoryHasRoom() {
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (s.isEmpty()) return true;
+            if (dropItems.contains(s.getItem()) && s.getCount() < s.getMaxStackSize()) return true;
+        }
+        return false;
+    }
+
+    // ---- vein mode (E): flood-fill the connected same-family ore off each broken block ----
+
+    /** (E) Grow {@link #veinTargets} by a 26-neighbourhood flood-fill over the current
+     *  scan hit set ({@link #knownOres}), seeded at the block we just broke, following
+     *  connected same-family ore (deepslate/stone variants count as one family). As each
+     *  vein member is later mined this re-runs from it, so the committed vein extends to
+     *  distal cells the scan only reveals once we've opened the rock. */
+    private void growVein(BlockPos seed, Block seedBlock) {
+        Set<BlockPos> known = new HashSet<>(knownOres);
+        Deque<BlockPos> queue = new ArrayDeque<>();
+        queue.add(seed);
+        while (!queue.isEmpty()) {
+            BlockPos p = queue.poll();
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        BlockPos n = p.offset(dx, dy, dz);
+                        if (veinTargets.contains(n) || !known.contains(n)) continue;
+                        Block nb = player.level().getBlockState(n).getBlock();
+                        if (!sameVeinFamily(seedBlock, nb)) continue;
+                        veinTargets.add(n);
+                        queue.add(n);
+                    }
+                }
+            }
+        }
+    }
+
+    /** (E) Same ore family for vein connectivity: identical blocks, or a stone/deepslate
+     *  variant pair (deepslate_diamond_ore ≡ diamond_ore). */
+    private static boolean sameVeinFamily(Block a, Block b) {
+        if (a == b) return true;
+        String pa = BuiltInRegistries.BLOCK.getKey(a).getPath();
+        String pb = BuiltInRegistries.BLOCK.getKey(b).getPath();
+        return normalizeVariant(pa).equals(normalizeVariant(pb));
+    }
+
+    private static String normalizeVariant(String path) {
+        return path.startsWith("deepslate_") ? path.substring("deepslate_".length()) : path;
+    }
+
+    // ---- honest terminal settlement (A④/B④/D/F3/F6) ----
+
+    /** A current census of target blocks still standing in range, bucketed by WHY each
+     *  wasn't gathered, plus how many chunks in range were unloaded/unsearched. */
+    private record Remaining(int blacklisted, int falling, int toolBlocked, int fluid,
+                             int reachable, int unloadedChunks) {}
+
+    /** Fresh one-shot survey (task-end only) of what remains and why — drives the honest
+     *  terminal message instead of the old flat "no more in range" lie. */
+    private Remaining summarizeRemaining() {
+        Level level = player.level();
+        boolean creative = isCreative();
+        int bl = 0, fall = 0, tool = 0, fluid = 0, reach = 0;
+        for (BlockScanner.Hit hit : BlockScanner.findWithin(
+                level, player.blockPosition(), r.maxRadius, r.targets)) {
+            BlockPos p = hit.pos();
+            BlockState s = level.getBlockState(p);
+            if (s.isAir() || !r.targets.contains(s.getBlock())) continue;
+            if (BlockMiningProgress.fluidBreakHazard(level, p) != null) { fluid++; continue; }
+            if (BlockHelper.breakReleasesFallingBlock(level, p)) { fall++; continue; }
+            if (!creative && !BlockHelper.canHarvest(player.getInventory(), s)) { tool++; continue; }
+            if (blacklist.contains(p)) { bl++; continue; }
+            reach++;
+        }
+        int unloaded = BlockScanner.countUnloadedChunks(level, player.blockPosition(), r.maxRadius);
+        return new Remaining(bl, fall, tool, fluid, reach, unloaded);
+    }
+
+    /**
+     * (A④/B④/D/F3/F6) Build the honest terminal reason. Never claims "no more in range"
+     * while ore is still standing but unreachable / hazardous / un-harvestable, and never
+     * hides a physical drop loss behind a bare item count.
+     */
+    private String terminalMessage() {
+        Remaining rem = summarizeRemaining();
+        int mined = r.getMined();
+        boolean minedEnough = brokenCount >= r.count;
+        StringBuilder sb = new StringBuilder();
+        if (mined > 0 || minedEnough) {
+            sb.append("gathered ").append(mined).append('/').append(r.count).append(' ').append(r.label);
+            if (minedEnough && mined < r.count) {
+                sb.append(" — broke ").append(brokenCount).append(" block(s) but ")
+                  .append(r.count - mined).append(" drop(s) were lost (fell in a gap or despawned)");
+            }
+        } else {
+            sb.append("no ").append(r.label).append(" gathered");
+        }
+        List<String> notes = new ArrayList<>();
+        if (rem.blacklisted() > 0) {
+            notes.add(rem.blacklisted() + " still in range but currently unreachable (walled off / no path"
+                    + ") — place cobblestone stepping-stones or approach from another side, then retry");
+        }
+        if (rem.falling() > 0) {
+            notes.add(rem.falling() + " skipped: sand/gravel sits directly above (mining would drop the "
+                    + "falling column into the dig)");
+        }
+        if (rem.toolBlocked() > 0) {
+            notes.add(rem.toolBlocked() + " left unmined: no tool in the pack can harvest them — the right "
+                    + "pickaxe broke or is missing; equip one and rerun");
+        }
+        if (rem.fluid() > 0) {
+            notes.add(rem.fluid() + " skipped: lava/water next to them would flood the dig");
+        }
+        if (rem.unloadedChunks() > 0) {
+            notes.add(rem.unloadedChunks() + " chunk(s) in range aren't loaded and weren't searched — "
+                    + "move closer to check them");
+        }
+        if (rem.reachable() > 0) {
+            notes.add(rem.reachable() + (r.isVein()
+                    ? " more in other veins nearby — this run mined the connected vein you hit; rerun to take them"
+                    : " still reachable in range but the run ended before reaching them"));
+        }
+        if (notes.isEmpty()) {
+            sb.append(mined > 0 || minedEnough
+                    ? ", no more " + r.label + " in range"
+                    : " — none found within " + r.maxRadius + " blocks");
+        } else {
+            sb.append(". Remaining: ").append(String.join("; ", notes)).append('.');
+        }
+        return sb.toString();
     }
 
     private boolean withinReach(BlockPos pos) {
@@ -566,6 +893,7 @@ public final class MineCompanionTask implements CompanionTask {
             nav = null;
         }
         navIsBranch = false;
+        navIsSweep = false;
     }
 
     @Override

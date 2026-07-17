@@ -171,6 +171,7 @@ public final class BlockDigger {
         boolean creative = player.getAbilities().instabuild;
         int best = inv.getSelectedSlot();
         float bestSpeed = inv.getItem(best).getDestroySpeed(state);
+        int bestDura = remainingDurability(inv.getItem(best));
         // In creative, destroy speed is irrelevant (any VALID item instabreaks) but a held
         // sword/trident (canDestroyBlocksInCreative=false) makes ServerPlayerGameMode.destroyBlock
         // refuse the break outright. So: never pick such an item — if the current slot can't
@@ -178,17 +179,33 @@ public final class BlockDigger {
         // everything in creative), and skip every sword/trident candidate in the scan below.
         if (creative && !canDestroyWith(inv.getItem(best), state)) {
             bestSpeed = -1.0f;
+            bestDura = -1;
         }
         for (int i = 0; i < inv.getContainerSize(); i++) {
             ItemStack s = inv.getItem(i);
             if (creative && !canDestroyWith(s, state)) continue;
             float speed = s.getDestroySpeed(state);
-            if (speed > bestSpeed) {
+            int dura = remainingDurability(s);
+            // Fastest tool wins as before; among EQUALLY-fast ACTUAL tools (speed > 1 — not bare hand
+            // or a non-tool) prefer the one with more durability left, so a spare full pickaxe is used
+            // before a near-shattered identical one (F6, durability-aware). Tie-break only — it never
+            // changes the tool TIER the cost model priced, so the planned break cost still matches.
+            boolean better = speed > bestSpeed
+                    || (speed == bestSpeed && speed > 1.0f && dura > bestDura);
+            if (better) {
                 bestSpeed = speed;
+                bestDura = dura;
                 best = i;
             }
         }
         player.holdInHand(best);
+    }
+
+    /** Remaining uses before {@code s} breaks — {@link Integer#MAX_VALUE} for empty slots (bare hand)
+     *  and non-damageable items, so only damageable tools ever tie-break by wear. */
+    private static int remainingDurability(ItemStack s) {
+        if (s.isEmpty() || !s.isDamageableItem()) return Integer.MAX_VALUE;
+        return s.getMaxDamage() - s.getDamageValue();
     }
 
     /** Whether holding {@code stack} would let the server actually destroy {@code state} at the

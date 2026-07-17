@@ -1508,7 +1508,14 @@ public final class NumenScreen extends Screen {
             switch (snap.get(i)) {
                 case ConvoState.Msg.User u -> {
                     flushTools(out, group, done, failed, width);
-                    wrapPlain(out, u.content(), YOU, width);     // user = teal body, no label
+                    if (isCognitiveNote(u.content())) {
+                        // Machine-facing cognition events (region snapshots, landmark events,
+                        // system notices, …) are context for the MODEL — the owner just saw
+                        // walls of raw XML. Fold them into one faint clickable row instead.
+                        addEventRows(out, "events-" + i, u.content(), width);
+                    } else {
+                        wrapPlain(out, u.content(), YOU, width); // user = teal body, no label
+                    }
                     int nAtt = u.attachments().size();           // muted "N image(s)" note under the text
                     if (nAtt > 0) {
                         wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
@@ -1590,6 +1597,36 @@ public final class NumenScreen extends Screen {
     private void addToolRow(List<Row> out, LlmToolCall tc, int width) {
         FormattedCharSequence seq = colored(fitOneLine(toolLine(tc), width - 2 - 11), TOOL).getVisualOrderText();
         out.add(new Row(seq, TOOL, List.of(tc.id()), null));
+    }
+
+    /** Root tags of machine-facing cognition notes (world-cognition events, corrective
+     *  notices, inference ledger) that ride user-role messages. */
+    private static final java.util.regex.Pattern EVENT_ROOT = java.util.regex.Pattern.compile(
+            "<(event|region_snapshot|region_diff|landmark_event|system_notice|inference|context_snapshot)\\b");
+
+    /** True when a user-role message is machine-facing cognition XML (and only that) —
+     *  owner prompts are plain text; mixed messages stay fully visible to be safe. */
+    private static boolean isCognitiveNote(String s) {
+        if (s == null) return false;
+        String t = s.strip();
+        return t.startsWith("<") && t.endsWith(">") && EVENT_ROOT.matcher(t).find();
+    }
+
+    /** Fold a cognition-note message into one faint clickable row ({@code ▸ 认知事件 ×N}),
+     *  expandable to the raw XML — same fold mechanism as thinking/tool groups. */
+    private void addEventRows(List<Row> out, String key, String text, int width) {
+        int n = 0;
+        var m = EVENT_ROOT.matcher(text);
+        while (m.find()) n++;
+        boolean notice = text.contains("<system_notice");
+        if (!expandedGroups.contains(key)) {
+            String label = "▸ 认知事件 ×" + Math.max(1, n) + (notice ? " · 含系统通知" : "");
+            out.add(new Row(colored(fitOneLine(label, width - 2), TXT_FAINT).getVisualOrderText(),
+                    TXT_FAINT, null, key));
+        } else {
+            out.add(new Row(colored("▾ 认知事件", TXT_FAINT).getVisualOrderText(), TXT_FAINT, null, key));
+            wrapPlain(out, text, TXT_FAINT, width);
+        }
     }
 
     /** Emit a thinking fold. Collapsed → one clickable summary row: live turns show

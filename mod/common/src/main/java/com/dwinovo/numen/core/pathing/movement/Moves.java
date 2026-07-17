@@ -528,6 +528,13 @@ public final class Moves {
     private static Movement parkour(NavContext ctx, BlockPos from, Direction dir) {
         if (!PathSettings.ALLOW_PARKOUR) return null;   // Baritone default: parkour off
         BlockGetter level = ctx.view;
+        // Takeoff-surface veto (Baritone MovementParkour standingOn vine/ladder/liquid
+        // refusal; also mirrors every sibling move's isLadderOrVine(from.below()) veto and
+        // MovementPillar's water guard). You climb a ladder/vine instead of jumping off it,
+        // and a body floating in water never has onGround, so the executor's jump impulse
+        // (onGround && dist>0.7) never fires — the move would only stall and churn replans.
+        if (isLadderOrVine(level.getBlockState(from.below()))) return null;
+        if (BlockHelper.isWater(level, from) || BlockHelper.isWater(level, from.below())) return null;
         // Only a real gap warrants a jump: a floor immediately ahead means a
         // plain traverse/descend already covers it.
         if (BlockHelper.canWalkOn(level, from.relative(dir).below())) return null;

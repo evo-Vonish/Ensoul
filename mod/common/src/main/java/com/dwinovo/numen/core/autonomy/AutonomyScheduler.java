@@ -72,7 +72,12 @@ public final class AutonomyScheduler {
 
     // ---- rhythm / cadence ----
     /** Quiet ticks required since the last higher-activity tick before autonomy engages (bridges brain think→act). */
-    private static final int IDLE_SETTLE_TICKS = 60;        // 3 s
+    /** Idle gap required before autonomy engages. The brain thinks CLIENT-side, so the
+     *  server can't see "a turn is in flight" — during a mission a slow model (30–90 s per
+     *  think) leaves the body apparently unemployed between tool calls, and with a 3 s
+     *  settle the sleepwalk kept wandering off MID-MISSION (field: the dragon-run playtest).
+     *  Two minutes covers any sane think gap; only a genuinely dismissed companion strolls. */
+    private static final int IDLE_SETTLE_TICKS = 2400;      // 2 min — post-work hold ("下班缓冲")
     private static final long REST_MIN_TICKS = 100;          // 5 s between actions
     private static final long REST_MAX_TICKS = 200;          // 10 s between actions
     private static final long STROLL_TIMEOUT_TICKS = 200;    // give up a wander leg after 10 s

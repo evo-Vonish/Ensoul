@@ -140,14 +140,19 @@ public final class PlayerPathExecutor {
         Status progress = trackProgress(mv);
         if (progress != null) return progress;
 
-        // Submerged = off-plan, EXCEPT when the current move is a swim-up: the surface
-        // plane is where traverse/ascend live, so being underwater on one of those means
-        // we were knocked under → replan from a valid surface cell. But a water-column
-        // swim-up (PILLAR out of a water cell) is *meant* to run submerged — exempt it,
-        // or the replan would pre-empt the only move that climbs back to the surface.
-        boolean swimmingUp = mv.kind == Movement.Kind.PILLAR
-                && BlockHelper.isWater(player.level(), mv.src);
-        if (player.isUnderWater() && !swimmingUp) {
+        // Submerged = off-plan ONLY for a fully DRY move. Any move whose src or dest cell
+        // is water is PLANNED to operate in/at water — the water-column PILLAR swims up
+        // submerged, a shore-exit ASCEND climbs out of a surface cell (dipping under while
+        // it digs/places/jumps at the bank), a FALL into a lake plunges below its landing
+        // cell before buoyancy brings it back. Cancelling those for being underwater
+        // replans the very move that resolves the submersion, and the replanned path is
+        // the SAME move again → an infinite churn (observed live: "underwater off-plan 21
+        // ticks" firing 5x/min on the same shore-exit ASCENDs, each replan resetting the
+        // dig/place progress, the body pacing in the lake forever). A DRY move keeps the
+        // watchdog: being dunked while executing it genuinely is off-plan.
+        boolean plannedInWater = BlockHelper.isWater(player.level(), mv.src)
+                || BlockHelper.isWater(player.level(), mv.dest);
+        if (player.isUnderWater() && !plannedInWater) {
             // Don't replan the instant we touch water — let the per-kind drive + buoyancy try to
             // surface first; only a SUSTAINED dunk is genuinely off-plan. Otherwise a fall that
             // clips water replans every tick, each new path again starting underwater.
@@ -156,6 +161,33 @@ public final class PlayerPathExecutor {
             }
         } else {
             ticksUnderwater = 0;
+        }
+
+        // A FALL that has LANDED on dry ground OUTSIDE its valid cells can never finish:
+        // arrived() needs feet==dest exactly, but driveFall only steers horizontally (a
+        // fall never jumps — correct mid-air, useless once grounded), so a landing in a
+        // notch below / beside the planned cell just grinds the body against the face
+        // under dest until the movement timeout (~cost+100 ticks) rescues it. Observed
+        // live: FALL 50,74,-16 -> 50,72,-15 landing at 50,71,-16 (one below dest, behind
+        // the dest-floor block), wall-rubbing t=0..114 within the 2-block soft band so no
+        // off-path watchdog fired. A grounded mislanding is exactly the settled state
+        // P1-5's safeToCancel(FALL onGround) hardening anticipated — replan NOW from
+        // where we actually are. In water buoyancy + the liquid float recover instead.
+        if (mv.kind == Movement.Kind.FALL && player.onGround() && !player.isInWater()
+                && !mv.validPositions().contains(feet()) && canReplanNow()) {
+            return replan("fall landed off-plan");
+        }
+        // Same grind, traverse flavour: grounded 2+ blocks BELOW the lane (the body
+        // dropped off it during a planning gap / segment hand-off), the drive halts and
+        // step-up hops forever — a 1-block jump can never climb 2+ (observed live:
+        // TRAVERSE -1,140,3 -> -2,140,3 hopping at feet y=138 under the lane until the
+        // 104-tick timeout). ±1 stays the normal P3-12 settling transient; deeper on land
+        // means the plan is stale — replan from the real position. Liquid keeps the
+        // existing float-to-surface behaviour.
+        if (mv.kind == Movement.Kind.TRAVERSE && player.onGround()
+                && player.level().getBlockState(feet()).getFluidState().isEmpty()
+                && feet().getY() <= mv.dest.getY() - 2 && canReplanNow()) {
+            return replan("grounded below the lane");
         }
 
         // Baritone cost re-verification: the world may have changed under a planned
@@ -192,6 +224,9 @@ public final class PlayerPathExecutor {
                 player.zza = 1.0f;
                 player.setSprinting(speed >= 1.0);
             }
+            // The dig halts locomotion but must NOT sink a floating body — float here too
+            // (after dig(): its halt() only zeroes zza/xxa, the jump impulse is additive).
+            liquidFloat(mv);
             return Status.RUNNING;
         }
 
@@ -218,6 +253,9 @@ public final class PlayerPathExecutor {
                     return replan("scaffold place failed");   // out of blocks / no angle → replan
                 }
                 case RUNNING -> {
+                    // The edge-sneak maneuver holds sneak + creeps — in water that sinks the
+                    // body tick by tick; keep it floated at the placement's working height.
+                    liquidFloat(mv);
                     return Status.RUNNING;
                 }
             }
@@ -230,16 +268,28 @@ public final class PlayerPathExecutor {
             return Status.RUNNING;
         }
         drive(mv);
-        // Baritone Movement.update universal liquid float (runs after EVERY movement's
-        // updateState): if our feet cell is liquid and we're below dest.y+0.6, press jump
-        // (→ jumpInLiquid buoyancy). This is the single framework-level mechanism that
-        // keeps the body riding the water surface across ALL kinds — without it the body
-        // sinks between per-move depth-corrections and porpoises.
+        liquidFloat(mv);
+        return Status.RUNNING;
+    }
+
+    /**
+     * Baritone Movement.update universal liquid float — framework-level, run on EVERY
+     * movement tick INCLUDING the break/place phases (Baritone applies it before the
+     * per-move updateState): feet cell in liquid and body below {@code dest.y+0.6} →
+     * press jump (→ jumpInLiquid buoyancy, +0.04/tick). This is the single mechanism
+     * that keeps the body riding the water surface across ALL kinds. Our port used to
+     * run it only on the drive tick: the dig/place early-returns skipped it, so a
+     * shore-exit ASCEND digging or edge-sneak-placing from a water cell sank tick by
+     * tick to the lake floor (dig() halts, PlaceManeuver sneaks — neither floats), the
+     * eyes went under, and the underwater watchdog cancelled + replanned the same move
+     * forever — the observed water-pacing loop. Self-limiting: only fires while BELOW
+     * dest.y+0.6, so downward moves (DESCEND/FALL/DIG_DOWN) never fight their descent.
+     */
+    private void liquidFloat(Movement mv) {
         if (!player.level().getBlockState(feet()).getFluidState().isEmpty()
                 && player.getY() < mv.dest.getY() + 0.6) {
             InputDriver.jump(player);
         }
-        return Status.RUNNING;
     }
 
     /** Horizontal speed² this tick — used to gate jump timing (Baritone waits for motion). */

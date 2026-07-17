@@ -83,7 +83,6 @@ public final class NumenScreen extends Screen {
     private static final int CTX_BAR_H = 3;
     private static final int CTX_BAND_H = 12;
     private static final int MAX_PROMPT = 1024;
-    private static final int TOOL_ARG_CHARS = 44;
 
     // ---- palette (BlockFrame "Cottage" theme — single theme for now, see UiTheme) ----
     private static final UiTheme TH = UiTheme.WARM;
@@ -1275,15 +1274,15 @@ public final class NumenScreen extends Screen {
         Set<String> failed = failedIds();
         for (Row row : rows) {
             if (y + LINE_H > bodyY && y < bodyBottom) {
-                if (row.foldKey() != null) {                 // clickable fold toggle — glyph baked into text
-                    txt(g, row.text, transX, y, row.color);
-                } else if (row.toolIds() != null) {          // tool row — status icon + text
+                if (row.toolIds() != null) {                 // tool row — status icon + narration (may also be click-to-expand)
                     boolean anyRunning = row.toolIds().stream().anyMatch(id -> !done.contains(id));
                     boolean anyFail = row.toolIds().stream().anyMatch(failed::contains);
                     String icon = anyRunning ? SPIN[(int) ((t / 120) % 4)] : (anyFail ? "✗" : "✔");
                     int ic = anyRunning ? RUN : (anyFail ? FAIL : OK);
                     txt(g, Component.literal(icon), transX, y, ic);
                     txt(g, row.text, transX + 11, y, row.color);
+                } else if (row.foldKey() != null) {          // clickable fold toggle — glyph baked into text
+                    txt(g, row.text, transX, y, row.color);
                 } else {
                     txt(g, row.text, transX, y, row.color);
                 }
@@ -1563,13 +1562,14 @@ public final class NumenScreen extends Screen {
         return out;
     }
 
-    /** Emit rows for a run of consecutive tool calls. A single call is always one plain row. A run of
+    /** Emit rows for a run of consecutive tool calls. A single call is always one row. A run of
      *  many stays EXPANDED while any is still running (live per-tool spinners) and AUTO-FOLDS to a muted
-     *  "N steps · names" summary once all are done — unless the user clicked it open (keyed by the first
-     *  id in {@link #expandedGroups}), in which case it shows a "▾" header + the tool rows. */
+     *  "N 步：<narrations>" summary once all are done — unless the user clicked it open (keyed by the first
+     *  id in {@link #expandedGroups}), in which case it shows a "▾" header + the per-tool rows. Each per-tool
+     *  row shows the model's {@code d} narration (chat-panel style, no raw args). */
     private void flushTools(List<Row> out, List<LlmToolCall> group, Set<String> done, Set<String> failed, int width) {
         if (group.isEmpty()) return;
-        if (group.size() == 1) {                                  // single tool — never folds
+        if (group.size() == 1) {                                  // single tool — never group-folds (still per-tool expandable)
             addToolRow(out, group.get(0), width);
             group.clear();
             return;
@@ -1577,16 +1577,16 @@ public final class NumenScreen extends Screen {
         String key = group.get(0).id();
         boolean running = group.stream().anyMatch(tc -> !done.contains(tc.id()));
         boolean expanded = running || expandedGroups.contains(key);
-        if (!expanded) {                                          // folded summary (click to expand)
-            List<String> names = new ArrayList<>();
-            for (LlmToolCall tc : group) if (!names.contains(tc.name())) names.add(tc.name());
+        if (!expanded) {                                          // folded summary (click to expand) — narrations, not names
+            List<String> labels = new ArrayList<>();
+            for (LlmToolCall tc : group) labels.add(ToolLine.label(tc.name(), tc.arguments()));
             boolean anyFail = group.stream().anyMatch(tc -> failed.contains(tc.id()));
-            String summary = "▸ " + group.size() + " steps · " + String.join(" · ", names);
+            String summary = ToolLine.groupSummary(group.size(), labels);
             out.add(new Row(colored(fitOneLine(summary, width - 2), anyFail ? FAIL : TOOL).getVisualOrderText(),
                     anyFail ? FAIL : TOOL, null, key));
         } else {
             if (!running) {                                       // manually expanded → collapsible header
-                String hdr = "▾ " + group.size() + " steps";
+                String hdr = "▾ " + group.size() + " 步";
                 out.add(new Row(colored(hdr, TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
             }
             for (LlmToolCall tc : group) addToolRow(out, tc, width);
@@ -1594,9 +1594,32 @@ public final class NumenScreen extends Screen {
         group.clear();
     }
 
+    /** One tool call. COLLAPSED (default): status icon + the model's {@code d} narration (or the bare tool
+     *  name when it wrote none) — no {@code <>} tags, no args JSON. EXPANDED (click): the same header line
+     *  plus faint detail rows with the tool name, the full args JSON, and the result. The per-tool fold key
+     *  ({@code "tool-"+id}) never collides with a group key (a raw id) or the event/thinking keys. */
     private void addToolRow(List<Row> out, LlmToolCall tc, int width) {
-        FormattedCharSequence seq = colored(fitOneLine(toolLine(tc), width - 2 - 11), TOOL).getVisualOrderText();
-        out.add(new Row(seq, TOOL, List.of(tc.id()), null));
+        String foldKey = "tool-" + tc.id();
+        String label = ToolLine.label(tc.name(), tc.arguments());
+        FormattedCharSequence seq = colored(fitOneLine(label, width - 2 - 11), TOOL).getVisualOrderText();
+        out.add(new Row(seq, TOOL, List.of(tc.id()), foldKey));   // toolIds → status icon; foldKey → click to expand
+        if (expandedGroups.contains(foldKey)) {
+            wrapPlain(out, tc.name(), TXT_MUTED, width);
+            String args = tc.arguments() == null ? "" : tc.arguments().replaceAll("\\s+", " ").trim();
+            if (!args.isEmpty()) wrapPlain(out, args, TXT_FAINT, width);
+            String result = resultFor(tc.id());
+            if (result != null && !result.isBlank()) {
+                wrapPlain(out, result.replaceAll("\\s+", " ").trim(), TXT_FAINT, width);
+            }
+        }
+    }
+
+    /** The tool-result content recorded for {@code toolCallId}, or null when none has landed yet. */
+    private String resultFor(String toolCallId) {
+        for (ConvoState.Msg m : loop().convo().snapshot()) {
+            if (m instanceof ConvoState.Msg.Tool t && toolCallId.equals(t.toolCallId())) return t.content();
+        }
+        return null;
     }
 
     /** Root tags of machine-facing cognition notes (world-cognition events, corrective
@@ -1672,12 +1695,6 @@ public final class NumenScreen extends Screen {
         if (font.width(s) <= pxWidth) return s;
         while (s.length() > 1 && font.width(s + "…") > pxWidth) s = s.substring(0, s.length() - 1);
         return s + "…";
-    }
-
-    private String toolLine(LlmToolCall tc) {
-        String args = tc.arguments() == null ? "" : tc.arguments().replaceAll("\\s+", " ").trim();
-        if (args.length() > TOOL_ARG_CHARS) args = args.substring(0, TOOL_ARG_CHARS) + "…";
-        return tc.name() + "  " + args;
     }
 
     /** A bold name header on its OWN line (fixed format — never merges into the body). */

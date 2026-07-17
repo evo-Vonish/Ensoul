@@ -874,7 +874,18 @@ public final class PlayerPathExecutor {
                 // could never replan out of a bad landing → wedge.
                 return feet().equals(mv.src) || player.onGround();
             case PARKOUR:
-                return ticksOnCurrent == 0;
+                // P1-5 × parkour-enable reconciliation (integration glue). The bare
+                // `ticksOnCurrent==0` was written while ALLOW_PARKOUR was off, so the
+                // PARKOUR branch was dead and never had to survive the P1-5 gate. Now
+                // the planner emits 2-cell gap jumps: a MISSED hop that drops into the
+                // pit stays on this move with ticksOnCurrent>0, so this gate would be
+                // false forever — and since P1-5 now routes EVERY watchdog replan exit
+                // (off-path, movement-timeout, stuck) through canReplanNow()=safeToCancel,
+                // none could ever fire and the body wedges in the gap until the task
+                // deadline. Relax exactly as FALL is (and as the parkour-enable commit
+                // db37447 directs): cancellable pre-liftoff (still running up, onGround)
+                // and once landed (onGround), locked only through the airborne arc.
+                return ticksOnCurrent == 0 || player.onGround();
             case ASCEND:
                 // Unsafe only while ACTIVELY placing the step block (mid-place, floor not yet
                 // down) — Baritone gates on ticksWithoutPlacement>0. We additionally treat a

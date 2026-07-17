@@ -1,0 +1,121 @@
+name: Publish Mod
+
+# Fires on version tags (e.g. v0.1.0-beta). The published version comes from
+# gradle.properties `version` — keep tag and property in sync. A -alpha/-beta
+# suffix on the tag picks the release channel (and marks the GitHub release
+# as a prerelease). Same conventions as minecraft-numen's pipeline, minus the
+# datagen and loader-detection machinery this single-version repo doesn't need.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: "temurin"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build both loaders
+        run: ./gradlew :fabric:build :neoforge:build --no-daemon
+
+      - name: Prepare publish metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_prop() { grep -E "^$1=" gradle.properties | head -n1 | cut -d= -f2-; }
+          mod_id="$(read_prop mod_id)"
+          mod_version="$(read_prop version)"
+          minecraft_version="$(read_prop minecraft_version)"
+
+          channel="release"
+          if [[ "${GITHUB_REF_NAME}" == *"-alpha"* ]]; then channel="alpha"
+          elif [[ "${GITHUB_REF_NAME}" == *"-beta"* ]]; then channel="beta"; fi
+          prerelease="false"; [ "${channel}" != "release" ] && prerelease="true"
+
+          find_jar() {
+            find "$1/build/libs" -maxdepth 1 -type f -name '*.jar' \
+              ! -name '*-sources.jar' ! -name '*-javadoc.jar' | LC_ALL=C sort | head -n1
+          }
+          {
+            echo "version_type=${channel}"
+            echo "github_prerelease=${prerelease}"
+            echo "minecraft_version=${minecraft_version}"
+            echo "fabric_file=$(find_jar fabric)"
+            echo "neoforge_file=$(find_jar neoforge)"
+            echo "fabric_name=${mod_id}-${mod_version}-${channel}-fabric-${minecraft_version}"
+            echo "neoforge_name=${mod_id}-${mod_version}-${channel}-neoforge-${minecraft_version}"
+            echo "fabric_version=${mod_version}-${channel}-fabric-${minecraft_version}"
+            echo "neoforge_version=${mod_version}-${channel}-neoforge-${minecraft_version}"
+          } >> "$GITHUB_OUTPUT"
+
+      # On a version tag: attach both loader jars to a GitHub Release and, when
+      # the CURSEFORGE_TOKEN repo secret is set, publish to the numen-mcp
+      # CurseForge project (id 1605815). mc-publish skips any platform whose
+      # token is absent, so without the secret only the GitHub Release is made.
+      # Set the dependency on Numen and the page copy in the CurseForge web UI.
+      - name: Publish Fabric to GitHub Release and CurseForge
+        continue-on-error: true
+        uses: Kira-NT/mc-publish@v3.3.0
+        with:
+          files: ${{ steps.meta.outputs.fabric_file }}
+          loaders: fabric
+          name: ${{ steps.meta.outputs.fabric_name }}
+          version: ${{ steps.meta.outputs.fabric_version }}
+          game-versions: ${{ steps.meta.outputs.minecraft_version }}
+          game-version-filter: none
+          version-type: ${{ steps.meta.outputs.version_type }}
+          github-prerelease: ${{ steps.meta.outputs.github_prerelease }}
+
+          # numen-mcp CurseForge project (delete these two lines to skip CF).
+          curseforge-id: 1605815
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
+          # Numen (numen-core, CF project 1581109) is required at runtime — this
+          # attaches it as a required dependency so CurseForge shows "Requires Numen".
+          dependencies: |
+            numen(required){curseforge:1581109}
+
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish NeoForge to GitHub Release and CurseForge
+        continue-on-error: true
+        uses: Kira-NT/mc-publish@v3.3.0
+        with:
+          files: ${{ steps.meta.outputs.neoforge_file }}
+          loaders: neoforge
+          name: ${{ steps.meta.outputs.neoforge_name }}
+          version: ${{ steps.meta.outputs.neoforge_version }}
+          game-versions: ${{ steps.meta.outputs.minecraft_version }}
+          game-version-filter: none
+          version-type: ${{ steps.meta.outputs.version_type }}
+          github-prerelease: ${{ steps.meta.outputs.github_prerelease }}
+
+          # numen-mcp CurseForge project (delete these two lines to skip CF).
+          curseforge-id: 1605815
+          curseforge-token: ${{ secrets.CURSEFORGE_TOKEN }}
+
+          # Numen (numen-core, CF project 1581109) is required at runtime — this
+          # attaches it as a required dependency so CurseForge shows "Requires Numen".
+          dependencies: |
+            numen(required){curseforge:1581109}
+
+          github-token: ${{ secrets.GITHUB_TOKEN }}

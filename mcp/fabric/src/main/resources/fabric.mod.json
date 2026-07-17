@@ -1,0 +1,28 @@
+{
+    "schemaVersion": 1,
+    "id": "${mod_id}",
+    "version": "${version}",
+    "name": "${mod_name}",
+    "description": "${description}",
+    "authors": [
+        "${mod_author}"
+    ],
+    "contact": {
+        "homepage": "https://github.com/Dwinovo/numen-mcp",
+        "sources": "https://github.com/Dwinovo/numen-mcp"
+    },
+    "license": "${license}",
+    "icon": "numen_mcp.png",
+    "environment": "client",
+    "entrypoints": {
+        "client": [
+            "com.dwinovo.numen.mcp.NumenMcpFabricClient"
+        ]
+    },
+    "depends": {
+        "fabricloader": ">=${fabric_loader_version}",
+        "numen_api": "*",
+        "minecraft": "~${minecraft_version}",
+        "java": ">=${java_version}"
+    }
+}

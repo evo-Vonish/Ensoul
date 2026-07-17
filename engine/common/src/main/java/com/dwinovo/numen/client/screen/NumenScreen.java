@@ -1516,14 +1516,20 @@ public final class NumenScreen extends Screen {
                 }
                 case ConvoState.Msg.Assistant a -> {
                     AssistantTurn turn = a.turn();
+                    // This assistant message's stored reasoning folds in BEFORE whatever the
+                    // message produced (thinking precedes the tool calls / the spoken reply it
+                    // led to), collapsed by default, keyed by the message's snapshot index.
+                    // Rendered for EVERY reasoned message, not only the ones that also spoke —
+                    // a tool-only turn (content empty, thinking + tool_calls) still thought, and
+                    // that intermediate thinking must not be swallowed. Its fold breaks the
+                    // current tool run so it lands in the right chronological slot.
+                    String pastThink = loop().reasoningAt(i);
+                    if (pastThink != null && !pastThink.isBlank()) {
+                        flushTools(out, group, done, failed, width);
+                        addThinkingRows(out, "think-" + i, pastThink, false, width);
+                    }
                     if (turn.content() != null && !turn.content().isBlank()) {
                         flushTools(out, group, done, failed, width);   // spoken reply breaks the fold
-                        // A past turn's stored reasoning folds in right before its text row,
-                        // collapsed by default (keyed by the message's snapshot index).
-                        String pastThink = loop().reasoningAt(i);
-                        if (pastThink != null && !pastThink.isBlank()) {
-                            addThinkingRows(out, "think-" + i, pastThink, false, width);
-                        }
                         addHeader(out, name, AI, width);         // bold name header on its OWN line
                         wrapPlain(out, turn.content(), AI, width);
                     }

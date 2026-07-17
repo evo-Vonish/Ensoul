@@ -163,6 +163,14 @@ public final class NumenCore {
         // TurtleDrive muscle the reflex layer also fires for a CORNERED companion. Appended LAST so all prior
         // tool ordering — and prompt caching — stays stable.
         ToolRegistry.register(new com.dwinovo.numen.core.tools.TurtleUpTool());
+
+        // L1 landmark naming (Wave D): remember_place / forget_place / recall_places — let the model name and
+        // annotate important locations and recall them by name (writes the LandmarkStore's label/category/note
+        // via the AgentLoopRegistry seam). Appended LAST, after TurtleUpTool, so all prior tool ordering — and
+        // prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RememberPlaceTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.ForgetPlaceTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RecallPlacesTool());
     }
 
 

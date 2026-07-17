@@ -166,22 +166,27 @@ public final class LookController {
             double edy = engY - body.getEyeY();
             double edz = engZ - body.getZ();
             double ehoriz = Math.sqrt(edx * edx + edz * edz);
-            float engYaw = (float) (Math.toDegrees(Math.atan2(edz, edx)) - 90.0);
+            float eBody = body.getYRot();
+            // Degenerate bearing: the work point is straight above/below (shaft mining, ceiling
+            // block) and atan2 of near-zero components is an arbitrary yaw — hold the current
+            // facing and let pitch carry the aim, like a real player digging straight down.
+            float engYaw = ehoriz < LookTunables.ENGAGED_MIN_HORIZ
+                    ? eBody
+                    : (float) (Math.toDegrees(Math.atan2(edz, edx)) - 90.0);
             float engPitch = LookMath.clamp(
                     (float) (-Math.toDegrees(Math.atan2(edy, ehoriz))),
-                    -LookTunables.MAX_PITCH_DEG, LookTunables.MAX_PITCH_DEG);
+                    -LookTunables.ENGAGED_MAX_PITCH_DEG, LookTunables.ENGAGED_MAX_PITCH_DEG);
 
-            float eBody = body.getYRot();
             float eHead = smoothHeadValid ? smoothHead : body.getYHeadRot();
             float ePitch = body.getXRot();
 
             float newBody = LookMath.approachAngle(eBody, engYaw,
-                    LookTunables.BODY_OMEGA_DEG, LookTunables.BODY_K,
+                    LookTunables.ENGAGED_BODY_OMEGA_DEG, LookTunables.BODY_K,
                     LookTunables.DEADZONE_DEG, 0.0f);
             body.setYRot(newBody);
 
             float newHead = LookMath.approachAngle(eHead, engYaw,
-                    LookTunables.HEAD_OMEGA_DEG, LookTunables.HEAD_K,
+                    LookTunables.ENGAGED_HEAD_OMEGA_DEG, LookTunables.HEAD_K,
                     LookTunables.DEADZONE_DEG, LookTunables.HEAD_MIN_STEP_DEG);
             newHead = LookMath.clampHeadToBody(newHead, newBody, LookTunables.MAX_HEAD_REL_DEG);
             body.setYHeadRot(newHead);

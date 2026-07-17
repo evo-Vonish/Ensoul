@@ -93,4 +93,30 @@ public final class LookTunables {
      * attention and locomotion, and yields only to a hard-aim snap.)
      */
     public static final int ENGAGED_HOLD_TICKS = 3;
+
+    // ---------------------------------------------------------------- engaged work posture rates
+    /**
+     * Body/head yaw caps (deg/tick) while ENGAGED — squaring up to a workbench, or onto the block
+     * being mined / the face being placed against. The idle rates (4°/6°) were tuned for ambient
+     * glances and are too slow for work: an axe fells a log in 8–15 ticks, so at 4°/tick a 120°
+     * offset never squares up before the block pops and the body works permanently crooked. Real
+     * players flick onto their work point in a few hundred ms (~200–400°/s); 9°/tick = 180°/s
+     * closes 90° in ~10 ticks with the same exponential ease-out, so the motion stays organic —
+     * brisk mid-turn, settling softly. Purely cosmetic: breaks/places are decided by the
+     * eye-position raycast, never by these angles.
+     */
+    public static final float ENGAGED_BODY_OMEGA_DEG = 9.0f;
+    /** Head yaw cap (deg/tick) while ENGAGED — see {@link #ENGAGED_BODY_OMEGA_DEG}. */
+    public static final float ENGAGED_HEAD_OMEGA_DEG = 9.0f;
+    /**
+     * Below this horizontal eye→point distance (blocks) the engaged bearing is degenerate — the
+     * work point is essentially straight above/below (shaft mining, ceiling block) and atan2 of
+     * near-zero components yields an arbitrary yaw. Hold the current body yaw instead of chasing
+     * it (a real player digging straight down keeps whatever facing they had), and let pitch do
+     * the work.
+     */
+    public static final double ENGAGED_MIN_HORIZ = 0.35;
+    /** Engaged pitch clamp (deg): mining a ceiling/floor block wants a deeper look-up/-down than
+     *  the ambient ±60° cone; players routinely pitch ~75–90° at their work point. */
+    public static final float ENGAGED_MAX_PITCH_DEG = 75.0f;
 }

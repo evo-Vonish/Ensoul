@@ -30,6 +30,25 @@ public interface NavGoal {
     // ---- the shared octile + vertical point bound ----
 
     /**
+     * Per-block inflation applied to the VERTICAL heuristic term. Horizontal is
+     * already weighted by {@link PathSettings#COST_HEURISTIC} (≈ 3.563, sprint
+     * cost); the raw vertical physics costs (JUMP ≈ 3.16, DESCEND ≈ 3.89) are
+     * LOWER than that, so in a closed vertical shaft — where almost all remaining
+     * cost is vertical — the heuristic stays a loose underestimate and weighted
+     * A* degenerates to near-Dijkstra, exploding node expansions until it hits the
+     * node budget. Inflating the vertical term (kept below the 3.563 horizontal
+     * weight, so it stays near-admissible relative to the real per-block ascent
+     * cost — stair ≈ 6.6, ladder ≈ 8.5, pillar ≈ 23 — and never breaks
+     * reachability) makes the search greedier UP the shaft and return a partial
+     * far sooner. 2.0 is a deliberately conservative pick in the recommended
+     * 1.5–2.5 band: it lifts JUMP to ≈ 6.3 (matching a real step-up) and DESCEND
+     * to ≈ 7.8 (a mild overestimate of cheap multi-block falls, harmless — the
+     * search is already weighted/inadmissible by design, and over-costing gratuitous
+     * descents even nudges the body away from dropping into holes).
+     */
+    double VERTICAL_HEURISTIC_WEIGHT = 2.0;
+
+    /**
      * Octile horizontal distance (× walk cost) plus a vertical term — the
      * admissible point-to-point bound every concrete goal builds on. Downward
      * must cost &gt; 0 (see {@link ActionCosts#DESCEND_ONE_BLOCK}): with a free
@@ -44,11 +63,13 @@ public interface NavGoal {
         // further multiplier (Baritone folds the weight into the heuristic itself).
         double horizontal = (Math.min(dx, dz) * ActionCosts.SQRT_2 + Math.abs(dx - dz))
                 * PathSettings.COST_HEURISTIC;
-        // Baritone GoalYLevel: up costs JUMP per block, down costs DESCEND (fall[2]/2).
+        // Baritone GoalYLevel: up costs JUMP per block, down costs DESCEND (fall[2]/2),
+        // both lifted by VERTICAL_HEURISTIC_WEIGHT to tame closed-shaft node explosion.
         int dy = goal.getY() - from.getY();
-        double vertical = dy > 0
+        double vertical = (dy > 0
                 ? dy * ActionCosts.JUMP_ONE_BLOCK
-                : -dy * ActionCosts.DESCEND_ONE_BLOCK;
+                : -dy * ActionCosts.DESCEND_ONE_BLOCK)
+                * VERTICAL_HEURISTIC_WEIGHT;
         return horizontal + vertical;
     }
 
@@ -90,6 +111,44 @@ public interface NavGoal {
             }
             @Override public BlockPos center() {
                 return new BlockPos(x, 0, z);   // y irrelevant — goal is XZ-only
+            }
+        };
+    }
+
+    /**
+     * Reach the {@code (x, z)} column AT OR ABOVE a resolved surface height — the
+     * "go to a location and stand on the open-air SURFACE" goal, the honest
+     * fulfilment of what {@code move_to x z} advertises. Where {@link #column}
+     * ({@code GoalXZ}) accepts ANY ground at the column and so strands the body on
+     * the first cave/well floor it drops into on the way (the P2-7 trap: reached
+     * {@code y=54} while the target sat at {@code y=65}), this terminates only once
+     * the feet are at or above {@code surfaceY}, and its vertical term pulls the
+     * search UP toward daylight. It NEVER makes a location unreachable: the caller
+     * (see {@code MoveToCompanionTask}) only builds this goal when the surface is a
+     * standable spot AND the body starts near the surface, and still falls back to a
+     * plain any-ground success if the planner can't reach the surface — so an
+     * underground move is never force-surfaced and a walled surface never hard-fails.
+     */
+    static NavGoal columnSurface(int x, int z, int surfaceY) {
+        return new NavGoal() {
+            @Override public boolean isAt(BlockPos feet) {
+                return feet.getX() == x && feet.getZ() == z && feet.getY() >= surfaceY;
+            }
+            @Override public double heuristic(BlockPos from) {
+                double dx = Math.abs(x - from.getX());
+                double dz = Math.abs(z - from.getZ());
+                double horizontal = (Math.min(dx, dz) * ActionCosts.SQRT_2 + Math.abs(dx - dz))
+                        * PathSettings.COST_HEURISTIC;
+                // Below the surface → weighted climb term pulls the search up; once at
+                // or above it, only the horizontal octile term remains.
+                int below = surfaceY - from.getY();
+                double vertical = below > 0
+                        ? below * ActionCosts.JUMP_ONE_BLOCK * VERTICAL_HEURISTIC_WEIGHT
+                        : 0.0;
+                return horizontal + vertical;
+            }
+            @Override public BlockPos center() {
+                return new BlockPos(x, surfaceY, z);
             }
         };
     }

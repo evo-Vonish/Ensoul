@@ -26,7 +26,7 @@ public final class MoveToTool extends ServerNumenTool {
     public String description() {
         return """
                 Travel somewhere — full terrain-traversing navigation, not just walking. Pick ONE of three intents by which coordinates you fill (leave the others null):
-                • Go to a LOCATION: give x and z, leave y null. The companion walks to that spot and stands on whatever ground is there — Y is auto-resolved to the surface. THIS IS THE DEFAULT for 'go over there' / following / exploring; never guess a Y for a location.
+                • Go to a LOCATION: give x and z, leave y null. The companion walks to that x,z and heads for the OPEN-AIR SURFACE there — I resolve Y myself, so never guess a Y. THIS IS THE DEFAULT for 'go over there' / following / exploring. If the surface is walled off or you started deep underground, it instead stops on the nearest ground it can reach (which may be a cave/well floor) and the result tells you the real height and how to surface.
                 • Go to an EXACT cell: give x, y and z. Only for a specific cell you know is reachable (e.g. a block you scanned). If that cell is mid-air or walled in it will report it couldn't reach it.
                 • Change ELEVATION: give y only (x and z null) to climb to the surface or descend to a mining depth at your current column.
                 En route it mines through obstructions, digs down/up, bridges gaps and pillars up with cobblestone/dirt from inventory. Digging is gated by your HELD tool: stone/deepslate need a pickaxe IN HAND (equip_item first); a sword held makes stone an impassable wall. Consumes scaffold blocks and tool durability; carry cobblestone/dirt for gaps. Timeout scales with distance; the result reports the actual position reached (and the real ground height) — call again with the same target to resume. But if it reports NO path or stops far short, that spot is unreachable or too far: pick a NEARER waypoint, or scan first — don't just repeat the same unreachable target. move_to is for getting somewhere to STAND; to open/use a station give its coordinate to interact_at instead.""";
@@ -36,11 +36,12 @@ public final class MoveToTool extends ServerNumenTool {
     public Map<String, Object> parameterSchema() {
         return Schema.object()
                 .nullableNumber("x", "Target X. Null for an elevation-only move (y alone).")
-                .nullableNumber("y", "Target Y (block height). LEAVE NULL to go to a location (x+z) — Y is "
-                        + "auto-resolved to the surface. Only set it for an exact cell (x+y+z) or an "
+                .nullableNumber("y", "Target Y (block height). LEAVE NULL to go to a location (x+z) — I resolve "
+                        + "Y to the surface at that column myself. Only set it for an exact cell (x+y+z) or an "
                         + "elevation move (y alone).")
                 .nullableNumber("z", "Target Z. Null for an elevation-only move (y alone).")
-                .number("speed", "Speed multiplier in [0.1, 2.0]. 1.0 is normal walking speed.", 0.1, 2.0)
+                .number("speed", "Movement pace in [0.1, 2.0]: below 1.0 walks, 1.0 and above sprints "
+                        + "(faster travel, more hunger). Not a linear multiplier.", 0.1, 2.0)
                 .build();
     }
 

@@ -53,6 +53,11 @@ public final class MoveToCompanionTask implements CompanionTask {
     private final int by;
     private final int bz;
     private final BlockPos blockTarget;   // only meaningful for BLOCK kind
+    /** P2-7: for a COLUMN move that begins near the surface, the resolved standable
+     *  surface feet cell at the target column — the goal we actually climb to instead
+     *  of the first cave floor. {@code null} = keep the old any-ground GoalXZ behaviour
+     *  (target has no standable surface, or the body starts underground). */
+    private final BlockPos columnSurface;
 
     private PlayerNav nav;
     private double bestDist = Double.MAX_VALUE;   // closest we've gotten to the goal
@@ -65,6 +70,54 @@ public final class MoveToCompanionTask implements CompanionTask {
         this.by = r.y != null ? (int) Math.floor(r.y) : 0;
         this.bz = r.z != null ? (int) Math.floor(r.z) : 0;
         this.blockTarget = new BlockPos(bx, by, bz);
+        this.columnSurface = resolveColumnSurfaceTarget();
+    }
+
+    /**
+     * P2-7: for a COLUMN (x+z) move, resolve the open-air surface feet cell at the
+     * target column so the search climbs to the SURFACE instead of stranding the
+     * body on the first cave/well floor it drops into. Returns {@code null} — meaning
+     * "keep the old GoalXZ any-ground behaviour" — unless BOTH hold:
+     * <ul>
+     *   <li>the target column has a standable surface cell (not an open void or a
+     *       water-capped column), AND</li>
+     *   <li>the body currently STARTS near the surface (not deep underground) — so an
+     *       inside-a-base or in-a-cave move is never hijacked into a dig-to-the-sky;
+     *       that intent belongs to a y-only elevation move, not a location move.</li>
+     * </ul>
+     */
+    private BlockPos resolveColumnSurfaceTarget() {
+        if (r.kind != MoveToTaskRecord.Kind.COLUMN) {
+            return null;
+        }
+        BlockPos targetSurface = standableSurface(bx, bz);
+        if (targetSurface == null) {
+            return null;
+        }
+        BlockPos feet = feet();
+        BlockPos hereSurface = standableSurface(feet.getX(), feet.getZ());
+        boolean startsNearSurface = hereSurface != null
+                && feet.getY() >= hereSurface.getY() - UNDERGROUND_MARGIN;
+        return startsNearSurface ? targetSurface : null;
+    }
+
+    /**
+     * The topmost standable feet cell at column {@code (x,z)} near the heightmap
+     * surface, or {@code null} if none (open void, water-capped, heightmap off). Scans
+     * a small window around MOTION_BLOCKING_NO_LEAVES so the returned cell is a REAL
+     * standable spot — absorbing the heightmap's ±1 and thin surface layers (snow,
+     * slabs, foliage) rather than trusting a raw heightmap value.
+     */
+    private BlockPos standableSurface(int x, int z) {
+        var level = player.level();
+        int hm = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        for (int y = hm + 1; y >= hm - 2; y--) {
+            BlockPos feet = new BlockPos(x, y, z);
+            if (com.dwinovo.numen.core.pathing.util.BlockHelper.isStandable(level, feet)) {
+                return feet;
+            }
+        }
+        return null;
     }
 
     @Override
@@ -88,7 +141,11 @@ public final class MoveToCompanionTask implements CompanionTask {
     private NavGoal goal() {
         return switch (r.kind) {
             case BLOCK -> NavGoal.exact(blockTarget);
-            case COLUMN -> NavGoal.column(bx, bz);
+            // COLUMN: climb to the resolved open-air surface when we have one (P2-7),
+            // else the old any-ground GoalXZ (never makes a location unreachable).
+            case COLUMN -> columnSurface != null
+                    ? NavGoal.columnSurface(bx, bz, columnSurface.getY())
+                    : NavGoal.column(bx, bz);
             case YLEVEL -> NavGoal.yLevel(by);
         };
     }
@@ -109,7 +166,12 @@ public final class MoveToCompanionTask implements CompanionTask {
         BlockPos feet = feet();
         return switch (r.kind) {
             case BLOCK -> feet.equals(blockTarget);
-            case COLUMN -> feet.getX() == bx && feet.getZ() == bz;
+            // COLUMN: at the target column. When we resolved a surface (P2-7) we must ALSO
+            // be at or above it — otherwise this predicate would fire the instant the body
+            // passes through the column at a lower cave floor, defeating the surface climb.
+            // With no resolved surface it stays the old x/z-only check.
+            case COLUMN -> feet.getX() == bx && feet.getZ() == bz
+                    && (columnSurface == null || feet.getY() >= columnSurface.getY());
             case YLEVEL -> feet.getY() == by && player.onGround();
         };
     }

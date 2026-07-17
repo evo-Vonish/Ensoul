@@ -15,6 +15,8 @@ import com.dwinovo.numen.core.task.TaskState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Item;
@@ -85,6 +87,9 @@ public final class MineCompanionTask implements CompanionTask {
      *  rescanning forever (scans finish in well under a tick; this only fires if
      *  something is truly stuck). */
     private static final int SCAN_TIMEOUT_TICKS = 200;
+    /** Body this many blocks below the heightmap surface + a surface-flora target (logs/leaves)
+     *  → the zero-found settlement adds "it only grows on the surface, go back up" guidance. */
+    private static final int SURFACE_HINT_MIN_DEPTH = 6;
     /** (A) Consecutive GENUINE "no path" nav failures against one ore before it is
      *  blacklisted — a single transient failure no longer condemns an ore forever
      *  (the diamond 7/8 root cause). Transient causes never accrue a strike. */
@@ -914,10 +919,34 @@ public final class MineCompanionTask implements CompanionTask {
             sb.append(mined > 0 || minedEnough
                     ? ", no more " + r.label + " in range"
                     : " — none found within " + r.maxRadius + " blocks");
+            // Environment fact the brain can't infer from a bare "none found": surface flora does
+            // not generate underground, so a cave search for logs is structurally hopeless — walking
+            // 40 blocks and rerunning just repeats the miss (owner field report: Fenn hunted trees
+            // in a mine shaft). Say WHERE the target actually lives.
+            if (mined == 0 && !minedEnough && surfaceFloraTarget()) {
+                int surfaceY = player.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                        player.getBlockX(), player.getBlockZ());
+                int depth = surfaceY - player.getBlockY();
+                if (depth >= SURFACE_HINT_MIN_DEPTH) {
+                    sb.append(". You are underground (y=").append(player.getBlockY())
+                      .append(", surface ≈ y=").append(surfaceY).append(") and ").append(r.label)
+                      .append(" only grows on the surface — get back up first (escape_to_surface), then rerun there");
+                }
+            }
         } else {
             sb.append(". Remaining: ").append(String.join("; ", notes)).append('.');
         }
         return sb.toString();
+    }
+
+    /** Every target block is surface flora (logs / leaves / saplings) — stuff that does not generate
+     *  underground, so a cave search for it is structurally hopeless rather than merely unlucky. */
+    private boolean surfaceFloraTarget() {
+        if (r.targets.isEmpty()) return false;
+        return r.targets.stream().allMatch(b -> {
+            BlockState s = b.defaultBlockState();
+            return s.is(BlockTags.LOGS) || s.is(BlockTags.LEAVES) || s.is(BlockTags.SAPLINGS);
+        });
     }
 
     private boolean withinReach(BlockPos pos) {

@@ -106,6 +106,12 @@ final class PerceptionState {
     long reflexAttackerSeenTick;
     /** True while a critical-HP episode is live; gates the once-per-episode note. */
     boolean reflexCriticalEpisode;
+    /** Game time ANY threat (attacker or proximity) last existed — arms the episode-close grace so a
+     *  chasing mob slipping outside the arming radius doesn't churn close/reopen (chase hysteresis). */
+    long reflexThreatSeenTick;
+    /** Game time the recover condition (clean verdict + HP above the line) started holding continuously;
+     *  0 = not holding. The episode only closes once it has held for the sustain window. */
+    long reflexCalmSinceTick;
     /** Game time the next reflex swing is allowed (~one hit per 12t); 0 = ready. */
     long reflexSwingUntil;
     /** Flee-drive deadline (≤ now+60t) while sprinting away; 0 = not currently fleeing. */

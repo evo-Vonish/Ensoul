@@ -108,6 +108,18 @@ public final class Reflexes {
     private static final int FLEE_MAX_TICKS = 60;
     /** Episode ends when the attacker has been dead / removed / unseen for this long. */
     private static final int ATTACKER_GONE_TICKS = 100;
+    /** Chase hysteresis: a live episode survives ALL threats being unseen for this long before it closes.
+     *  Crossing back outside the 8-block arming radius mid-chase is not safety — a chasing zombie re-enters
+     *  within a second, and every premature close+reopen minted a fresh context note (the observed
+     *  one-note-per-second reflex storm). */
+    private static final int THREAT_CLEAR_GRACE_TICKS = 100;
+    /** A clean-ENGAGE + recovered-HP verdict must hold for this long before it closes the episode. The raw
+     *  condition flaps at the boundary (HP regen/damage around the 50% line, fight/flee verdict re-scored
+     *  every REASSESS_PERIOD) and each flap re-opened the episode sub-second — the second storm engine. */
+    private static final int RECOVER_SUSTAIN_TICKS = 60;
+    /** Floor between two episode-start context notes. Whatever still churns episodes faster than this stays
+     *  ONE story in the context, not a line per churn (同主题最高seq为准 — the newest note wins anyway). */
+    private static final int CRITICAL_NOTE_COOLDOWN_TICKS = 200;
     /** How far ahead of the body the flee waypoint is placed (direction matters, not the exact point). */
     private static final double FLEE_LOOKAHEAD = 8.0;
 
@@ -474,14 +486,24 @@ public final class Reflexes {
             PLANS.remove(body.getUUID());
             return;
         }
-        if (threat == null && !turtling(body)) {   // episode was live but the last threat is gone → close it out
+        if (threat == null) {
+            if (turtling(body)) {   // threat gone but a burrow is still open — let the turtle break out gracefully
+                tickTurtle(body, st, now);
+                return;
+            }
+            // Chase hysteresis: "no threat this tick" is not "safe" — a chasing mob that slipped outside the
+            // arming radius re-enters within a second, and closing+reopening the episode minted a context
+            // note per crossing. Hold the episode through the grace window: finish any planned retreat,
+            // plan nothing new (no threat to steer from), close only once the calm has lasted.
+            if (now - st.reflexThreatSeenTick <= THREAT_CLEAR_GRACE_TICKS) {
+                ReflexNav nav = NAVS.get(body.getUUID());
+                if (nav != null && nav.tick() != ReflexNav.Status.RUNNING) dropNav(body);
+                return;
+            }
             endCriticalReflex(st, body);
             return;
         }
-        if (threat == null) {   // threat gone but a burrow is still open — let the turtle break out gracefully
-            tickTurtle(body, st, now);
-            return;
-        }
+        st.reflexThreatSeenTick = now;
 
         float max = body.getMaxHealth();
         float hp = body.getHealth();
@@ -496,11 +518,19 @@ public final class Reflexes {
 
         if (st.reflexCriticalEpisode) {
             // A dangerous verdict never ends on an HP rebound — one more blow can be lethal; it ends only when
-            // the threat is gone (handled above). A clean-ENGAGE verdict ends the episode on HP recovery.
+            // the threat is gone (handled above). A clean-ENGAGE verdict ends the episode on HP recovery —
+            // but only a SUSTAINED one: the raw condition flaps at the boundary (HP regen/damage around the
+            // recover line, verdict re-scored every REASSESS_PERIOD) and each flap re-opened the episode
+            // sub-second, minting a context note per flap (the second storm engine).
             boolean recovered = !dangerous && hp > max * HP_RECOVER_FRAC && !turtling(body);
             if (recovered) {
-                endCriticalReflex(st, body);
-                return;
+                if (st.reflexCalmSinceTick == 0) st.reflexCalmSinceTick = now;
+                if (now - st.reflexCalmSinceTick >= RECOVER_SUSTAIN_TICKS) {
+                    endCriticalReflex(st, body);
+                    return;
+                }
+            } else {
+                st.reflexCalmSinceTick = 0;
             }
             actCritical(body, st, now, threat, plan);
             return;
@@ -512,9 +542,15 @@ public final class Reflexes {
         if (dangerous || wounded) {
             st.reflexCriticalEpisode = true;
             st.reflexFleeUntil = 0;
-            emit(body, "本能反应:遭遇威胁,已本能反击/撤离(目标:"
-                    + Perceptions.safe(threat.getName().getString())
-                    + (plan.limiting().isEmpty() ? "" : ";评估:" + plan.limiting()) + ")。");
+            st.reflexCalmSinceTick = 0;
+            // Note floor: whatever still churns episodes faster than the cooldown stays ONE story in the
+            // context, not a line per churn — the spinal cord keeps acting either way, only the note is gated.
+            if (st.ready("reflex_critical_note", now)) {
+                st.arm("reflex_critical_note", now, CRITICAL_NOTE_COOLDOWN_TICKS);
+                emit(body, "本能反应:遭遇威胁,已本能反击/撤离(目标:"
+                        + Perceptions.safe(threat.getName().getString())
+                        + (plan.limiting().isEmpty() ? "" : ";评估:" + plan.limiting()) + ")。");
+            }
             actCritical(body, st, now, threat, plan);
         }
     }
@@ -650,6 +686,7 @@ public final class Reflexes {
     private static void endCriticalEpisode(PerceptionState st, NumenPlayer body) {
         st.reflexCriticalEpisode = false;
         st.reflexFleeUntil = 0;
+        st.reflexCalmSinceTick = 0;
         st.reflexAttacker = null;       // don't pin a possibly-removed entity; the next hit re-arms it
         st.reflexLastHitDamage = 0.0f;  // clear the last-hit latch with the attacker
         st.reflexNearHostile = null;    // drop the proximity-trigger ref with the episode

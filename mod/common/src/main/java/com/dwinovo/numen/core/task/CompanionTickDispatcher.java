@@ -49,6 +49,11 @@ public final class CompanionTickDispatcher {
                 // look engine a smooth gaze intent. Runs every tick (idle AND walking); the engine
                 // itself yields to any fresher hard-aim / locomotion, so this can push unconditionally.
                 LookBrain.tick(ap);
+                // GUI-engagement posture ("工位姿态"): while a container menu is open, face the station
+                // and stay planted for the whole session. Runs AFTER tickOne (so its halt overrides the
+                // idle-autonomy sleepwalk that tickOne may have issued) and BEFORE the reflex layer's
+                // Perceptions::tick (so a survival reflex still wins the body — see GuiEngagement).
+                com.dwinovo.numen.core.perception.GuiEngagement.tick(ap);
             }
         }
     }
@@ -94,6 +99,7 @@ public final class CompanionTickDispatcher {
         }
         QUEUES.remove(id);   // the body is gone; don't leak its queue
         LookBrain.forget(id);   // drop the companion's attention state with its queue
+        com.dwinovo.numen.core.perception.GuiEngagement.forget(id);   // ...and any GUI-engagement registration
     }
 
     private static void tickOne(NumenPlayer player) {

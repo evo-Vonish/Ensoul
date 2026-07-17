@@ -9,6 +9,7 @@ import com.dwinovo.numen.core.task.PlayerInv;
 import com.dwinovo.numen.task.TaskResult;
 import com.dwinovo.numen.core.task.TaskState;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.util.Mth;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
@@ -29,11 +30,21 @@ public final class InteractAtCompanionTask implements CompanionTask {
     private static final double REACH_SQR = REACH * REACH;
     private static final double WALK_SPEED = 1.0;
 
+    // ---- pre-click settle beat (right-click on a real aim only) ----
+    /** Turn toward the target for at least this many ticks before the click (never snap-and-open). */
+    private static final int SETTLE_MIN_TICKS = 2;
+    /** ...and never wait longer than this, so a partly-blocked bearing can't stall the interaction. */
+    private static final int SETTLE_MAX_TICKS = 4;
+    /** Fire early once the head is within this of the target bearing (deg) — "roughly facing it". */
+    private static final float SETTLE_ALIGN_DEG = 10.0f;
+
     private final NumenPlayer player;
     private final InteractAtTaskRecord r;
 
     private PlayerNav nav;
     private Interaction interaction;
+    private boolean prepared;          // one-time on-arrival prep (hold item) has run
+    private int settleTicks = -1;      // ticks spent easing into the engaged posture before the click
     private long holdUntil = -1;       // game tick to release a fixed-duration hold (holdTicks > 0)
     private String doneReason = "done";
     // A right-click that activated a real block (a station's GUI): captured so the
@@ -77,8 +88,21 @@ public final class InteractAtCompanionTask implements CompanionTask {
 
         // 2) Resolve the crosshair once we're in position, then drive the action.
         if (interaction == null) {
-            if (r.item != null) {
-                player.holdInHand(PlayerInv.findSlot(player.getInventory(), r.item));
+            // One-time on-arrival prep: switch the named item into hand (must NOT repeat during the
+            // settle beat below — holdInHand SWAPS a main-inventory slot, so re-running it thrashes).
+            if (!prepared) {
+                prepared = true;
+                if (r.item != null) {
+                    player.holdInHand(PlayerInv.findSlot(player.getInventory(), r.item));
+                }
+            }
+            // Settle beat: a right-click on a real block/entity aim is a GUI candidate — don't snap
+            // and click blind. Ease into an engaged posture first (halt + feed the look engine the
+            // gaze so head and body turn to face the target), then click once roughly aligned or a
+            // short cap elapses. Opening a menu then reads as "walked up, turned to it, used it".
+            // Left-clicks (break/attack) keep their snappy hard-aim; in-air uses have nothing to face.
+            if (r.aim != null && button() == Interaction.Button.USE && !settleReady()) {
+                return TaskState.RUNNING;
             }
             if (r.aim != null) {
                 InputDriver.lookAt(player, Vec3.atCenterOf(r.aim));
@@ -134,6 +158,31 @@ public final class InteractAtCompanionTask implements CompanionTask {
     private Interaction.Button button() {
         return r.button == InteractAtTaskRecord.Button.LEFT
                 ? Interaction.Button.ATTACK : Interaction.Button.USE;
+    }
+
+    /**
+     * One tick of the pre-click settle beat, run every tick until it returns true: halt, feed the
+     * look engine the engaged gaze so head+body smoothly turn onto the target, and report whether
+     * we've eased enough to fire — roughly aligned (head within {@link #SETTLE_ALIGN_DEG} of the
+     * target bearing) after a minimum, or the {@link #SETTLE_MAX_TICKS} cap. The subsequent
+     * hard-aim in the caller still guarantees the raytrace hits; this only makes the approach look
+     * natural, and bounds its own duration so it never breaks the task's deadline semantics.
+     */
+    private boolean settleReady() {
+        settleTicks++;
+        Vec3 aim = Vec3.atCenterOf(r.aim);
+        InputDriver.halt(player);
+        player.getLook().markEngaged(aim.x, aim.y, aim.z);
+        if (settleTicks >= SETTLE_MAX_TICKS) {
+            return true;
+        }
+        if (settleTicks < SETTLE_MIN_TICKS) {
+            return false;
+        }
+        double dx = aim.x - player.getX();
+        double dz = aim.z - player.getZ();
+        float targetYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        return Math.abs(Mth.wrapDegrees(targetYaw - player.getYHeadRot())) < SETTLE_ALIGN_DEG;
     }
 
     private boolean withinReach() {

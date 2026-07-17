@@ -56,4 +56,34 @@ public final class ToolLine {
     public static String groupSummary(int size, List<String> labels) {
         return "▸ " + size + " 步：" + String.join("、", labels);
     }
+
+    /**
+     * Collapsed step-digest body — the chat-panel v2 aggregation of everything between two
+     * adjacent spoken messages, e.g. {@code "▸ 8 步 · 挖铁矿补装备、回工作台合成"}: the tool-step
+     * count plus each step's label (a {@code d} narration or bare tool name) joined with a
+     * Chinese enumeration comma. The caller width-ellipsizes this and appends {@link
+     * #digestSuffix} pinned to the row's right edge.
+     *
+     * <p>When the interval carried no tool steps (only sightings / intermediate thinking) it
+     * degrades to a bare {@code "▸ 过程"} so the row still reads as a foldable process summary.
+     */
+    public static String digestBody(int steps, List<String> labels) {
+        if (steps <= 0) return "▸ 过程";
+        String head = "▸ " + steps + " 步";
+        if (labels == null || labels.isEmpty()) return head;
+        return head + " · " + String.join("、", labels);
+    }
+
+    /**
+     * The {@code " · 含见闻/思考"} tail appended to a collapsed digest when the interval also
+     * carried system sightings (cognition notes) and/or intermediate ("middle-turn") thinking.
+     * Empty when it carried neither. Kept separate from {@link #digestBody} so the caller can
+     * pin it to the row's right edge, past the width-ellipsized body.
+     */
+    public static String digestSuffix(boolean hasEvents, boolean hasThink) {
+        if (hasEvents && hasThink) return " · 含见闻·思考";
+        if (hasEvents) return " · 含见闻";
+        if (hasThink) return " · 含思考";
+        return "";
+    }
 }

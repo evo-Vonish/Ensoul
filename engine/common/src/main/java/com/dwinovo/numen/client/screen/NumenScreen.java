@@ -1495,56 +1495,94 @@ public final class NumenScreen extends Screen {
         super.removed();
     }
 
-    /** Flatten the convo into render rows. Tool RESULT messages aren't drawn — they only mark the
-     *  matching tool call done (via {@link #doneIds()}); the call line shows the spinner/check. */
+    /**
+     * Flatten the convo into render rows, chat-panel v2 three-layer model.
+     *
+     * <p><b>Top layer — only four kinds of row surface here:</b> the owner's words, Fenn's spoken
+     * words, a thinking fold (the SPEAKING turn's own reasoning, glued before its message), and a
+     * <em>step-digest</em> row. Everything that happens <em>between two adjacent spoken messages</em>
+     * — consecutive tool-call runs, the intermediate ("middle-turn") thinking of tool-only turns, and
+     * machine-facing cognition-note user messages (system 见闻) — is aggregated into ONE collapsed
+     * digest row per interval (see {@link #emitDigest}).
+     *
+     * <p><b>The active (trailing) round is exempt:</b> whatever follows the last spoken message has no
+     * closing boundary yet, so it is laid out top-level as before (live spinners / live thinking stay
+     * visible in real time; {@link #layoutActiveInterval}). Only completed intervals aggregate.
+     *
+     * <p>Tool RESULT messages aren't drawn — they only mark the matching call done (via {@link
+     * #doneIds()}); the call line shows the spinner/check.
+     */
     private List<Row> buildRows(int width) {
         List<Row> out = new ArrayList<>();
         Set<String> done = doneIds();
         Set<String> failed = failedIds();
-        List<LlmToolCall> group = new ArrayList<>();        // a run of consecutive tool calls
         List<ConvoState.Msg> snap = loop().convo().snapshot();
+
+        // Process accumulated between two adjacent spoken messages, in time order. `group` is the
+        // pending run of consecutive tool calls; it's pushed into the interval (closing the run) the
+        // moment a thinking / cognition-note element interleaves, so the timeline order is exact.
+        List<Proc> interval = new ArrayList<>();
+        List<LlmToolCall> group = new ArrayList<>();
+        int intervalStart = -1;                     // snapshot index the interval began at → digest fold key
+
         for (int i = 0; i < snap.size(); i++) {
             switch (snap.get(i)) {
                 case ConvoState.Msg.User u -> {
-                    flushTools(out, group, done, failed, width);
                     if (isCognitiveNote(u.content())) {
-                        // Machine-facing cognition events (region snapshots, landmark events,
-                        // system notices, …) are context for the MODEL — the owner just saw
-                        // walls of raw XML. Fold them into one faint clickable row instead.
-                        addEventRows(out, "events-" + i, u.content(), width);
+                        // Machine-facing cognition events (region snapshots, landmark events, system
+                        // notices, …) are context for the MODEL, not owner speech — they belong to the
+                        // interval's step timeline (system 见闻), not the top-level flow.
+                        if (intervalStart < 0) intervalStart = i;
+                        pushGroup(interval, group);              // close the open tool run (keep time order)
+                        interval.add(new Proc.Events("events-" + i, u.content()));
                     } else {
+                        // Owner speaks → a top-level boundary: seal the interval as a digest, then the message.
+                        pushGroup(interval, group);
+                        emitDigest(out, interval, intervalStart, failed, width);
+                        interval = new ArrayList<>(); intervalStart = -1;
                         wrapPlain(out, u.content(), YOU, width); // user = teal body, no label
-                    }
-                    int nAtt = u.attachments().size();           // muted "N image(s)" note under the text
-                    if (nAtt > 0) {
-                        wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
+                        int nAtt = u.attachments().size();       // muted "N image(s)" note under the text
+                        if (nAtt > 0) {
+                            wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
+                        }
                     }
                 }
                 case ConvoState.Msg.Assistant a -> {
                     AssistantTurn turn = a.turn();
-                    // This assistant message's stored reasoning folds in BEFORE whatever the
-                    // message produced (thinking precedes the tool calls / the spoken reply it
-                    // led to), collapsed by default, keyed by the message's snapshot index.
-                    // Rendered for EVERY reasoned message, not only the ones that also spoke —
-                    // a tool-only turn (content empty, thinking + tool_calls) still thought, and
-                    // that intermediate thinking must not be swallowed. Its fold breaks the
-                    // current tool run so it lands in the right chronological slot.
                     String pastThink = loop().reasoningAt(i);
-                    if (pastThink != null && !pastThink.isBlank()) {
-                        flushTools(out, group, done, failed, width);
-                        addThinkingRows(out, "think-" + i, pastThink, false, width);
-                    }
-                    if (turn.content() != null && !turn.content().isBlank()) {
-                        flushTools(out, group, done, failed, width);   // spoken reply breaks the fold
+                    boolean thought = pastThink != null && !pastThink.isBlank();
+                    boolean spoke = turn.content() != null && !turn.content().isBlank();
+                    if (spoke) {
+                        // Spoken reply → a top-level boundary. Seal the preceding interval, then this
+                        // turn's OWN reasoning stays top-level glued before the reply (a speaking turn's
+                        // thinking is NOT middle-turn process), then the bold name header + body.
+                        pushGroup(interval, group);
+                        emitDigest(out, interval, intervalStart, failed, width);
+                        interval = new ArrayList<>(); intervalStart = -1;
+                        if (thought) addThinkingRows(out, "think-" + i, pastThink, false, width);
                         addHeader(out, name, AI, width);         // bold name header on its OWN line
                         wrapPlain(out, turn.content(), AI, width);
+                    } else if (thought) {
+                        // Tool-only turn that still reasoned → middle-turn thinking: into the interval
+                        // timeline, at its exact chronological slot (before this turn's tool calls).
+                        if (intervalStart < 0) intervalStart = i;
+                        pushGroup(interval, group);
+                        interval.add(new Proc.Think("think-" + i, pastThink));
                     }
-                    group.addAll(turn.toolCalls());
+                    // This turn's tool calls open (or extend) the interval that follows this point.
+                    if (!turn.toolCalls().isEmpty()) {
+                        if (intervalStart < 0) intervalStart = i;
+                        group.addAll(turn.toolCalls());
+                    }
                 }
                 case ConvoState.Msg.Tool ignored -> { /* result drives done/fail, not a row */ }
             }
         }
-        flushTools(out, group, done, failed, width);
+        // Trailing interval = the ACTIVE round (no closing boundary yet) → laid out top-level so the
+        // in-progress tool run and thinking stay live; it folds into a digest once the next message lands.
+        pushGroup(interval, group);
+        layoutActiveInterval(out, interval, done, failed, width);
+
         // Live "thinking" — the current turn's streaming reasoning transcript, shown as a fold:
         // collapsed (default) = ONE row with a live-updating tail preview, so the row count stays
         // stable while streaming; click to expand the full text. Keyed by the snapshot size so each
@@ -1560,6 +1598,80 @@ public final class NumenScreen extends Screen {
             wrapPlain(out, "Say something to " + name + ".", TXT_FAINT, width);
         }
         return out;
+    }
+
+    /** Close the pending tool run into the interval timeline (preserving time order), if non-empty. */
+    private static void pushGroup(List<Proc> interval, List<LlmToolCall> group) {
+        if (!group.isEmpty()) {
+            interval.add(new Proc.Tools(new ArrayList<>(group)));
+            group.clear();
+        }
+    }
+
+    /**
+     * Emit ONE collapsed step-digest row for a completed between-messages interval (mid-layer of the
+     * three-layer model), or — when the user has clicked it open (fold key {@code "digest-"+start}) —
+     * a {@code ▾ N 步} header followed by the interval's step timeline: each tool call as its own
+     * {@link #addToolRow} (itself expandable to args + result), each middle-turn thinking as a
+     * collapsed {@link #addThinkingRows}, each cognition note as a collapsed {@link #addEventRows}.
+     * No-ops on an empty interval (e.g. two adjacent owner messages).
+     */
+    private void emitDigest(List<Row> out, List<Proc> interval, int start, Set<String> failed, int width) {
+        if (interval.isEmpty()) return;
+        String key = "digest-" + (start < 0 ? 0 : start);
+        int steps = 0;
+        boolean hasEvents = false, hasThink = false, anyFail = false;
+        List<String> labels = new ArrayList<>();
+        for (Proc p : interval) {
+            if (p instanceof Proc.Tools t) {
+                for (LlmToolCall tc : t.calls()) {
+                    steps++;
+                    labels.add(ToolLine.label(tc.name(), tc.arguments()));
+                    if (failed.contains(tc.id())) anyFail = true;
+                }
+            } else if (p instanceof Proc.Think) {
+                hasThink = true;
+            } else if (p instanceof Proc.Events) {
+                hasEvents = true;
+            }
+        }
+        if (!expandedGroups.contains(key)) {                      // collapsed: one quiet summary line
+            String suffix = ToolLine.digestSuffix(hasEvents, hasThink);
+            String body = fitOneLine(ToolLine.digestBody(steps, labels), width - 2 - font.width(suffix));
+            int color = anyFail ? FAIL : TOOL;
+            out.add(new Row(colored(body + suffix, color).getVisualOrderText(), color, null, key));
+        } else {                                                  // expanded: header + step timeline
+            String hdr = steps > 0 ? "▾ " + steps + " 步" : "▾ 过程";
+            out.add(new Row(colored(hdr, TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
+            for (Proc p : interval) {
+                if (p instanceof Proc.Tools t) {
+                    for (LlmToolCall tc : t.calls()) addToolRow(out, tc, width);
+                } else if (p instanceof Proc.Think th) {
+                    addThinkingRows(out, th.key(), th.text(), false, width);
+                } else if (p instanceof Proc.Events ev) {
+                    addEventRows(out, ev.key(), ev.text(), width);
+                }
+            }
+        }
+    }
+
+    /**
+     * Lay out the ACTIVE (trailing) interval at top level, unchanged from the pre-v2 behaviour: each
+     * tool run through {@link #flushTools} (live per-tool spinners while running, auto-folding to a
+     * {@code ▸ N 步} summary once done), middle-turn thinking + cognition notes as their own collapsed
+     * folds. Intentionally NOT digested — the user must see the round in progress.
+     */
+    private void layoutActiveInterval(List<Row> out, List<Proc> interval, Set<String> done, Set<String> failed, int width) {
+        for (Proc p : interval) {
+            if (p instanceof Proc.Tools t) {
+                List<LlmToolCall> g = new ArrayList<>(t.calls());
+                flushTools(out, g, done, failed, width);
+            } else if (p instanceof Proc.Think th) {
+                addThinkingRows(out, th.key(), th.text(), false, width);
+            } else if (p instanceof Proc.Events ev) {
+                addEventRows(out, ev.key(), ev.text(), width);
+            }
+        }
     }
 
     /** Emit rows for a run of consecutive tool calls. A single call is always one row. A run of
@@ -1885,6 +1997,19 @@ public final class NumenScreen extends Screen {
     /** A rendered transcript line. {@code toolIds} non-null = a tool row (status icon = spinner/✔/✗).
      *  {@code foldKey} non-null = a clickable fold toggle (the group's first id); both null = plain text. */
     private record Row(FormattedCharSequence text, int color, List<String> toolIds, String foldKey) {}
+
+    /**
+     * One element on a between-messages interval's step timeline, in chronological order — the raw
+     * material a {@linkplain #emitDigest step-digest} aggregates (collapsed) or replays (expanded).
+     * {@code Tools} is a run of consecutive tool calls; {@code Think} is a middle-turn reasoning fold;
+     * {@code Events} is a machine-facing cognition-note (system 见闻). {@code key} carries the fold key
+     * each nested element keeps when the digest is expanded (non-colliding: {@code think-}/{@code events-}).
+     */
+    private sealed interface Proc {
+        record Tools(List<LlmToolCall> calls) implements Proc {}
+        record Think(String key, String text) implements Proc {}
+        record Events(String key, String text) implements Proc {}
+    }
 
     /** A composed-but-unsent image: the source file (copied into the attachments dir on send)
      *  plus its live thumbnail texture and on-screen size. */

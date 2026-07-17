@@ -20,16 +20,16 @@ public final class ToolLine {
     private ToolLine() {}
 
     /**
-     * The model-written {@code d} narration from a tool call's raw args JSON, or
-     * {@code null} when it is absent, blank, or the JSON doesn't parse (e.g. a
+     * The model-written {@code description} narration from a tool call's raw args JSON,
+     * or {@code null} when it is absent, blank, or the JSON doesn't parse (e.g. a
      * still-streaming partial call). Never throws.
      */
     public static String narration(String argsJson) {
         if (argsJson == null || argsJson.isBlank()) return null;
         try {
             JsonObject o = JsonParser.parseString(argsJson).getAsJsonObject();
-            if (o.has("d") && o.get("d").isJsonPrimitive()) {
-                String d = o.get("d").getAsString().trim();
+            if (o.has("description") && o.get("description").isJsonPrimitive()) {
+                String d = o.get("description").getAsString().trim();
                 return d.isEmpty() ? null : d;
             }
         } catch (RuntimeException ignored) {

@@ -222,11 +222,11 @@ public class OpenAIProvider implements LlmProvider {
             props = new JsonObject();
             schema.add("properties", props);
         }
-        if (!props.has("d")) props.add("d", narrationParamSchema());
+        if (!props.has("description")) props.add("description", narrationParamSchema());
         if (!props.has("max_seconds")) props.add("max_seconds", maxSecondsParamSchema());
     }
 
-    /** Schema for the universal {@code d} self-narration parameter. */
+    /** Schema for the universal {@code description} self-narration parameter. */
     static JsonObject narrationParamSchema() {
         JsonObject p = new JsonObject();
         p.addProperty("type", "string");

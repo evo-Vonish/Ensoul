@@ -36,7 +36,16 @@ import net.minecraft.world.phys.Vec3;
  */
 public final class PlayerPathExecutor {
 
-    public enum Status { RUNNING, ARRIVED, NEEDS_REPLAN, FAILED }
+    /**
+     * Tick outcome. {@link #SEGMENT_DONE} is deliberately distinct from {@link #ARRIVED}
+     * (P0-1): a PARTIAL path walked cleanly to its end has finished this SEGMENT — hand off
+     * to the precomputed continuation and keep moving — but has NOT reached the goal, and
+     * must not be charged against the replan budget the way a genuine off-path / cost cancel
+     * ({@link #NEEDS_REPLAN}) is. {@link #ARRIVED} is reserved for a COMPLETE path reaching
+     * its end. Both terminal-arrival states are reported only from the "index past the last
+     * movement" points; every mid-move bail goes through {@link #replan}/{@code NEEDS_REPLAN}.
+     */
+    public enum Status { RUNNING, ARRIVED, SEGMENT_DONE, NEEDS_REPLAN, FAILED }
 
     /** Off-path bands (Baritone MAX_DIST_FROM_PATH 2 / MAX_MAX 3), squared. */
     private static final double SOFT_DIST_SQR =
@@ -105,13 +114,13 @@ public final class PlayerPathExecutor {
 
     public Status tick() {
         if (path.isEmpty() || index >= path.movements.size()) {
-            return path.partial ? Status.NEEDS_REPLAN : Status.ARRIVED;
+            return path.partial ? Status.SEGMENT_DONE : Status.ARRIVED;
         }
 
         Status reloc = relocalize();
         if (reloc != null) return reloc;
         if (index >= path.movements.size()) {
-            return path.partial ? Status.NEEDS_REPLAN : Status.ARRIVED;
+            return path.partial ? Status.SEGMENT_DONE : Status.ARRIVED;
         }
 
         // Baritone sprint-to-next: flow straight through a traverse→sprintable-ascend
@@ -124,7 +133,7 @@ public final class PlayerPathExecutor {
         // A splice/skip can land us at the path end (the overshoot ran to the last move) —
         // re-check arrival before resolving a move, or movements.get(index) would overrun.
         if (index >= path.movements.size()) {
-            return path.partial ? Status.NEEDS_REPLAN : Status.ARRIVED;
+            return path.partial ? Status.SEGMENT_DONE : Status.ARRIVED;
         }
 
         Movement mv = path.movements.get(index);
@@ -142,7 +151,7 @@ public final class PlayerPathExecutor {
             // Don't replan the instant we touch water — let the per-kind drive + buoyancy try to
             // surface first; only a SUSTAINED dunk is genuinely off-plan. Otherwise a fall that
             // clips water replans every tick, each new path again starting underwater.
-            if (++ticksUnderwater > UNDERWATER_GRACE_TICKS) {
+            if (++ticksUnderwater > UNDERWATER_GRACE_TICKS && canReplanNow()) {
                 return replan("underwater off-plan " + ticksUnderwater + " ticks");
             }
         } else {
@@ -157,8 +166,12 @@ public final class PlayerPathExecutor {
         if (reverify != null) return reverify;
 
         ticksOnCurrent++;
-        // Baritone: cancel a movement that overshoots its estimate by movementTimeoutTicks.
-        if (ticksOnCurrent > mv.cost + PathSettings.MOVEMENT_TIMEOUT_TICKS) {
+        // Baritone: cancel a movement that overshoots its estimate by movementTimeoutTicks —
+        // but only once the move is in a cancellable state (P1-5). A bridge whose floor isn't
+        // laid, or an airborne fall, must not be abandoned to the void; the timeout waits for
+        // safeToCancel to open (a genuine dead-end still escapes via its own ungated bail,
+        // e.g. scaffold-place FAILED, or the fall/place completing).
+        if (ticksOnCurrent > mv.cost + PathSettings.MOVEMENT_TIMEOUT_TICKS && canReplanNow()) {
             return replan("movement timeout");
         }
 
@@ -273,26 +286,35 @@ public final class PlayerPathExecutor {
         boolean sprintBase = speed >= 1.0 && !player.isInWater() && !hazardJustPast(mv);
         switch (mv.kind) {
             case TRAVERSE -> {
-                // Baritone MovementTraverse: correct DEPTH before advancing. If our feet
-                // aren't on the destination's Y level (bobbing while swimming across water,
-                // or sunk into a dip), do NOT move forward this tick — only rise (JUMP) if
-                // we're below it; if we've popped ABOVE it, do nothing and let it settle.
-                // Moving forward only happens once we're actually on the lane, which is
-                // what keeps a water-surface crossing stable instead of porpoising.
+                // Baritone MovementTraverse corrects DEPTH before advancing. But a SINGLE-block
+                // Y offset on LAND is the normal transient of a step-up / hop settling (or the
+                // last block dropping onto the lane) — hard-halting on it every such tick is the
+                // P3-12 micro-hitch, and it stutters the P0-1 segment hand-off (whose first move
+                // is often a traverse the body enters mid-stride). So: exactly on the lane, or
+                // within ±1 on land, KEEP advancing (auto-step + gravity close the 1-block gap as
+                // we move, plus a step-up hop when a block low). Only a DEEPER offset, or bobbing
+                // in liquid, halts to correct depth first — that is what keeps a water-surface
+                // crossing stable instead of porpoising.
                 int feetY = feet().getY();
-                if (feetY != mv.dest.getY()) {
-                    InputDriver.halt(player);
-                    // Below the lane → rise. On LAND that's a step-up hop; in LIQUID the
-                    // universal liquid-float jump (in tick()) already does the rising, so
-                    // don't add a second impulse here (our jump() isn't an idempotent flag).
-                    if (feetY < mv.dest.getY()
-                            && player.level().getBlockState(feet()).getFluidState().isEmpty()) {
+                int dy = feetY - mv.dest.getY();
+                boolean feetInLiquid =
+                        !player.level().getBlockState(feet()).getFluidState().isEmpty();
+                if (dy == 0 || (!feetInLiquid && Math.abs(dy) <= 1)) {
+                    // On (or within a settling block of) the lane: advance. Don't sprint across a
+                    // floor we just placed (Baritone wasTheBridgeBlockAlwaysThere).
+                    InputDriver.stepToward(player, dest, sprintBase && mv.toPlace == null);
+                    // A block low on land → add the step-up hop so we climb onto the lane.
+                    if (dy < 0 && !feetInLiquid) {
                         InputDriver.jump(player);
                     }
                 } else {
-                    // On the lane: advance. Don't sprint across a floor we just placed
-                    // (Baritone wasTheBridgeBlockAlwaysThere).
-                    InputDriver.stepToward(player, dest, sprintBase && mv.toPlace == null);
+                    InputDriver.halt(player);
+                    // Below the lane → rise. On LAND that's a step-up hop; in LIQUID the universal
+                    // liquid-float jump (in tick()) already does the rising, so don't add a second
+                    // impulse here (our jump() isn't an idempotent flag).
+                    if (dy < 0 && !feetInLiquid) {
+                        InputDriver.jump(player);
+                    }
                 }
             }
             // Only sprint a diagonal when both cut corners are clear (Baritone sprint() corner check).
@@ -810,14 +832,33 @@ public final class PlayerPathExecutor {
     }
 
     /**
+     * P1-5 replan-safety gate applied to EVERY replan EXIT — relocalize (off-path bands),
+     * underwater, movement-timeout, and the stuck backstop — not just the cost re-verification
+     * {@link #safeToCancel} originally guarded (that was the sole safe-gated exit; the rest
+     * abandoned the move unconditionally). A move that is mid-commit — an airborne fall, a
+     * bridge whose floor isn't laid yet — must not be cancelled, or the body is dropped into
+     * the void / off the ledge. When this is false the triggering watchdog HOLDS its replan
+     * (its counter keeps accruing) until the move reaches a cancellable state; the movement
+     * timeout stays the final backstop, it just waits for {@link #safeToCancel} to open. A
+     * genuine dead-end that can never become cancellable keeps its own ungated escape (the
+     * scaffold-place FAILED → replan, and the FALL/ASCEND "settled once on ground / placed"
+     * clauses so a bad landing or post-place stall can still time out).
+     */
+    private boolean canReplanNow() {
+        return index >= path.movements.size()
+                || safeToCancel(path.movements.get(index));
+    }
+
+    /**
      * Baritone PathExecutor's {@code canCancel = movement.safeToCancel()} gate, mapped
      * to our movement kinds + live body state. A movement that is mid-commit must not
      * be cancelled (replanned) — doing so drops the body off a fall, fails a jump, or
      * strands it mid-bridge. Mirrors each Baritone Movement.safeToCancel override:
      * <ul>
-     *   <li>FALL — safe only before stepping off the edge (still at {@code src});</li>
+     *   <li>FALL — safe before stepping off the edge (still at {@code src}) or once landed
+     *       ({@code onGround}); unsafe only mid-air;</li>
      *   <li>PARKOUR — only on the takeoff (0th) tick, no momentum knowledge after;</li>
-     *   <li>ASCEND — not while a step block was just placed;</li>
+     *   <li>ASCEND — unsafe only while actively placing the step block; safe once it's placed;</li>
      *   <li>TRAVERSE — a sneak-bridge over air can't be abandoned until its floor exists;</li>
      *   <li>others (DIAGONAL/DESCEND/PILLAR/DIG_DOWN) — base {@code true}.</li>
      * </ul>
@@ -825,13 +866,25 @@ public final class PlayerPathExecutor {
     private boolean safeToCancel(Movement mv) {
         switch (mv.kind) {
             case FALL:
-                return feet().equals(mv.src);
+                // Safe before committing off the edge (still at src) OR once we've landed
+                // (onGround) — mid-air the drop is physically committed and cancelling would
+                // strand the body, but a completed drop is a settled state a replan may cancel
+                // from. The onGround clause matters now that P1-5 also gates the OFF-PATH exits:
+                // without it a fall that lands off its planned column is "unsafe" forever and
+                // could never replan out of a bad landing → wedge.
+                return feet().equals(mv.src) || player.onGround();
             case PARKOUR:
                 return ticksOnCurrent == 0;
             case ASCEND:
-                // Baritone: unsafe once we've STARTED placing the step block
-                // (ticksWithoutPlacement>0) — for us, once the place maneuver began or finished.
-                return mv.toPlace == null || (placeManeuver == null && !placedThisMove);
+                // Unsafe only while ACTIVELY placing the step block (mid-place, floor not yet
+                // down) — Baritone gates on ticksWithoutPlacement>0. We additionally treat a
+                // FINISHED placement (block now walkable) as settled: the body stands on solid
+                // ground at src, so a post-place hop-stall can still time out under the P1-5
+                // gate instead of wedging (the middle clause alone stays false forever once
+                // placedThisMove flips true).
+                return mv.toPlace == null
+                        || (placeManeuver == null && !placedThisMove)
+                        || BlockHelper.canWalkOn(player.level(), mv.toPlace);
             case TRAVERSE:
                 return mv.toPlace == null
                         || BlockHelper.canWalkOn(player.level(), mv.dest.below());
@@ -952,7 +1005,19 @@ public final class PlayerPathExecutor {
             int dz = mv.dest.getZ() - mv.src.getZ();
             return feet.equals(mv.dest.offset(dx, 0, dz));
         }
-        // DIAGONAL (Baritone: feet==dest only, no overshoot), DIG_DOWN, PARKOUR.
+        if (mv.kind == Movement.Kind.DIAGONAL) {
+            // Baritone declares a diagonal done only at feet==dest, but a SPRINTED diagonal
+            // routinely carries the body one cell past dest along the move axis; without an
+            // overshoot tolerance it never reads "arrived", faceYaw snaps hard back to dest,
+            // and the body bangs back and forth across the boundary (P1-3). Count the one-cell
+            // diagonal overshoot as arrived (mirrors the TRAVERSE overshoot tolerance, and the
+            // matching cell is anchored in the move's validPositions).
+            if (feet.equals(mv.dest)) return true;
+            int dx = Integer.signum(mv.dest.getX() - mv.src.getX());
+            int dz = Integer.signum(mv.dest.getZ() - mv.src.getZ());
+            return feet.equals(mv.dest.offset(dx, 0, dz));
+        }
+        // DIG_DOWN, PARKOUR: feet==dest only.
         return feet.equals(mv.dest);
     }
 
@@ -984,22 +1049,31 @@ public final class PlayerPathExecutor {
             ticksAway = 0;
             return null;
         }
-        // Backward (Baritone PathExecutor.onTick): lagged / pushed back — scan earlier
-        // movements FROM THE START and take the FIRST (earliest) whose valid cells hold us.
-        for (int i = 0; i < index; i++) {
-            if (path.movements.get(i).validPositions().contains(feet)) {
-                jumpToIndex(i);
-                return null;
-            }
-        }
-        // Forward skip +3: a movement signals its own completion (e.g. sneak-place),
-        // so +1/+2 are deliberately skipped (Baritone PathExecutor).
+        // Resync to the movement whose valid cells hold us that is CLOSEST in path order to
+        // where we think we are (P2-9). The old rule snapped BACKWARD to the EARLIEST match
+        // and only then looked forward — but DESCEND/FALL landing boxes overlap between
+        // segments, so "earliest" teleports the index to a far-back segment and it thrashes.
+        // Take the least path-order distance instead. Backward matches snap to i (lagged /
+        // pushed back); forward matches snap to i-1 (a move self-signals its completion, so
+        // +1/+2 are deliberately skipped — Baritone PathExecutor). NB the backward scan runs
+        // from index-1 DOWNWARD, so its first hit is the NEAREST earlier move, not the earliest.
         int last = path.movements.size() - 1;
+        int backIdx = -1;
+        for (int i = index - 1; i >= 0; i--) {
+            if (path.movements.get(i).validPositions().contains(feet)) { backIdx = i; break; }
+        }
+        int fwdIdx = -1;
         for (int i = index + 3; i <= last; i++) {
-            if (path.movements.get(i).validPositions().contains(feet)) {
-                jumpToIndex(i - 1);
-                return null;
-            }
+            if (path.movements.get(i).validPositions().contains(feet)) { fwdIdx = i; break; }
+        }
+        if (backIdx >= 0 || fwdIdx >= 0) {
+            // Compare the RESULTING index's path-order distance (forward resolves to fwdIdx-1);
+            // ties favour the backward snap, preserving Baritone's lagged-detection priority.
+            int backDist = (backIdx >= 0) ? index - backIdx : Integer.MAX_VALUE;
+            int fwdDist = (fwdIdx >= 0) ? (fwdIdx - 1) - index : Integer.MAX_VALUE;
+            if (fwdDist < backDist) jumpToIndex(fwdIdx - 1);
+            else jumpToIndex(backIdx);
+            return null;
         }
         // Off-path watchdog (Baritone PathExecutor.onTick + closestPathPos): distance to the
         // closest valid cell of the WHOLE path — not just the current movement — so the body
@@ -1012,15 +1086,20 @@ public final class PlayerPathExecutor {
                 if (d < bestSq) bestSq = d;
             }
         }
-        // Soft band first (matches Baritone's order), then the immediate hard band.
+        // Soft band first (matches Baritone's order), then the immediate hard band. Both are
+        // gated by canReplanNow (P1-5): the ticksAway counter keeps accruing while the move is
+        // mid-commit (so it fires the instant the move becomes cancellable), but we never
+        // abandon an airborne / bridging move to the void just because we drifted off the line
+        // — a fall that landed off-path becomes cancellable via safeToCancel(FALL)'s onGround
+        // clause the tick it touches down.
         if (possiblyOffPath(cur, bestSq, SOFT_DIST_SQR)) {
-            if (++ticksAway > PathSettings.MAX_TICKS_AWAY) {
+            if (++ticksAway > PathSettings.MAX_TICKS_AWAY && canReplanNow()) {
                 return replan("off-path soft band " + PathSettings.MAX_TICKS_AWAY + " ticks");
             }
         } else {
             ticksAway = 0;
         }
-        if (possiblyOffPath(cur, bestSq, HARD_DIST_SQR)) {
+        if (possiblyOffPath(cur, bestSq, HARD_DIST_SQR) && canReplanNow()) {
             return replan("off-path hard band (>3 blocks)");
         }
         return null;
@@ -1093,7 +1172,8 @@ public final class PlayerPathExecutor {
             Constants.LOG.warn("[numen-path] STUCK no forward progress {} ticks | {}",
                     ticksSinceProgress, desc(mv));
         }
-        if (ticksSinceProgress >= STUCK_REPLAN_TICKS && ticksOnCurrent < STUCK_WARN_TICKS) {
+        if (ticksSinceProgress >= STUCK_REPLAN_TICKS && ticksOnCurrent < STUCK_WARN_TICKS
+                && canReplanNow()) {
             return replan("no net progress " + ticksSinceProgress + " ticks (index thrash)");
         }
         return null;

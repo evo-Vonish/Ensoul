@@ -137,22 +137,24 @@ public final class PlayerNav {
         switch (current.tick()) {
             case RUNNING -> { return Status.RUNNING; }
             case ARRIVED -> {
+                // A COMPLETE path reached its end. A complete path is never precomputed
+                // (precompute is partial-only), so this resolves to a budgeted fresh search
+                // only when the goal predicate still isn't satisfied (goal moved, or the
+                // arrival check is stricter than the path end) — a genuine replan.
                 replans = 0;
-                if (reached.getAsBoolean()) return Status.ARRIVED;
-                if (pendingNext != null) {
-                    // Hand off to the precomputed segment WITHOUT halting — calling
-                    // current.stop() zeroes the inputs for a tick and causes a visible
-                    // hitch at every segment boundary. pendingNext takes over the
-                    // inputs on its first tick, so motion stays continuous.
-                    current = pendingNext;
-                    pendingNext = null;
-                    if (pendingPathForViz != null) {
-                        publishViz(pendingPathForViz);
-                        pendingPathForViz = null;
-                    }
-                    return Status.RUNNING;
-                }
-                return restartFresh(true);
+                return handoffOrRestart(true);
+            }
+            case SEGMENT_DONE -> {
+                // P0-1: a PARTIAL segment was walked cleanly to its end — normal forward
+                // progression, NOT a replan. Hand off to the precomputed continuation without
+                // halting (seamless, identical to an arrival hand-off, so motion stays
+                // continuous), or — if the precompute isn't ready yet — start the next search
+                // fresh but DON'T charge it against the replan budget. The old code returned
+                // NEEDS_REPLAN at every partial-segment boundary, which discarded the ready
+                // precompute (re-running the same search) AND inflated replans until a long,
+                // legitimately-multi-segment journey falsely "gave up after MAX_REPLANS".
+                replans = 0;
+                return handoffOrRestart(false);
             }
             case NEEDS_REPLAN -> {
                 discardPrecompute();
@@ -163,6 +165,31 @@ public final class PlayerNav {
             }
         }
         return Status.RUNNING;
+    }
+
+    /**
+     * Shared tail for a segment/path end (P0-1). Goal reached → ARRIVED; else hand off to the
+     * precomputed continuation WITHOUT halting — calling {@code current.stop()} zeroes the
+     * inputs for a tick and hitches at every boundary; pendingNext takes over the inputs on its
+     * first tick, so motion stays continuous; else cancel any still-in-flight precompute and
+     * start the next search fresh. {@code budgeted} charges that fresh search against the replan
+     * budget: {@code true} for a complete-path re-search (the goal wasn't actually satisfied),
+     * {@code false} for normal partial-segment progression (segment completion is progress, not
+     * a failure — a runaway is bounded by the task-level deadline, not the replan cap).
+     */
+    private Status handoffOrRestart(boolean budgeted) {
+        if (reached.getAsBoolean()) return Status.ARRIVED;
+        if (pendingNext != null) {
+            current = pendingNext;
+            pendingNext = null;
+            if (pendingPathForViz != null) {
+                publishViz(pendingPathForViz);
+                pendingPathForViz = null;
+            }
+            return Status.RUNNING;
+        }
+        discardPrecompute();   // no continuation ready — drop any stale in-flight one, then re-search
+        return restartFresh(budgeted);
     }
 
     /** Frozen context for a SEARCH — snapshot inventory + an immutable loaded-chunk view, safe to read

@@ -1742,9 +1742,11 @@ public final class NumenScreen extends Screen {
     }
 
     /** Root tags of machine-facing cognition notes (world-cognition events, corrective
-     *  notices, inference ledger) that ride user-role messages. */
+     *  notices, inference ledger) that ride user-role messages. {@code system-reminder} is
+     *  the constitution's injection envelope — its kind attribute (context_snapshot etc.)
+     *  varies, but the wrapper tag itself marks machine-facing content. */
     private static final java.util.regex.Pattern EVENT_ROOT = java.util.regex.Pattern.compile(
-            "<(event|region_snapshot|region_diff|landmark_event|system_notice|inference|context_snapshot)\\b");
+            "<(event|region_snapshot|region_diff|landmark_event|system_notice|inference|context_snapshot|system-reminder)\\b");
 
     /** True when a user-role message is machine-facing cognition XML (and only that) —
      *  owner prompts are plain text; mixed messages stay fully visible to be safe. */

@@ -57,8 +57,19 @@ public record TaskResult(boolean success,
         return new TaskResult(false, message, true, false, Map.of());
     }
 
+    /** Timeout that KEEPS the structured payload — the plain factory drops it, which
+     *  starves the LLM of progress data exactly on the branches that need it most. */
+    public static TaskResult timeout(String message, Map<String, Object> data) {
+        return new TaskResult(false, message, true, false, data);
+    }
+
     public static TaskResult cancelled(String message) {
         return new TaskResult(false, message, false, true, Map.of());
+    }
+
+    /** Cancellation that KEEPS the structured payload (see {@link #timeout(String, Map)}). */
+    public static TaskResult cancelled(String message, Map<String, Object> data) {
+        return new TaskResult(false, message, false, true, data);
     }
 
     /**

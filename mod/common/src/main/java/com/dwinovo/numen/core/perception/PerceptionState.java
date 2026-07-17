@@ -116,6 +116,17 @@ final class PerceptionState {
      */
     float reflexLastHitDamage;
 
+    // Reflex 2 (v4): threat-triggered assessment (刀①) — arm an engagement assessment on proximity, not just on
+    // a landed hit or HP<40%. Refreshed only on the idle proximity-scan cadence, so it's a null-check per tick.
+    /** Nearest hostile remembered by the idle proximity scan (arms the assessment before the first hit); null = none. */
+    Entity reflexNearHostile;
+
+    // Reflex 2 (v4): turtle-up (刀③) — the CORNERED escape hatch.
+    /** Game time the next turtle-up is allowed (600t between burrows); persists across episodes (anti-abuse). */
+    long reflexTurtleCooldownUntil;
+    /** True once this critical episode has already turtled (one per episode); reset when the episode ends. */
+    boolean reflexTurtledThisEpisode;
+
     // Reflex 3 (v2): creeper panic sprint — HP-independent, pre-explosion (the looting one-shot death).
     /**
      * Nearest creeper remembered by the 20t proximity scan; null = none nearby. Gates the per-tick

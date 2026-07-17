@@ -112,7 +112,9 @@ public final class CompanionTickDispatcher {
         } else if (running.record().getState() == TaskState.RUNNING) {
             if (player.level().getGameTime() >= running.record().getDeadlineGameTime()) {
                 running.record().setState(TaskState.TIMEOUT);
-            } else {
+            } else if (!com.dwinovo.numen.core.perception.Reflexes.ownsBody(player)) {
+                // 身体仲裁 (刀②): while a survival reflex drives the body (flee-nav / turtle / creeper sprint /
+                // drowning / fire-lava) the task yields — its navigator must not fight the reflex for the inputs.
                 running.record().setState(running.task().tick());
             }
         }

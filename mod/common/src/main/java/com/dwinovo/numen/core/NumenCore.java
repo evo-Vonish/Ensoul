@@ -158,6 +158,11 @@ public final class NumenCore {
         ToolRegistry.register(new com.dwinovo.numen.core.tools.PillarUpTool());
         ToolRegistry.register(new com.dwinovo.numen.core.tools.BridgeToTool());
         ToolRegistry.register(new com.dwinovo.numen.core.tools.EscapeToSurfaceTool());
+
+        // Survival-closure v2 (刀③): turtle_up — burrow + cap + hunker down, the brain-orderable face of the
+        // TurtleDrive muscle the reflex layer also fires for a CORNERED companion. Appended LAST so all prior
+        // tool ordering — and prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.TurtleUpTool());
     }
 
 
@@ -185,5 +190,9 @@ public final class NumenCore {
                 (p, r) -> new com.dwinovo.numen.core.task.BridgeToCompanionTask(p, r));
         CompanionTaskFactory.register(com.dwinovo.numen.core.task.EscapeToSurfaceTaskRecord.class,
                 (p, r) -> new com.dwinovo.numen.core.task.EscapeToSurfaceCompanionTask(p, r));
+
+        // Survival-closure v2 (刀③): the turtle_up muscle's task runner.
+        CompanionTaskFactory.register(com.dwinovo.numen.core.task.TurtleUpTaskRecord.class,
+                (p, r) -> new com.dwinovo.numen.core.task.TurtleUpCompanionTask(p, r));
     }
 }

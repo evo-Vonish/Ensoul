@@ -77,12 +77,27 @@ public final class LandmarkStore {
     /** Dimension assumed for entries migrated from the old {@code .blocks.json} (which had none). */
     private static final String MIGRATION_DIM = "minecraft:overworld";
 
+    /**
+     * Synthetic {@code kind} for an owner-named waypoint created via {@link #rememberPlace} at a coordinate
+     * that holds no tracked station — a pure semantic marker ("我的主基地"), not a block-presence claim. It is
+     * deliberately NOT a {@link #TRACKED_TYPES} path, so {@link #verify} keeps it on faith instead of "confirming
+     * it gone" (there is no block there to confirm). Naming an <em>existing</em> tracked landmark keeps that
+     * landmark's real block kind.
+     */
+    private static final String PLACE_KIND = "numen:place";
+
+    /** Default category for a new named waypoint when the owner supplies none. */
+    private static final String PLACE_CATEGORY = "place";
+
     /** The kind of semantic change an event represents. */
     public enum ChangeType { ADDED, REMOVED, RENAMED, REPURPOSED, POSITION_CORRECTED }
 
     /** An append-only, immutable statement of a semantic change to a landmark. */
     public record LandmarkEvent(ChangeType type, String id, String kind, String dim,
                                 int x, int y, int z, String label) {}
+
+    /** Outcome of {@link #rememberPlace}: the landmark id, and whether it was newly created (vs. an update). */
+    public record NamingResult(String id, boolean created) {}
 
     /** Mutable canonical record for one landmark. Metadata timestamps are wall-clock millis. */
     public static final class Entry {
@@ -197,6 +212,7 @@ public final class LandmarkStore {
         while (it.hasNext()) {
             Entry e = it.next().getValue();
             if (!currentDim.equals(e.dim)) continue;          // different dimension — can't verify here
+            if (!isTracked(pathOf(e.kind))) continue;         // owner-named waypoint (no tracked block) — kept on faith
             BlockPos pos = BlockPos.of(e.pos);
             if (!level.hasChunkAt(pos)) continue;             // unloaded — keep on faith (test #6)
             String actual = BuiltInRegistries.BLOCK
@@ -245,6 +261,113 @@ public final class LandmarkStore {
                 sb.append("\n  ").append(e.id).append(' ').append(e.kind)
                   .append(" (").append(p.getX()).append(',').append(p.getY()).append(',').append(p.getZ()).append(')');
                 if (e.label != null && !e.label.isBlank()) sb.append(" \"").append(e.label).append('"');
+            }
+        }
+        return sb.toString();
+    }
+
+    // ---- explicit naming (Wave D: remember_place / forget_place / recall_places) ----
+
+    /**
+     * Owner-driven naming: give the landmark at {@code (pos, dim)} a {@code label} (and optional
+     * {@code category}/{@code note}), <em>reusing the existing event + persistence machinery</em>:
+     * <ul>
+     *   <li>a landmark already at that coordinate (e.g. a furnace the passive harvest remembered) is
+     *       <b>renamed/annotated in place</b> — its real block {@code kind} is kept, label/category/note
+     *       updated, and a {@link ChangeType#RENAMED} event queued;</li>
+     *   <li>a fresh coordinate becomes a new labeled waypoint ({@link #PLACE_KIND}); since it carries a
+     *       label it is exempt from the unlabeled cap, and an {@link ChangeType#ADDED} event is queued.</li>
+     * </ul>
+     * The queued event drains through {@link #drainEvents()} → {@code LandmarkEventEmitter} exactly like a
+     * passively-harvested change. {@code label} must be non-blank (validated by the caller). Main thread only.
+     */
+    public NamingResult rememberPlace(BlockPos pos, String dim, String label, String category, String note) {
+        if (dim == null || dim.isBlank()) dim = MIGRATION_DIM;
+        long now = System.currentTimeMillis();
+        String posKey = posKey(dim, pos.asLong());
+        String existingId = posIndex.get(posKey);
+        if (existingId != null) {
+            Entry e = byId.get(existingId);
+            e.label = label;
+            if (category != null && !category.isBlank()) e.category = category;
+            if (note != null) e.note = note;
+            e.lastUsedAt = now;
+            e.lastVerified = now;
+            pending.add(new LandmarkEvent(ChangeType.RENAMED, e.id, e.kind, e.dim,
+                    pos.getX(), pos.getY(), pos.getZ(), e.label));
+            Constants.LOG.info("[numen-landmark] named {} \"{}\" at {},{},{} ({})",
+                    e.id, label, pos.getX(), pos.getY(), pos.getZ(), dim);
+            save();
+            return new NamingResult(e.id, false);
+        }
+        Entry e = new Entry();
+        e.id = "lm_" + String.format("%03d", nextId++);
+        e.kind = PLACE_KIND;
+        e.pos = pos.asLong();
+        e.dim = dim;
+        e.label = label;
+        e.category = (category != null && !category.isBlank()) ? category : PLACE_CATEGORY;
+        e.note = note;
+        e.firstSeen = now;
+        e.lastUsedAt = now;
+        e.lastVerified = now;
+        byId.put(e.id, e);
+        posIndex.put(posKey, e.id);
+        pending.add(new LandmarkEvent(ChangeType.ADDED, e.id, e.kind, e.dim,
+                pos.getX(), pos.getY(), pos.getZ(), e.label));
+        Constants.LOG.info("[numen-landmark] new named place {} \"{}\" at {},{},{} ({})",
+                e.id, label, pos.getX(), pos.getY(), pos.getZ(), dim);
+        save();
+        return new NamingResult(e.id, true);
+    }
+
+    /**
+     * Explicitly forget a landmark by its {@code lm_xxx} id or (case-insensitively) its label. Queues a
+     * {@link ChangeType#REMOVED} event and drops the entry, reusing the same emit/persist path as a
+     * world-confirmed removal. Returns the removed entry's id, or {@code null} if nothing matched.
+     * Main thread only.
+     */
+    public String forgetPlace(String idOrLabel) {
+        if (idOrLabel == null || idOrLabel.isBlank()) return null;
+        String needle = idOrLabel.strip();
+        Entry match = byId.get(needle);                       // exact id first
+        if (match == null) {
+            for (Entry e : byId.values()) {                   // else first label match (case-insensitive)
+                if (e.label != null && e.label.equalsIgnoreCase(needle)) { match = e; break; }
+            }
+        }
+        if (match == null) return null;
+        BlockPos p = BlockPos.of(match.pos);
+        pending.add(new LandmarkEvent(ChangeType.REMOVED, match.id, match.kind, match.dim,
+                p.getX(), p.getY(), p.getZ(), match.label));
+        byId.remove(match.id);
+        posIndex.remove(posKey(match.dim, match.pos));
+        Constants.LOG.info("[numen-landmark] forgot {} \"{}\"", match.id, match.label);
+        save();
+        return match.id;
+    }
+
+    /**
+     * Render the full current landmark list for the {@code recall_places} tool — richer than
+     * {@link #renderSnapshotBody} (adds category and note), grouped by dimension in stable insertion order.
+     * Empty string when nothing is known (the tool phrases that itself). Read-only.
+     */
+    public String listPlaces() {
+        if (byId.isEmpty()) return "";
+        LinkedHashMap<String, List<Entry>> byDim = new LinkedHashMap<>();
+        for (Entry e : byId.values()) {
+            byDim.computeIfAbsent(e.dim, k -> new ArrayList<>()).add(e);
+        }
+        StringBuilder sb = new StringBuilder("已知地标(按维度分组):");
+        for (Map.Entry<String, List<Entry>> de : byDim.entrySet()) {
+            sb.append("\n[").append(de.getKey()).append("]");
+            for (Entry e : de.getValue()) {
+                BlockPos p = BlockPos.of(e.pos);
+                sb.append("\n  ").append(e.id).append(' ').append(e.kind)
+                  .append(" (").append(p.getX()).append(',').append(p.getY()).append(',').append(p.getZ()).append(')');
+                if (e.label != null && !e.label.isBlank()) sb.append(" \"").append(e.label).append('"');
+                if (e.category != null && !e.category.isBlank()) sb.append(" [").append(e.category).append(']');
+                if (e.note != null && !e.note.isBlank()) sb.append(" — ").append(e.note);
             }
         }
         return sb.toString();

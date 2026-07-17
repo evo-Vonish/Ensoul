@@ -1,6 +1,7 @@
 package com.dwinovo.numen.core.perception;
 
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -136,4 +137,37 @@ final class PerceptionState {
     Entity reflexCreeper;
     /** Creeper-sprint deadline (≤ now+40t) while sprinting away from a creeper; 0 = not creeper-fleeing. */
     long reflexCreeperFleeUntil;
+
+    // ---- read-only threat view for the attention brain (core.look) — derives, never writes ----
+
+    /**
+     * How long after the last hit / sighting an attacker still counts as an "active" look-back threat.
+     * Mirrors {@link Reflexes}' own {@code ATTACKER_GONE_TICKS} gone-timer so a long-finished engagement
+     * stops pulling the gaze back (a creeper ref needs no such window — the 20t reflex scan nulls it the
+     * moment the creeper leaves).
+     */
+    private static final long THREAT_ATTACKER_RECENT_TICKS = 100L;
+
+    /**
+     * The eye-height world point of the threat the reflex layer is currently tracking — creeper first (the
+     * more urgent thing to keep an eye on), then a recently-seen living attacker — or {@code null} when no
+     * threat is live. This is a pure read-only <em>derivation</em> over the existing reflex refs
+     * ({@link #reflexCreeper}, {@link #reflexAttacker}, {@link #reflexAttackerSeenTick}) that {@link Reflexes}
+     * already maintains: it reads what the spinal cord wrote and never writes anything itself. {@code now} is
+     * the current game time, used only to age out a stale attacker. Server-thread only, like the rest of this
+     * state. Consumed via {@link Perceptions#activeThreatEyePos(com.dwinovo.numen.entity.NumenPlayer)} so the
+     * look brain (a different package) can glance back at danger without reaching into these fields directly.
+     */
+    Vec3 activeThreatEyePos(long now) {
+        Entity c = reflexCreeper;
+        if (c != null && c.isAlive() && !c.isRemoved()) {
+            return c.getEyePosition();
+        }
+        Entity a = reflexAttacker;
+        if (a != null && a.isAlive() && !a.isRemoved()
+                && (now - reflexAttackerSeenTick) <= THREAT_ATTACKER_RECENT_TICKS) {
+            return a.getEyePosition();
+        }
+        return null;
+    }
 }

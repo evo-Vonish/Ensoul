@@ -130,6 +130,13 @@ public final class CompanionTickDispatcher {
             }
         }
 
+        // Idle-autonomy L3 (sleepwalk layer, lowest priority): self-gates on reflex body
+        // ownership / brain turn in flight, and we hand it the dispatcher's own ground truth
+        // about an active task, so it acts only when nobody else is driving. It runs after
+        // the completion block so a task that just finished frees the body this same tick.
+        // See docs/idle-autonomy-L3.md.
+        com.dwinovo.numen.core.autonomy.AutonomyScheduler.tick(player, ACTIVE.containsKey(id));
+
         drainResults(player);
     }
 

@@ -83,4 +83,14 @@ public final class LookTunables {
     /** A look intent from the brain is considered stale after this many ticks with no refresh, after
      *  which the head relaxes back toward the body. The brain refreshes every tick it wants a gaze. */
     public static final int INTENT_TTL_TICKS = 5;
+    /**
+     * After a GUI-engagement write ({@code markEngaged} — the tool pack marks this every tick a
+     * container menu is open: a station's GUI, a villager trade), the controller holds the engaged
+     * posture — squared up to the target, body planted — for this many ticks past the last refresh.
+     * A short latch so a one-tick gap (the LLM thinking between tool calls, a dispatcher hiccup)
+     * can't drop the pose mid-session; the moment the menu truly closes the pack stops refreshing
+     * and attention naturally returns within this window. (Priority ladder: engaged outranks idle
+     * attention and locomotion, and yields only to a hard-aim snap.)
+     */
+    public static final int ENGAGED_HOLD_TICKS = 3;
 }

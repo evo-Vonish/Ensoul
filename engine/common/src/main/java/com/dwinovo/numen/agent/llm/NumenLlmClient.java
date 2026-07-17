@@ -1,0 +1,496 @@
+package com.dwinovo.numen.agent.llm;
+
+import com.dwinovo.numen.Constants;
+import com.dwinovo.numen.agent.http.HttpLlmTransport;
+import com.dwinovo.numen.agent.provider.AssistantTurn;
+import com.dwinovo.numen.agent.provider.DashScopeProvider;
+import com.dwinovo.numen.agent.provider.DeepSeekProvider;
+import com.dwinovo.numen.agent.provider.LlmProvider;
+import com.dwinovo.numen.agent.provider.LlmToolCall;
+import com.dwinovo.numen.agent.provider.MinimaxProvider;
+import com.dwinovo.numen.agent.provider.MoonshotProvider;
+import com.dwinovo.numen.agent.provider.OpenAIProvider;
+import com.dwinovo.numen.agent.provider.StreamAccumulator;
+import com.dwinovo.numen.agent.provider.VolcengineProvider;
+import com.dwinovo.numen.agent.tool.NumenTool;
+import com.dwinovo.numen.platform.Services;
+import com.dwinovo.numen.platform.services.INumenConfig;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+
+/**
+ * Mod-global LLM client (client-side singleton). Wraps {@link HttpLlmTransport}
+ * + a configured {@link LlmProvider}; SSE streaming is the default so
+ * users see token-by-token progress in logs (and, in the future, in a
+ * chat bubble above the entity).
+ *
+ * <h2>Streaming flow</h2>
+ * <ol>
+ *   <li>{@link #chatStreaming} builds the request body via the provider,
+ *       sets {@code stream:true} + {@code stream_options.include_usage:true},
+ *       and dispatches to {@link HttpLlmTransport#postSse}.</li>
+ *   <li>For each SSE chunk, the provider's {@code accumulateChunk} updates
+ *       a per-call {@link StreamAccumulator}.</li>
+ *   <li>When the stream terminates, {@code finalizeStream} produces an
+ *       {@link AssistantTurn}; the future completes with it.</li>
+ *   <li>Token usage and finish reason emitted as an INFO log line.</li>
+ * </ol>
+ *
+ * <h2>Per-call request id</h2>
+ * The transport tags every request with a short {@code lr-N} id used in
+ * every related log line; users can grep one ID through the whole chain
+ * (HTTP → provider → agent loop) when debugging.
+ */
+public final class NumenLlmClient {
+
+    /** Suffix appended to base URLs that don't already end with it. */
+    private static final String CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
+
+    private static volatile NumenLlmClient instance;
+
+    private final HttpLlmTransport transport;
+    private final LlmProvider provider;
+    private final String fullUrl;
+    private final String apiKey;
+    private final String model;
+    /** Configured reasoning-effort knob, forwarded to the provider's {@code applyReasoning}. */
+    private final String reasoningEffort;
+
+    private NumenLlmClient(INumenConfig config) {
+        this.provider = pickProvider(config.getProvider());
+        String siteBase = com.dwinovo.numen.agent.model.ModelRegistry.baseUrl(config.getProvider());
+        this.fullUrl = composeUrl(config.getBaseUrl(), siteBase, provider);
+        this.apiKey = config.getApiKey();
+        this.transport = new HttpLlmTransport(config.getProxy(),
+                com.dwinovo.numen.agent.model.ModelRegistry.headers(config.getProvider()));
+        String configured = config.getModel();
+        this.model = (configured == null || configured.isBlank()) ? "gpt-5.4-mini" : configured;
+        this.reasoningEffort = config.getReasoningEffort();
+        Constants.LOG.info("[numen-llm] client initialised: provider={}, model={}, url={}, streaming={}",
+                provider.name(), model, fullUrl, provider.supportsStreaming());
+    }
+
+    /**
+     * Compose the chat completions URL. Base URL precedence: an explicit per-config override wins;
+     * else the site's registered base URL (from {@code numen_models.json} — so "+ add site" URLs and
+     * adapter-less sites like Gemini/Grok actually take effect); else the adapter's hard-coded default.
+     * Then, LiteLLM-style: trim a trailing slash and append {@code /chat/completions} if absent.
+     */
+    private static String composeUrl(String userBase, String siteBase, LlmProvider provider) {
+        String base = nonBlank(userBase) ? userBase
+                : nonBlank(siteBase) ? siteBase
+                : provider.defaultBaseUrl();
+        if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
+        if (base.endsWith(CHAT_COMPLETIONS_SUFFIX)) return base;
+        return base + CHAT_COMPLETIONS_SUFFIX;
+    }
+
+    public static NumenLlmClient instance() {
+        NumenLlmClient local = instance;
+        if (local != null) return local;
+        synchronized (NumenLlmClient.class) {
+            if (instance == null) {
+                instance = new NumenLlmClient(Services.CONFIG);
+            }
+            return instance;
+        }
+    }
+
+    public static boolean isConfigured() {
+        String key = Services.CONFIG.getApiKey();
+        return key != null && !key.isBlank();
+    }
+
+    /**
+     * Invalidate the cached singleton so the next {@link #instance()} call
+     * rebuilds from fresh config. Called by the settings GUI after the
+     * user changes provider / API key / model / base URL — lets players
+     * switch backends without restarting the game.
+     *
+     * <p>In-flight requests on the old instance complete with the old
+     * credentials (we don't try to cancel them); only subsequent calls
+     * see the new config. Per-entity {@code ConvoState} is unaffected, so
+     * conversations continue with the new backend.
+     */
+    public static void reset() {
+        synchronized (NumenLlmClient.class) {
+            if (instance != null) {
+                Constants.LOG.info("[numen-llm] resetting client (next call will rebuild from current config)");
+            }
+            instance = null;
+        }
+    }
+
+    /**
+     * Final turn plus the usage the backend reported for it. {@code promptTokens}
+     * is the request's true context size as the API counted it — the signal the
+     * agent loop's auto-compaction triggers on (no client-side token estimation
+     * needed). Zero when the backend sent no usage frame.
+     *
+     * <p>{@code cachedTokens} is the provider-reported prompt-cache hit for this
+     * request ({@code usage.prompt_tokens_details.cached_tokens}, or DeepSeek's
+     * {@code prompt_cache_hit_tokens}); {@code -1} when the provider reported no
+     * cache detail — unknown is NOT the same as a miss. This is the supplier-side
+     * audit of the context constitution: a byte-frozen prefix that stops hitting
+     * the cache shows up here first.
+     */
+    public record ChatResult(AssistantTurn turn, int promptTokens, int totalTokens, int cachedTokens) {}
+
+    // ---- wire capture (context export diagnostics) ----
+
+    /** One captured outbound request: the exact serialized wire body + its prompt-prefix hash. */
+    public record WireCapture(String body, String prefixHash, long capturedAt) {}
+
+    /**
+     * Last request body actually sent, per companion — transient diagnostics read by the
+     * context exporter ({@code ContextExporter}). Static so it survives {@link #reset()};
+     * never persisted; overwritten on every dispatch.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, WireCapture> LAST_WIRE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The last captured outbound request for {@code companion}, or null when none yet. */
+    public static WireCapture lastWire(java.util.UUID companion) {
+        return companion == null ? null : LAST_WIRE.get(companion);
+    }
+
+    /**
+     * Streaming chat completion at the configured reasoning effort. Convenience
+     * overload — delegates to {@link #chatStreaming(List, Collection, String, String,
+     * Consumer, Consumer)} with no per-call effort override (falls back to config).
+     */
+    public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
+                                                       Collection<NumenTool> tools,
+                                                       String systemPrompt,
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
+        return chatStreaming(null, messages, tools, systemPrompt, null, onChunk, onReasoning);
+    }
+
+    /** Overload without companion attribution — no wire capture for the context exporter. */
+    public CompletableFuture<ChatResult> chatStreaming(List<ConvoState.Msg> messages,
+                                                       Collection<NumenTool> tools,
+                                                       String systemPrompt,
+                                                       String effortOverride,
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
+        return chatStreaming(null, messages, tools, systemPrompt, effortOverride, onChunk, onReasoning);
+    }
+
+    /**
+     * Streaming chat completion. Returns a future of the final
+     * {@link ChatResult} — the {@link AssistantTurn} built up from all SSE
+     * chunks via the provider's accumulator, plus reported token usage.
+     *
+     * @param companion      companion (entity uuid) this call belongs to — used solely to
+     *                       attribute the wire-body capture for the context exporter. Null
+     *                       skips the capture; nothing else changes.
+     * @param messages       conversation history (provider translates to wire)
+     * @param tools          tool list (provider serialises to wire shape;
+     *                       empty = no tools field, e.g. for summarization calls)
+     * @param systemPrompt   prepended automatically — pass empty / null to skip
+     * @param effortOverride per-call reasoning-effort override (e.g. {@code "off"}
+     *                       for an emergency turn that must react fast). Null or
+     *                       blank means "use the client's configured effort" — a
+     *                       real value like {@code "off"} / {@code "low"} passes
+     *                       through as-is. Forwarded to the provider's
+     *                       {@code applyReasoning}; no-op for providers/models
+     *                       without a reasoning knob.
+     * @param onChunk        optional per-chunk callback (e.g. for live UI).
+     *                       Receives the raw provider chunk JSON. May be null.
+     * @param onReasoning    optional live-reasoning callback. Fired (on the HTTP
+     *                       thread) with the whole running reasoning transcript
+     *                       each time it grows — for the live "thinking" display.
+     *                       Display-only; never persisted or re-sent. May be null.
+     */
+    public CompletableFuture<ChatResult> chatStreaming(java.util.UUID companion,
+                                                       List<ConvoState.Msg> messages,
+                                                       Collection<NumenTool> tools,
+                                                       String systemPrompt,
+                                                       String effortOverride,
+                                                       Consumer<JsonObject> onChunk,
+                                                       Consumer<String> onReasoning) {
+        // -- 1. Build wire-format messages and tool list via provider.
+        // Image cost control: re-sending every attachment in history each turn
+        // balloons requests, so images are inlined ONLY for the MOST RECENT user
+        // message; older user messages with attachments render as text + an
+        // "[image omitted]" placeholder on the wire (see OpenAIProvider). Find
+        // that most-recent user index up front.
+        int lastUserIdx = -1;
+        for (int i = 0; i < messages.size(); i++) {
+            if (messages.get(i) instanceof ConvoState.Msg.User) lastUserIdx = i;
+        }
+        List<JsonObject> wire = new ArrayList<>(messages.size());
+        for (int i = 0; i < messages.size(); i++) {
+            ConvoState.Msg m = messages.get(i);
+            final boolean inlineImages = (i == lastUserIdx);
+            switch (m) {
+                case ConvoState.Msg.User u ->
+                        wire.add(provider.buildUserMessage(u.content(), u.attachments(), inlineImages));
+                case ConvoState.Msg.Assistant a -> wire.add(provider.assistantToRequestMessage(a.turn()));
+                case ConvoState.Msg.Tool t -> wire.add(provider.buildToolResultMessage(t.toolCallId(), t.content()));
+            }
+        }
+        JsonArray toolList = provider.buildToolList(tools);
+        JsonObject body = provider.buildRequestBody(model, systemPrompt, wire, toolList);
+        // Reasoning-effort knob (provider-specific; no-op unless the provider
+        // supports it AND the configured effort/model warrant it). A per-call
+        // override wins when supplied (blank/null falls back to the configured
+        // effort); a real value like "off" — an emergency turn — passes through.
+        String effort = (effortOverride == null || effortOverride.isBlank())
+                ? reasoningEffort : effortOverride;
+        provider.applyReasoning(body, model, effort);
+        // One INFO line per request stating the effort actually configured, tagged with
+        // the same lr-N id the transport will use — so the game log shows exactly what
+        // reached the wire (reserve the id here; the transport reuses it below).
+        String requestId = HttpLlmTransport.nextRequestId();
+        boolean effortAuto = effort == null || effort.isBlank()
+                || effort.equalsIgnoreCase("auto");
+        Constants.LOG.info("[numen-llm] {} reasoning: effort={} ({}, {})",
+                requestId, effortAuto ? "none/provider-default" : effort,
+                provider.name(), model);
+        // Cache-regression hook: hash the byte-frozen prompt prefix (serialized tools array +
+        // system message content). With the append-only world-cognition design this must stay
+        // constant across turns that add no structural new knowledge — grep one companion's
+        // lr-N lines and watch prefixHash to catch a prefix that started jittering.
+        String pfx = prefixHash(toolList, systemPrompt);
+        Constants.LOG.info("[numen-llm] {} prefixHash={}", requestId, pfx);
+
+        // -- 2. Enable streaming + usage reporting (both server-side flags).
+        body.addProperty("stream", true);
+        JsonObject streamOpts = new JsonObject();
+        streamOpts.addProperty("include_usage", true);
+        body.add("stream_options", streamOpts);
+
+        // Wire capture for the context exporter: the exact body about to hit the network.
+        if (companion != null) {
+            LAST_WIRE.put(companion, new WireCapture(body.toString(), pfx, System.currentTimeMillis()));
+        }
+
+        if (Constants.LOG.isDebugEnabled()) {
+            Constants.LOG.debug("[numen-llm] chat start: provider={}, model={}, msgs={}, tools={}, system_prompt_chars={}",
+                    provider.name(), model, wire.size(), toolList.size(),
+                    systemPrompt == null ? 0 : systemPrompt.length());
+        }
+
+        // -- 3. Stream the response into an accumulator.
+        long t0 = System.nanoTime();
+        StreamAccumulator acc = new StreamAccumulator();
+        // Tracks the reasoning buffer length last seen, so we only fire the
+        // callback (with the whole running transcript) when it actually grew.
+        final int[] lastReasoningLen = {0};
+        return transport.postSse(requestId, fullUrl, apiKey, body, chunk -> {
+            try {
+                provider.accumulateChunk(chunk, acc);
+                if (onChunk != null) onChunk.accept(chunk);
+                if (onReasoning != null && acc.reasoning.length() > lastReasoningLen[0]) {
+                    lastReasoningLen[0] = acc.reasoning.length();
+                    onReasoning.accept(acc.reasoning.toString());
+                }
+            } catch (RuntimeException ex) {
+                Constants.LOG.warn("[numen-llm] accumulator failed on chunk: {}", ex.getMessage());
+            }
+        }).thenApply(v -> {
+            AssistantTurn turn = provider.finalizeStream(acc);
+            logCallSummary(t0, acc, turn);
+            int prompt = jsonInt(acc.usage, "prompt_tokens");
+            int cached = cachedTokens(acc.usage);
+            auditCacheHit(companion, requestId, pfx, prompt, cached);
+            return new ChatResult(turn, prompt,
+                    jsonInt(acc.usage, "total_tokens"), cached);
+        });
+    }
+
+    // ---- prompt-cache audit (constitution telemetry) ----
+
+    /**
+     * Provider-reported prompt-cache hit for one usage frame, or {@code -1} when the
+     * provider sent no cache detail. Reads the OpenAI-compatible shape
+     * ({@code prompt_tokens_details.cached_tokens} — OpenAI, zhipu, moonshot) and falls
+     * back to DeepSeek's top-level {@code prompt_cache_hit_tokens}.
+     */
+    private static int cachedTokens(JsonObject usage) {
+        if (usage == null) return -1;
+        if (usage.has("prompt_tokens_details") && usage.get("prompt_tokens_details").isJsonObject()) {
+            JsonObject details = usage.getAsJsonObject("prompt_tokens_details");
+            if (details.has("cached_tokens") && details.get("cached_tokens").isJsonPrimitive()) {
+                return details.get("cached_tokens").getAsInt();
+            }
+        }
+        if (usage.has("prompt_cache_hit_tokens") && usage.get("prompt_cache_hit_tokens").isJsonPrimitive()) {
+            return usage.get("prompt_cache_hit_tokens").getAsInt();
+        }
+        return -1;
+    }
+
+    /** Last request's (prefixHash, promptTokens) per companion — the cache-regression baseline. */
+    private record CacheBaseline(String prefixHash, int promptTokens) {}
+
+    private static final java.util.concurrent.ConcurrentHashMap<java.util.UUID, CacheBaseline> CACHE_BASELINE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The supplier-side constitution audit. One INFO line per request with the metered
+     * hit; a WARN when the hit collapses even though OUR prefix stayed byte-identical
+     * and the history only grew (append-only) — i.e. the provider should have hit.
+     * A shrunken prompt (post-compaction splice) resets the baseline without warning:
+     * that recast is the one sanctioned prefix-adjacent change. First requests and
+     * providers that report no cache detail never warn.
+     */
+    private static void auditCacheHit(java.util.UUID companion, String requestId,
+                                      String pfx, int prompt, int cached) {
+        if (cached >= 0 && prompt > 0) {
+            Constants.LOG.info("[numen-llm] {} cache: hit {}/{} prompt tokens ({}%)",
+                    requestId, cached, prompt, Math.round(cached * 100.0 / prompt));
+        }
+        if (companion == null) return;
+        CacheBaseline prev = CACHE_BASELINE.put(companion, new CacheBaseline(pfx, prompt));
+        if (cached < 0 || prev == null) return;
+        boolean samePrefix = prev.prefixHash().equals(pfx);
+        boolean appendOnlyGrowth = prompt >= prev.promptTokens();
+        if (samePrefix && appendOnlyGrowth && cached < prev.promptTokens() / 2) {
+            Constants.LOG.warn(
+                    "[numen-llm] {} cache regression: prefix frozen (hash {}) and history append-only "
+                    + "(prev prompt {} -> {}), yet provider cached only {} tokens — "
+                    + "TTL expiry, provider eviction, or an unnoticed byte drift below the hash",
+                    requestId, pfx, prev.promptTokens(), prompt, cached);
+        }
+    }
+
+    private void logCallSummary(long t0, StreamAccumulator acc, AssistantTurn turn) {
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+        String tokens = "?";
+        if (acc.usage != null) {
+            int in = jsonInt(acc.usage, "prompt_tokens");
+            int out = jsonInt(acc.usage, "completion_tokens");
+            int total = jsonInt(acc.usage, "total_tokens");
+            tokens = in + "/" + out + " (total " + total + ")";
+        }
+        StringBuilder toolSummary = new StringBuilder();
+        for (LlmToolCall tc : turn.toolCalls()) {
+            if (toolSummary.length() > 0) toolSummary.append(", ");
+            toolSummary.append(tc.name());
+        }
+        String contentSnippet = turn.content().isEmpty() ? "<no text>"
+                : truncate(turn.content().replace('\n', ' '), 120);
+        Constants.LOG.info(
+                "[numen-llm] chat done in {}ms, chunks={}, tokens={}, finish={}, tool_calls=[{}], content=\"{}\"",
+                elapsedMs, acc.chunkCount, tokens,
+                acc.finishReason == null ? "?" : acc.finishReason,
+                toolSummary, contentSnippet);
+    }
+
+    /**
+     * SHA-256 over the prompt prefix (serialized tools array + a separator + system message
+     * content), returned as the first 12 hex digits. Deterministic and cheap; used only for
+     * the cache-regression log line. Returns {@code "unavailable"} if hashing somehow fails.
+     */
+    private static String prefixHash(JsonArray tools, String systemPrompt) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            md.update((tools == null ? "[]" : tools.toString())
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            md.update((byte) 0);
+            md.update((systemPrompt == null ? "" : systemPrompt)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            byte[] h = md.digest();
+            StringBuilder sb = new StringBuilder(12);
+            for (int i = 0; i < 6; i++) sb.append(String.format("%02x", h[i]));   // 6 bytes → 12 hex
+            return sb.toString();
+        } catch (Exception ex) {
+            return "unavailable";
+        }
+    }
+
+    private static boolean nonBlank(String s) { return s != null && !s.isBlank(); }
+
+    private static int jsonInt(JsonObject o, String key) {
+        if (o == null || !o.has(key) || o.get(key).isJsonNull()) return 0;
+        try { return o.get(key).getAsInt(); } catch (RuntimeException ex) { return 0; }
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "...";
+    }
+
+    public LlmProvider provider() { return provider; }
+    public String model() { return model; }
+
+    // ---- account balance (Settings → Usage view) ----
+
+    /** Whether the active provider exposes a key-scoped balance endpoint. */
+    public boolean supportsBalance() {
+        return provider.balanceUrl(balanceBase()) != null;
+    }
+
+    /**
+     * Query the provider's account balance. Resolves with a one-line display string
+     * (provider-parsed, e.g. {@code "余额: ¥12.34 (赠送 ¥0.50)"}; raw JSON as a fallback
+     * when the parse comes up empty). Fails when the provider has no balance API or the
+     * HTTP call errors. Fully async — completes on the HTTP executor thread.
+     */
+    public CompletableFuture<String> queryBalance() {
+        String url = provider.balanceUrl(balanceBase());
+        if (url == null) {
+            return CompletableFuture.failedFuture(
+                    new UnsupportedOperationException("provider has no balance API"));
+        }
+        return transport.get(url, apiKey).thenApply(body -> {
+            String s = provider.parseBalance(body);
+            return (s == null || s.isBlank()) ? truncate(body.toString(), 120) : s;
+        });
+    }
+
+    /** The effective base URL (chat URL minus the {@code /chat/completions} suffix). */
+    private String balanceBase() {
+        return fullUrl.endsWith(CHAT_COMPLETIONS_SUFFIX)
+                ? fullUrl.substring(0, fullUrl.length() - CHAT_COMPLETIONS_SUFFIX.length())
+                : fullUrl;
+    }
+
+    /**
+     * Map a config {@code provider} string to a concrete {@link LlmProvider}.
+     *
+     * <p>Accepted ids match LiteLLM's provider names plus a few Chinese
+     * aliases that users naturally type:
+     * <ul>
+     *   <li>{@code openai} (default fallback)</li>
+     *   <li>{@code deepseek} — DeepSeek (V4 / R1 family)</li>
+     *   <li>{@code moonshot} / {@code kimi} — Moonshot AI (Kimi)</li>
+     *   <li>{@code minimax} — MiniMax (abab / M-series)</li>
+     *   <li>{@code volcengine} / {@code doubao} / {@code ark} — Doubao via Volcengine Ark</li>
+     *   <li>{@code dashscope} / {@code qwen} / {@code tongyi} / {@code aliyun} — DashScope (Qwen)</li>
+     * </ul>
+     * Unknown values fall back to {@code openai} with a warning log.
+     */
+    public static LlmProvider pickProvider(String name) {
+        if (name == null) return new OpenAIProvider();
+        return switch (name.toLowerCase()) {
+            case DeepSeekProvider.NAME -> new DeepSeekProvider();
+            case MoonshotProvider.NAME, "kimi" -> new MoonshotProvider();
+            case MinimaxProvider.NAME -> new MinimaxProvider();
+            case VolcengineProvider.NAME, "doubao", "ark" -> new VolcengineProvider();
+            case DashScopeProvider.NAME, "qwen", "tongyi", "aliyun" -> new DashScopeProvider();
+            case com.dwinovo.numen.agent.provider.ZhipuProvider.NAME, "glm" ->
+                    new com.dwinovo.numen.agent.provider.ZhipuProvider();
+            case com.dwinovo.numen.agent.provider.SiliconFlowProvider.NAME, "silicon" ->
+                    new com.dwinovo.numen.agent.provider.SiliconFlowProvider();
+            case OpenAIProvider.NAME, "openai-compatible" -> new OpenAIProvider();
+            // Any other registered site (Gemini, Grok, "+ add site" customs) is OpenAI-compatible — use the
+            // base adapter silently; only a genuinely unknown id (typo) warns.
+            default -> {
+                if (!com.dwinovo.numen.agent.model.ModelRegistry.has(name)) {
+                    Constants.LOG.warn("[numen-llm] unknown provider '{}', falling back to openai", name);
+                }
+                yield new OpenAIProvider();
+            }
+        };
+    }
+}

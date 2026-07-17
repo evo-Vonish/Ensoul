@@ -1,0 +1,57 @@
+# Ensoul monorepo — root ignore rules.
+# Each module (engine/ mod/ mcp/) also ships its own .gitignore; this is the
+# repo-wide safety net covering build outputs, IDE metadata and run artifacts
+# across all subtrees.
+
+# Gradle
+**/build/
+**/.gradle/
+!**/src/**/build/           # never ignore a source dir literally named "build"
+
+# IDEs — IntelliJ
+**/out/
+*.ipr
+*.iws
+*.iml
+.idea/*
+!.idea/scopes
+
+# IDEs — Eclipse
+bin/
+*.launch
+.settings/
+.metadata/
+.classpath
+.project
+eclipse/
+
+# IDEs — VS Code
+.vscode/
+
+# Minecraft run directories
+**/run/
+**/runs/
+**/logs/
+.vfox
+
+# Datagen output — regenerated via runDatagen / runData
+**/generated/
+
+# Secrets & local env — API keys live in an untracked .env
+.env
+**/.env
+!**/.env.example
+
+# Claude / local agent tooling — not project source
+.claude/
+
+# Node (the ui-textures authoring tool)
+**/node_modules/
+
+# JVM crash logs
+hs_err_pid*.log
+replay_pid*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db

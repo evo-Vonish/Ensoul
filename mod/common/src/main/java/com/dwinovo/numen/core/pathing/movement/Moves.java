@@ -53,8 +53,21 @@ public final class Moves {
             {Direction.SOUTH, Direction.WEST},
     };
 
-    /** Maximum parkour gap (blocks) — 4 needs sprint physics, the vanilla cap. */
+    /** Physical parkour reach — cells from takeoff to landing; 4 needs sprint
+     *  physics, the vanilla cap (Baritone {@code MovementParkour} MAX_JUMP). */
     private static final int MAX_PARKOUR = 4;
+
+    /**
+     * Conservatively ENABLED parkour reach. Only the 2-cell hop (one empty gap
+     * cell, same-Y landing) is a plain standing/walking jump the current executor
+     * drives reliably. The 3- and 4-cell sprint jumps stay gated OFF here because
+     * the executor's PARKOUR branch sprints only at {@code gap >= 4}
+     * (PlayerPathExecutor:304) — so a 3-cell (2-gap) jump is driven WITHOUT sprint
+     * and falls short, dropping the body into the pit. Raise this to
+     * {@link #MAX_PARKOUR} once the executor sprints for {@code gap >= 3} and
+     * guarantees takeoff run-up momentum (see the cross-cluster note in the receipt).
+     */
+    private static final int MAX_PARKOUR_ENABLED = 2;
 
     private Moves() {}
 
@@ -521,7 +534,7 @@ public final class Moves {
         // Head-room to jump from the takeoff.
         if (!BlockHelper.canWalkThrough(level, from.above(2))) return null;
 
-        for (int d = 2; d <= MAX_PARKOUR; d++) {
+        for (int d = 2; d <= MAX_PARKOUR_ENABLED; d++) {
             // Every cell from 1..d must be clear air at feet & head (no clipping).
             boolean clear = true;
             for (int i = 1; i <= d; i++) {

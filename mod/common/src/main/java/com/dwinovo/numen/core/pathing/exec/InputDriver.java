@@ -46,6 +46,26 @@ public final class InputDriver {
     }
 
     /**
+     * Register an ENGAGED work gaze on {@code point} — a block being mined or a support face being
+     * placed against. Like {@link #setLookIntent} this moves NOTHING this tick and drives no
+     * locomotion; unlike it, engaged OUTRANKS idle attention and locomotion (the look engine squares
+     * the body up and eases head + pitch onto the point over the coming ticks), yielding only to a
+     * {@link #lookAt hard-aim} snap. It auto-expires a few ticks ({@code ENGAGED_HOLD_TICKS}) after
+     * the last call, so refresh it every tick the work continues.
+     *
+     * <p>Purely presentational: a break is decided by the eye-position raycast + tool + permissions,
+     * and a place by the eye-position line of sight + crouch — never by where the head visually
+     * points — so swapping a cosmetic hard {@link #lookAt} for this softer engaged gaze changes how
+     * the work LOOKS, not whether or when it lands. No body movement, no locomotion input, no extra
+     * tick cost. No-op for a non-companion body.
+     */
+    public static void engage(ServerPlayer p, Vec3 point) {
+        if (p instanceof NumenPlayer np) {
+            np.getLook().markEngaged(point.x, point.y, point.z);
+        }
+    }
+
+    /**
      * Register a SMOOTH gaze intent — the attention brain's "please look here" for idle/walking.
      * Unlike {@link #lookAt}, this does not move the body at all this tick; the look engine eases the
      * head (and, when idle, the body) toward {@code point} over the coming ticks, honouring the 50°

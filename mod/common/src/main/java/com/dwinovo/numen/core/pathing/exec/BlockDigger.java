@@ -52,6 +52,7 @@ public final class BlockDigger {
     private float progress;       // accumulated 0..1 (Carpet curBlockDamageMP)
     private boolean started;      // START_DESTROY_BLOCK has been sent for `pos`
     private int blockHitDelay;    // post-break cooldown (survives reset())
+    private Vec3 engageHold;      // last dig aim point, kept engaged through the cooldown (survives reset())
 
     public BlockDigger(NumenPlayer player) {
         this.player = player;
@@ -72,6 +73,13 @@ public final class BlockDigger {
         Level level = player.level();
         if (blockHitDelay > 0) {                    // let the previous break land first
             blockHitDelay--;
+            // Keep the eyes engaged on the just-broken block through the whole cooldown: the ENGAGED
+            // latch lapses after ENGAGED_HOLD_TICKS (3t) but the delay runs BLOCK_HIT_DELAY (5t), so
+            // without a per-tick refresh the head would relax mid-cooldown and snap back for the last
+            // couple of frames. Cosmetic only — this branch drives no break and no locomotion.
+            if (engageHold != null) {
+                InputDriver.engage(player, engageHold);
+            }
             InputDriver.halt(player);
             return false;
         }
@@ -102,7 +110,14 @@ public final class BlockDigger {
         // when the TARGET itself goes, so callers that count mined targets / treat the cell as cleared
         // aren't fooled by a leaf we broke just to open the line of sight.
         boolean targetBreak = effective.equals(target);
-        InputDriver.lookAt(player, hit.getLocation());
+        // Cosmetic: turn the head onto the block being mined via the ENGAGED channel instead of a hard
+        // snap. The break is driven entirely by the eye-position raycast (reachableHit / centerRaycast),
+        // the held tool and getDestroyProgress below — none of which read head rotation — so this
+        // changes only how the dig LOOKS, never its tick count. Remember the aim so the post-break
+        // cooldown branch can hold this gaze across the 5t delay.
+        Vec3 aim = hit.getLocation();
+        InputDriver.engage(player, aim);
+        engageHold = aim;
         Direction side = hit.getDirection();
         BlockState state = level.getBlockState(pos);
 

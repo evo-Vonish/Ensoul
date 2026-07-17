@@ -133,13 +133,38 @@ public record ExecuteToolPayload(UUID entityUuid,
                         new TaskResultPayload(p.entityUuid(), p.toolCallId(), json));
         try {
             if (tool instanceof com.dwinovo.numen.core.tool.ServerNumenTool st) {
-                st.runOnServer(p.toolCallId(), args, companion, reply);
+                // The single point where every server tool's args are read: pull the optional
+                // per-call max_seconds cap and bind it for ctx() to pick up, so ToolContext.deadline
+                // can tighten the task's self-estimated budget. Instant/query tools never build a
+                // TaskRecord, so the bound cap is simply never consulted for them.
+                com.dwinovo.numen.core.tool.ServerNumenTool.bindMaxSeconds(readMaxSeconds(args));
+                try {
+                    st.runOnServer(p.toolCallId(), args, companion, reply);
+                } finally {
+                    com.dwinovo.numen.core.tool.ServerNumenTool.unbindMaxSeconds();
+                }
             } else {
                 replyError(player, p, "tool not server-runnable: " + p.toolName());
             }
         } catch (RuntimeException ex) {
             replyError(player, p, "invalid arguments: " + ex.getMessage());
         }
+    }
+
+    /**
+     * The optional {@code max_seconds} time-box the model may put on any tool call
+     * (universally injected into every tool schema at the engine serialization layer).
+     * A positive integer caps this call's runtime; absent / non-positive / unparseable
+     * yields {@code 0} (no cap). This is the one place the value is read off the wire.
+     */
+    private static int readMaxSeconds(JsonObject args) {
+        if (args.has("max_seconds") && args.get("max_seconds").isJsonPrimitive()) {
+            try {
+                int v = args.get("max_seconds").getAsInt();
+                return v > 0 ? v : 0;
+            } catch (RuntimeException ignored) { /* not an int → no cap */ }
+        }
+        return 0;
     }
 
     public static void replyError(ServerPlayer player, ExecuteToolPayload p, String message) {

@@ -149,7 +149,17 @@ public final class MoveToCompanionTask implements CompanionTask {
     /** Did we get close enough to the destination to call it done (teaching success)? */
     private boolean closeEnoughToSucceed() {
         return switch (r.kind) {
-            case BLOCK, COLUMN -> horizontalDistSqr(bx, bz) <= NEAR_SUCCESS_RADIUS * NEAR_SUCCESS_RADIUS;
+            // BLOCK is an EXACT cell (x+y+z): the caller named a Y, so Y must be met. Without the
+            // |Δy| gate a body stuck 40+ blocks below the target reports success on horizontal
+            // arrival alone — field evidence: at y=59 asked for y=105, "arrived … at y=59, the
+            // exact cell y=105 wasn't reachable" yet success=true, so the model climbed y+1 in an
+            // infinite no-op loop (each call a full LLM turn). An unreachable Y is a real failure,
+            // routed to blockedResult, so the model tries elevation (escape_to_surface) instead.
+            case BLOCK -> horizontalDistSqr(bx, bz) <= NEAR_SUCCESS_RADIUS * NEAR_SUCCESS_RADIUS
+                    && Math.abs(feet().getY() - by) <= 1;
+            // COLUMN deliberately ignores Y — its whole contract is "go to this x,z and stand on
+            // whatever ground is there"; the underground/surface honesty note rides arrivedMessage.
+            case COLUMN -> horizontalDistSqr(bx, bz) <= NEAR_SUCCESS_RADIUS * NEAR_SUCCESS_RADIUS;
             case YLEVEL -> Math.abs(feet().getY() - by) <= 1;
         };
     }

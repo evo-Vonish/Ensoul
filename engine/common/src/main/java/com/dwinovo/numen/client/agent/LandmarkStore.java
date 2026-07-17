@@ -89,6 +89,17 @@ public final class LandmarkStore {
     /** Default category for a new named waypoint when the owner supplies none. */
     private static final String PLACE_CATEGORY = "place";
 
+    /**
+     * Fresh-evidence faith window (ms): an entry recorded/verified this recently is trusted over the
+     * client world read. The add comes from a SERVER-side tool success (the body literally just placed
+     * or used the block), but the tool-result payload and the vanilla block-update packet travel
+     * separately — a turn boundary fires {@link #verify} in that gap, reads the pre-place block from
+     * the lagging client chunk, and minted a false {@code removed} seconds after placement (owner
+     * field report: crafting table AND furnace both). Server truth outranks a possibly-stale client
+     * read for this window; a genuine break is still confirmed by any later verify pass.
+     */
+    private static final long FRESH_EVIDENCE_FAITH_MS = 5000;
+
     /** The kind of semantic change an event represents. */
     public enum ChangeType { ADDED, REMOVED, RENAMED, REPURPOSED, POSITION_CORRECTED }
 
@@ -215,6 +226,8 @@ public final class LandmarkStore {
             if (!isTracked(pathOf(e.kind))) continue;         // owner-named waypoint (no tracked block) — kept on faith
             BlockPos pos = BlockPos.of(e.pos);
             if (!level.hasChunkAt(pos)) continue;             // unloaded — keep on faith (test #6)
+            if (now - e.lastVerified < FRESH_EVIDENCE_FAITH_MS) continue;   // fresh server-side evidence
+                       // outranks a lagging client read — see FRESH_EVIDENCE_FAITH_MS
             String actual = BuiltInRegistries.BLOCK
                     .getKey(level.getBlockState(pos).getBlock()).getPath();
             if (actual.equals(pathOf(e.kind))) {

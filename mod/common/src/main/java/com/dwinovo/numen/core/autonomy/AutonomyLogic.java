@@ -90,11 +90,21 @@ final class AutonomyLogic {
      * (an owner turn/reflex seized the body) or once it has run long enough — but ONLY if it actually
      * accomplished something. Zero-append discipline: a stretch that did nothing produces no event.
      */
+    /**
+     * Flush the dream journal? {@code effectiveTicks} is the session's BANKED active time —
+     * carried ticks from earlier insubstantial interrupted stints plus the current stint —
+     * so a slow brain waking every 30–90 s can no longer mint a "漫步约 3 秒" line per gap:
+     * an interrupt only flushes once enough substance accumulated (or something was picked
+     * up, which is always worth a line); otherwise the caller suspends and carries forward.
+     * The max-session cap still forces a flush on a long continuous stroll.
+     */
     static boolean shouldFlushJournal(boolean sessionActive, boolean interrupted,
-                                      long now, long sessionStart, long maxSessionTicks,
+                                      long effectiveTicks, long maxSessionTicks, long minSubstanceTicks,
                                       int strollLegs, int pickedCount) {
         if (!sessionActive) return false;
         if (strollLegs <= 0 && pickedCount <= 0) return false;   // nothing accomplished → no append
-        return interrupted || (now - sessionStart >= maxSessionTicks);
+        if (effectiveTicks >= maxSessionTicks) return true;      // long-running batch cap
+        if (!interrupted) return false;
+        return pickedCount > 0 || effectiveTicks >= minSubstanceTicks;
     }
 }

@@ -78,6 +78,9 @@ public final class AutonomyScheduler {
     private static final long STROLL_TIMEOUT_TICKS = 200;    // give up a wander leg after 10 s
     private static final long PICKUP_TIMEOUT_TICKS = 200;    // give up an approach after 10 s
     private static final long JOURNAL_MAX_SESSION_TICKS = 2400;   // flush a running session at most every ~2 min
+    /** Minimum banked wander time before an interrupt may flush a journal line (~60 s).
+     *  Below this the session suspends and carries forward instead — no three-second diary. */
+    private static final long JOURNAL_MIN_SUBSTANCE_TICKS = 1200;
 
     // ---- stroll / pickup geometry ----
     private static final int PICKUP_SCAN_RADIUS = 8;
@@ -122,6 +125,10 @@ public final class AutonomyScheduler {
         // ---- dream-journal session accumulator (batched summary, not per-action) ----
         boolean sessionActive;
         long sessionStart;
+        /** Active-wander ticks carried over from insubstantial interrupted sessions (a slow
+         *  brain wakes every 30–90 s and interrupts the stroll; without carrying, every gap
+         *  produced its own "漫步约 3 秒" journal line — field-observed noise). */
+        long carriedTicks;
         int strollLegs;
         double strollBlocks;
         final Map<String, Integer> picked = new LinkedHashMap<>();
@@ -325,10 +332,9 @@ public final class AutonomyScheduler {
         if (s.sessionActive) return;
         s.sessionActive = true;
         s.sessionStart = now;
-        s.strollLegs = 0;
-        s.strollBlocks = 0.0;
-        s.picked.clear();
-        s.noticedUnpicked.clear();
+        // Tallies are deliberately NOT cleared here: an insubstantial interrupted session
+        // suspends (suspendSession) and carries its legs/blocks/pickups/carriedTicks into
+        // the next idle window; only a real flush (resetSession) zeroes the accumulator.
     }
 
     private static void recordPicked(State s, ItemStack stack) {
@@ -342,19 +348,28 @@ public final class AutonomyScheduler {
     }
 
     private static void maybeFlushJournal(NumenPlayer body, State s, long now, boolean interrupted) {
-        boolean flush = AutonomyLogic.shouldFlushJournal(s.sessionActive, interrupted, now, s.sessionStart,
-                JOURNAL_MAX_SESSION_TICKS, s.strollLegs, totalPicked(s));
+        long effectiveTicks = s.carriedTicks + Math.max(0, now - s.sessionStart);
+        boolean flush = AutonomyLogic.shouldFlushJournal(s.sessionActive, interrupted, effectiveTicks,
+                JOURNAL_MAX_SESSION_TICKS, JOURNAL_MIN_SUBSTANCE_TICKS, s.strollLegs, totalPicked(s));
         if (flush) {
             emitJournal(body, s, now);
             resetSession(s);
         } else if (interrupted && s.sessionActive) {
-            resetSession(s);   // interrupted with nothing accomplished → drop it silently (zero-append)
+            suspendSession(s, now);   // not enough substance yet — carry the tally, don't drop it
         }
+    }
+
+    /** Suspend an insubstantial interrupted session: bank its active time and keep every
+     *  tally so the NEXT idle window continues the same journal entry instead of spawning
+     *  a fresh three-second one. */
+    private static void suspendSession(State s, long now) {
+        s.carriedTicks += Math.max(0, now - s.sessionStart);
+        s.sessionActive = false;
     }
 
     /** Batch-summary event: {@code <event kind="autonomy" provenance="observed">自主:…</event>}, non-urgent. */
     private static void emitJournal(NumenPlayer body, State s, long now) {
-        long secs = Math.max(1, (now - s.sessionStart) / 20);
+        long secs = Math.max(1, (s.carriedTicks + Math.max(0, now - s.sessionStart)) / 20);
         StringBuilder sb = new StringBuilder("自主:");
         boolean any = false;
         if (s.strollLegs > 0) {
@@ -380,6 +395,7 @@ public final class AutonomyScheduler {
 
     private static void resetSession(State s) {
         s.sessionActive = false;
+        s.carriedTicks = 0;
         s.strollLegs = 0;
         s.strollBlocks = 0.0;
         s.picked.clear();

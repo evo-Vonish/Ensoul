@@ -375,14 +375,40 @@ public final class MineCompanionTask implements CompanionTask {
      *  Returns the live {@code knownOres} list unchanged when vein mode is off/uncommitted,
      *  so the default (non-vein) execution path is byte-for-byte the old behaviour. */
     private List<BlockPos> activeOres() {
+        List<BlockPos> base;
         if (r.isVein() && !veinTargets.isEmpty()) {
-            List<BlockPos> out = new ArrayList<>();
+            base = new ArrayList<>();
             for (BlockPos p : knownOres) {
-                if (veinTargets.contains(p)) out.add(p);
+                if (veinTargets.contains(p)) base.add(p);
             }
-            return out;
+        } else {
+            base = knownOres;
         }
-        return knownOres;
+        // Rotation: hide targets on transient-failure cooldown so the next attempt goes
+        // for a different candidate. An empty result routes to the honest step-3 terminal
+        // ("N temporarily unreachable — needs scaffolding / another approach") rather than
+        // an endless retry of the same unreachable block.
+        if (targetCooldown.isEmpty()) return base;
+        long now = player.level().getGameTime();
+        targetCooldown.values().removeIf(until -> now >= until);
+        if (targetCooldown.isEmpty()) return base;
+        List<BlockPos> out = new ArrayList<>();
+        for (BlockPos p : base) {
+            if (!targetCooldown.containsKey(p)) out.add(p);
+        }
+        return out;
+    }
+
+    /** Targets currently hidden by the transient-failure rotation cooldown (still known,
+     *  never condemned) — surfaced in the terminal message so "none reachable right now"
+     *  is never reported as "none left". */
+    private int coolingCount() {
+        if (targetCooldown.isEmpty()) return 0;
+        int n = 0;
+        for (BlockPos p : knownOres) {
+            if (targetCooldown.containsKey(p)) n++;
+        }
+        return n;
     }
 
     /** Nearby target-drop item entities within {@code radius} (Baritone droppedItemsScan,
@@ -688,16 +714,27 @@ public final class MineCompanionTask implements CompanionTask {
         }
     }
 
-    /** (A) A composite nav search failed to reach the whole active field. Strike the
-     *  nearest active ore, but ONLY for a genuine persistent cause, and blacklist it
-     *  only after {@link #BLACKLIST_STRIKES} consecutive genuine strikes. */
+    /** Transient nav failures put the failed target on this short rotation cooldown so the
+     *  next attempt tries a DIFFERENT candidate instead of hammering the same one. Field
+     *  case: bare-hand tree chopping — the canopy logs need scaffolding the body doesn't
+     *  carry, so "transient, retry later" looped forever on one log while other trees
+     *  stood in range. Cooling targets stay known (never condemned) and re-enter the
+     *  rotation when the cooldown lapses, the body mines something, or it relocates. */
+    private final Map<BlockPos, Long> targetCooldown = new HashMap<>();
+    private static final int TRANSIENT_COOLDOWN_TICKS = 300;   // 15 s
+
+    /** (A) A composite nav search failed to reach the whole active field. ALWAYS cool the
+     *  nearest active ore (rotate to another candidate next attempt); additionally strike
+     *  it toward the blacklist ONLY for a genuine persistent cause. */
     private void registerNavFailure(String failReason) {
-        if (!isGenuineUnreachable(failReason)) return;   // transient — retry later, never condemn
         BlockPos feet = player.blockPosition();
         BlockPos nearest = activeOres().stream()
                 .min(Comparator.comparingDouble(feet::distSqr))
                 .orElse(null);
         if (nearest == null) return;
+        targetCooldown.put(nearest.immutable(),
+                player.level().getGameTime() + TRANSIENT_COOLDOWN_TICKS);
+        if (!isGenuineUnreachable(failReason)) return;   // transient — rotated, never condemned
         int strikes = failStrikes.merge(nearest, 1, Integer::sum);
         if (strikes >= BLACKLIST_STRIKES) {
             blacklist.add(nearest);
@@ -843,6 +880,12 @@ public final class MineCompanionTask implements CompanionTask {
             sb.append("no ").append(r.label).append(" gathered");
         }
         List<String> notes = new ArrayList<>();
+        int cooling = coolingCount();
+        if (cooling > 0) {
+            notes.add(cooling + " couldn't be reached on this attempt (too high without scaffolding "
+                    + "blocks, or the route failed) — carry dirt/cobblestone to pillar up, use pillar_up, "
+                    + "or approach from another side and rerun");
+        }
         if (rem.blacklisted() > 0) {
             notes.add(rem.blacklisted() + " still in range but currently unreachable (walled off / no path"
                     + ") — place cobblestone stepping-stones or approach from another side, then retry");

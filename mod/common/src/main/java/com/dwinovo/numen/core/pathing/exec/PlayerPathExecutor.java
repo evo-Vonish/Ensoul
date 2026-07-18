@@ -332,8 +332,11 @@ public final class PlayerPathExecutor {
         openDoorsForMove(mv);            // a shut wooden door/gate ahead → open it, don't break it
         Vec3 dest = Vec3.atBottomCenterOf(mv.dest);
         // Baritone never sprints in water, nor when about to run into a hazard just
-        // past the destination (it could carry us into lava/cactus/etc).
-        boolean sprintBase = speed >= 1.0 && !player.isInWater() && !hazardJustPast(mv);
+        // past the destination (it could carry us into lava/cactus/etc). Owner fix
+        // order (2026-07-19): also ease OFF the sprint into the path end and into
+        // sharp corners — see easeOffSprint.
+        boolean sprintBase = speed >= 1.0 && !player.isInWater() && !hazardJustPast(mv)
+                && !easeOffSprint(mv);
         switch (mv.kind) {
             case TRAVERSE -> {
                 // Baritone MovementTraverse corrects DEPTH before advancing. But a SINGLE-block
@@ -434,6 +437,50 @@ public final class PlayerPathExecutor {
         } else {
             InputDriver.halt(player);
         }
+    }
+
+    /** Walk-in distance from the FINAL destination inside which sprint is released
+     *  (a real player eases off the sprint key before stopping). */
+    private static final double PATH_END_WALK_IN_DIST = 2.2;
+    /** Within the last block of a movement whose successor turns sharply, enter the
+     *  corner at walk speed instead of sprint-carrying through it. */
+    private static final double CORNER_WALK_IN_DIST = 1.1;
+
+    /**
+     * Owner fix order (2026-07-19), "走路晕晕乎乎/走超" — sprint never eased off, so
+     * the momentum-preserving hand-offs of the fix wave let the body sprint-carry
+     * PAST the path end and slam corners. Two walk-in gates on {@code sprintBase}:
+     * <ol>
+     *   <li><b>path-end ease-off</b> — on the LAST movement, within
+     *       {@value #PATH_END_WALK_IN_DIST} blocks of the final dest, walk it in
+     *       (arrival tolerances stop reading as overshoot);</li>
+     *   <li><b>sharp-corner ease-off</b> — within the last block of a movement whose
+     *       successor turns ≥90° (horizontal direction dot ≤ 0), drop sprint so the
+     *       corner is entered at walk speed. Straight-throughs and gentle 45° bends
+     *       (dot &gt; 0) are untouched.</li>
+     * </ol>
+     * Deliberately NOT applied to: water (never sprints anyway), the DESCEND/FALL
+     * fakeDest momentum window (intentional, its overshoot is ≤1 cell and recovered),
+     * PARKOUR's gap≥4 physics sprint (the jump needs it), and the sprint-skip
+     * straight-through logic (unchanged). Flight never passes through here — the
+     * {@code FlyPathExecutor} has its own approach deceleration.
+     */
+    private boolean easeOffSprint(Movement mv) {
+        if (index >= path.movements.size() - 1) {
+            return horizontalDistTo(mv.dest) < PATH_END_WALK_IN_DIST;
+        }
+        if (horizontalDistTo(mv.dest) >= CORNER_WALK_IN_DIST) {
+            return false;
+        }
+        Movement next = path.movements.get(index + 1);
+        int cx = mv.dest.getX() - mv.src.getX();
+        int cz = mv.dest.getZ() - mv.src.getZ();
+        int nx = next.dest.getX() - next.src.getX();
+        int nz = next.dest.getZ() - next.src.getZ();
+        if ((cx == 0 && cz == 0) || (nx == 0 && nz == 0)) {
+            return false;   // a vertical link (pillar/dig-down) — no horizontal corner to ease
+        }
+        return cx * nx + cz * nz <= 0;
     }
 
     /** Baritone MovementDescend.safeMode: a hazard just past dest (sprint-overshoot risk)

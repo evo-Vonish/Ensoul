@@ -20,8 +20,12 @@ import java.util.Set;
  */
 public final class Movement {
 
-    /** Kind tag, used by the executor to pick an animation / phase order. */
-    public enum Kind { TRAVERSE, ASCEND, DESCEND, FALL, DIAGONAL, PILLAR, DIG_DOWN, PARKOUR }
+    /** Kind tag, used by the executor to pick an animation / phase order.
+     *  {@code FLY} is the creative-flight edge (creative-motion design v1): emitted
+     *  ONLY by {@code FlyPlanner}'s independent 3D air search and consumed by
+     *  {@code FlyPathExecutor} — the ground A* ({@code Moves}) never generates it,
+     *  and {@code PlayerPathExecutor} never receives it. */
+    public enum Kind { TRAVERSE, ASCEND, DESCEND, FALL, DIAGONAL, PILLAR, DIG_DOWN, PARKOUR, FLY }
 
     public final Kind kind;
     /** Feet position the entity starts this step at. */
@@ -106,7 +110,7 @@ public final class Movement {
                     set.add(dest.offset(-fdx, 0, -fdz));     // fell one short (braked / knocked back)
                 }
             }
-            default -> { /* TRAVERSE, PILLAR, DIG_DOWN: just src + dest */ }
+            default -> { /* TRAVERSE, PILLAR, DIG_DOWN, FLY: just src + dest */ }
         }
         validPositions = set;
         return set;

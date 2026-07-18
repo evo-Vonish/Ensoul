@@ -26,6 +26,15 @@ import java.util.function.Supplier;
  * cell ({@link #PlayerNav(NumenPlayer, BlockPos, double, BooleanSupplier)}) or
  * a richer goal — a {@link NavGoal#composite composite} ore field, a mining
  * stance — via {@link #toGoal}.
+ *
+ * <p><b>Creative flight (design v1, wave 2):</b> a body that may fly
+ * ({@code mayfly}) navigates by {@link FlyPathExecutor} instead — flight is the
+ * creative-first locomotion for EVERY nav caller (move_to, mining approach,
+ * item collection, …) with zero caller changes. The switch is seamless both
+ * ways: creative granted mid-walk takes to the air at the next tick; mayfly
+ * revoked mid-flight (or an honest aerial failure, e.g. a protected player
+ * build in the way) falls back to this ground pipeline. Survival navigation is
+ * bit-for-bit untouched — every flight branch sits behind the mayfly gate.
  */
 public final class PlayerNav {
 
@@ -42,6 +51,17 @@ public final class PlayerNav {
 
     private BlockPos plannedCenter;
     private PlayerPathExecutor current;
+
+    // ---- creative flight (creative-motion design v1, wave 2) ----
+    /** The flight executor when the body may fly (creative). Null → ground pipeline.
+     *  Every flight branch in this class is gated behind {@link FlyPathExecutor#available}
+     *  (mayfly), so survival navigation is untouched by construction. */
+    private FlyPathExecutor flight;
+    /** Set when an aerial attempt terminally failed for THIS nav — the ground pipeline
+     *  takes over and we don't re-enter the air (a fresh nav may try again). */
+    private boolean flightDisabled;
+    /** The aerial failure, preserved so a subsequent ground failure can report both. */
+    private String flightFailNote;
 
     // A* now runs on the planner pool, not stepped on the tick thread. We hold the future (polled each
     // tick) plus the search object itself (to cancel it on replan/stop so a stale worker stops wasting
@@ -104,7 +124,17 @@ public final class PlayerNav {
         this.goalSupplier = goalSupplier;
         this.speed = speed;
         this.reached = reached;
-        startFreshSearch();
+        // 创造态首选飞行 (design v1): a body that MAY fly navigates by air; the ground
+        // A* pipeline is the survival path AND the fallback when the air honestly fails.
+        if (FlyPathExecutor.available(player)) {
+            flight = newFlight();
+        } else {
+            startFreshSearch();
+        }
+    }
+
+    private FlyPathExecutor newFlight() {
+        return new FlyPathExecutor(player, goalSupplier, speed, this::publishViz);
     }
 
     /** A cell goal: exact if standable, else reach within 2 (mirrors move_to arrival). */
@@ -116,6 +146,23 @@ public final class PlayerNav {
 
     public Status tick() {
         if (reached.getAsBoolean()) return Status.ARRIVED;
+
+        // Creative granted mid-journey (owner switched the body's game mode): flight is
+        // the creative-first locomotion, and taking over is safe from ANY ground state —
+        // setting flying arrests even a mid-air fall — so switch at once. The reverse
+        // hand-off (mayfly revoked) comes back through Status.UNAVAILABLE below.
+        if (flight == null && !flightDisabled && FlyPathExecutor.available(player)) {
+            if (current != null) {
+                current.stop();
+                current = null;
+            }
+            discardPrecompute();
+            cancelSearch();
+            flight = newFlight();
+        }
+        if (flight != null) {
+            return tickFlight();
+        }
 
         if (current == null) {
             return advanceFreshSearch();
@@ -165,6 +212,64 @@ public final class PlayerNav {
             }
         }
         return Status.RUNNING;
+    }
+
+    /**
+     * One flight tick, mapped onto the nav contract. RUNNING passes through; ARRIVED
+     * with the caller's {@code reached} still false (tick() checked it first) hovers
+     * and re-polls — a moving goal re-arms the executor by itself, and a permanently
+     * stricter predicate is budgeted against {@link #MAX_REPLANS} so the body falls
+     * back to walking instead of hovering forever. UNAVAILABLE (mayfly revoked
+     * mid-nav) hands off to the ground pipeline seamlessly from wherever the body
+     * is; FAILED preserves the honest aerial reason and lets the ground pipeline
+     * have its try (creative ground pathing — wave 1 — still works).
+     */
+    private Status tickFlight() {
+        switch (flight.tick()) {
+            case RUNNING -> {
+                return Status.RUNNING;
+            }
+            case ARRIVED -> {
+                if (reached.getAsBoolean()) return Status.ARRIVED;
+                if (++replans >= MAX_REPLANS) {
+                    flightFailNote = "arrived by air but the goal predicate never satisfied";
+                    abandonFlight();
+                }
+                return Status.RUNNING;
+            }
+            case UNAVAILABLE -> {
+                flight = null;                 // not disabled: re-enters if mayfly returns
+                startFreshSearch();
+                return Status.RUNNING;
+            }
+            case FAILED -> {
+                failReason = flight.failReason();
+                flightFailNote = flight.failReason();
+                abandonFlight();
+                return Status.RUNNING;
+            }
+        }
+        return Status.RUNNING;
+    }
+
+    /** Terminal aerial failure for THIS nav: hand the body to the ground pipeline.
+     *  Flying is RELEASED here — with it on, gravity is off and the ground executor's
+     *  physics (falls, jumps, onGround gates) can never engage; a creative body is
+     *  invulnerable, so the drop to the ground is safe, and the ground planner's
+     *  replan budget absorbs the landing. (The arrival hover keeps flying ON — the
+     *  blueprint's 悬停不摘 — this release is only the failure fallback.) */
+    private void abandonFlight() {
+        if (flight != null) {
+            flight.stop();
+            flight = null;
+        }
+        flightDisabled = true;
+        var abilities = player.getAbilities();
+        if (abilities.flying) {
+            abilities.flying = false;
+            player.onUpdateAbilities();
+        }
+        startFreshSearch();
     }
 
     /**
@@ -282,6 +387,11 @@ public final class PlayerNav {
         searchObj = null;
         if (path == null || path.isEmpty()) {
             failReason = describeEmptyPath(finished);
+            if (flightFailNote != null) {
+                // The air was tried first and failed for its own honest reason (e.g. a
+                // protected player build) — report both, not just the ground's view.
+                failReason += " (air route also failed: " + flightFailNote + ")";
+            }
             return reached.getAsBoolean() ? Status.ARRIVED : Status.FAILED;
         }
         Path cut = path.staticCutoff();
@@ -383,6 +493,13 @@ public final class PlayerNav {
     }
 
     public void stop() {
+        if (flight != null) {
+            // Ends the drive and zeroes the vector; flying stays ON (blueprint: a
+            // finished creative move hovers — nothing auto-cancels flight, and the
+            // survival-switch descent belongs to the engine-side hook).
+            flight.stop();
+            flight = null;
+        }
         if (current != null) {
             current.stop();
             current = null;

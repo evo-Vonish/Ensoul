@@ -109,13 +109,15 @@ public final class LookTunables {
     /** Head yaw cap (deg/tick) while ENGAGED — see {@link #ENGAGED_BODY_OMEGA_DEG}. */
     public static final float ENGAGED_HEAD_OMEGA_DEG = 9.0f;
     /**
-     * Below this horizontal eye→point distance (blocks) the engaged bearing is degenerate — the
-     * work point is essentially straight above/below (shaft mining, ceiling block) and atan2 of
-     * near-zero components yields an arbitrary yaw. Hold the current body yaw instead of chasing
-     * it (a real player digging straight down keeps whatever facing they had), and let pitch do
-     * the work.
+     * At or beyond this |pitch| (deg) the engaged work point counts as vertical — straight
+     * above/below (shaft mining, a ceiling block) — and the body HOLDS its current yaw instead
+     * of chasing a bearing that is visually irrelevant (a real player digging straight down
+     * keeps whatever facing they had). Discriminating by PITCH, not horizontal distance: a log
+     * right beside the face sits at ~0.3 blocks horizontal but only ~30° pitch, and the body
+     * must absolutely square onto it — a distance threshold froze exactly that case (owner
+     * field report: chopping while facing away from the trunk).
      */
-    public static final double ENGAGED_MIN_HORIZ = 0.35;
+    public static final float ENGAGED_VERTICAL_PITCH_DEG = 65.0f;
     /** Engaged pitch clamp (deg): mining a ceiling/floor block wants a deeper look-up/-down than
      *  the ambient ±60° cone; players routinely pitch ~75–90° at their work point. */
     public static final float ENGAGED_MAX_PITCH_DEG = 75.0f;

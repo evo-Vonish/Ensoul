@@ -167,14 +167,18 @@ public final class LookController {
             double edz = engZ - body.getZ();
             double ehoriz = Math.sqrt(edx * edx + edz * edz);
             float eBody = body.getYRot();
-            // Degenerate bearing: the work point is straight above/below (shaft mining, ceiling
-            // block) and atan2 of near-zero components is an arbitrary yaw — hold the current
-            // facing and let pitch carry the aim, like a real player digging straight down.
-            float engYaw = ehoriz < LookTunables.ENGAGED_MIN_HORIZ
+            float rawPitch = (float) (-Math.toDegrees(Math.atan2(edy, ehoriz)));
+            // Vertical work point (straight above/below — shaft mining, a ceiling block): yaw is
+            // visually irrelevant and its atan2 is numerically arbitrary — hold the current facing
+            // and let pitch carry the aim, like a real player digging straight down. Discriminated
+            // by PITCH: a block right beside the face is CLOSE horizontally but shallow-pitched,
+            // and the body must square onto it (a distance threshold froze exactly that case).
+            boolean vertical = Math.abs(rawPitch) >= LookTunables.ENGAGED_VERTICAL_PITCH_DEG
+                    || ehoriz < 1.0e-3;
+            float engYaw = vertical
                     ? eBody
                     : (float) (Math.toDegrees(Math.atan2(edz, edx)) - 90.0);
-            float engPitch = LookMath.clamp(
-                    (float) (-Math.toDegrees(Math.atan2(edy, ehoriz))),
+            float engPitch = LookMath.clamp(rawPitch,
                     -LookTunables.ENGAGED_MAX_PITCH_DEG, LookTunables.ENGAGED_MAX_PITCH_DEG);
 
             float eHead = smoothHeadValid ? smoothHead : body.getYHeadRot();

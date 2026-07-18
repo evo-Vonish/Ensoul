@@ -365,9 +365,14 @@ public final class Reflexes {
      */
     private static void onHurt(PerceptionEvents.HurtInfo info) {
         if (!ENABLED) return;
+        NumenPlayer body = info.body();
+        // 龟缩期间被命中 = 掩体有洞(或坑太浅)的实证:立即让龟缩肌重验密封并补洞/挖深(幂等,仅
+        // holding 时生效),而不是蹲在假安全里干等——实测死亡 #3(“已封闭”事件后 3 秒仍被邻格僵尸
+        // 村民打穿)的修复之一。放在 living-attacker 过滤之前:箭、爆炸溅射等任何伤害都触发重验。
+        TurtleState turtle = TURTLES.get(body.getUUID());
+        if (turtle != null) turtle.drive.reverify();
         Entity attacker = livingAttacker(info.source());
         if (attacker == null) return;
-        NumenPlayer body = info.body();
         PerceptionState st = Perceptions.stateFor(body);
         st.reflexAttacker = attacker;
         st.reflexAttackerSeenTick = body.level().getGameTime();
@@ -702,10 +707,13 @@ public final class Reflexes {
 
     // ============================================================ turtle-up (刀③)
 
-    /** Per-body turtle bookkeeping: the muscle + whether we've emitted the once-per-burrow "封闭掩体" note. */
+    /** Per-body turtle bookkeeping: the muscle + the once-per-burrow note latches (one for the block-verified
+     *  "已封闭" report, one for the honest "未能完全密封,仍暴露" report — a burrow may emit both, in either
+     *  order, e.g. exposed first and sealed later once a hit-triggered reverify patched the hole). */
     private static final class TurtleState {
         final TurtleDrive drive;
         boolean sealedNoted;
+        boolean exposedNoted;
         TurtleState(TurtleDrive drive) { this.drive = drive; }
     }
 
@@ -732,9 +740,23 @@ public final class Reflexes {
         switch (ts.drive.tick()) {
             case WORKING, EMERGING -> { /* in progress — keep ticking */ }
             case SEALED -> {
-                if (!ts.sealedNoted) {
-                    ts.sealedNoted = true;
-                    emit(body, "本能龟缩:已封闭掩体,等待威胁散去。");
+                // SEALED means "holding", not "safe": the safety claim comes ONLY from the drive's
+                // block-measured audit (cap + both side rings solid AND depth ≥ 2 — the melee attack box has
+                // no vertical inflation, so 2 blocks of depth is what exits it). The old note here trusted
+                // the state machine and reported "已封闭" for the give-up crouch too — the lie behind field
+                // death #3 (sealed-note at 07:11:49, killed by the adjacent zombie villager from 07:11:52).
+                if (ts.drive.sealedTight()) {
+                    if (!ts.sealedNoted) {
+                        ts.sealedNoted = true;
+                        emit(body, "本能龟缩:已封闭掩体(实测头顶与四周全实心,深 "
+                                + ts.drive.depthReached() + " 格),等待威胁散去。");
+                    }
+                } else if (!ts.exposedNoted) {
+                    ts.exposedNoted = true;
+                    int gaps = ts.drive.openSealGaps();
+                    emit(body, "本能龟缩:掩体未能完全密封("
+                            + (gaps > 0 ? "缺 " + gaps + " 块," : "")
+                            + "深仅 " + ts.drive.depthReached() + " 格),仍暴露,危险未解除。");
                 }
                 // Re-evaluate on cadence: coast clear (no hostile near AND bright / owner here) → break out.
                 if (now % TURTLE_REASSESS_PERIOD == 0 && turtleCoastClear(body)) {

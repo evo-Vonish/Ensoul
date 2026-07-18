@@ -202,8 +202,11 @@ public class OpenAIProvider implements LlmProvider {
      *   <li>{@code d} — a short narration the model writes on every call, in the
      *       conversation's language, describing what it is doing right now. The chat
      *       panel shows this human sentence instead of the raw JSON args.</li>
-     *   <li>{@code max_seconds} — an optional per-call time-box; when present the
-     *       server tightens the task deadline to it (see {@code ToolContext.deadline}).</li>
+     *   <li>{@code timeout_seconds} — an optional per-call time-box; when present the
+     *       server tightens the task deadline to it (see {@code ToolContext.deadline}).
+     *       The unit lives IN the name — a bare "timeout" invites millisecond guesses
+     *       from the model. (Renamed from {@code max_seconds}; the server still accepts
+     *       the legacy key so persisted conversations replay cleanly.)</li>
      * </ul>
      * Both are OPTIONAL (never added to {@code required}); because they are injected
      * into {@code properties}, a schema with {@code additionalProperties:false} stays
@@ -223,7 +226,7 @@ public class OpenAIProvider implements LlmProvider {
             schema.add("properties", props);
         }
         if (!props.has("description")) props.add("description", narrationParamSchema());
-        if (!props.has("max_seconds")) props.add("max_seconds", maxSecondsParamSchema());
+        if (!props.has("timeout_seconds")) props.add("timeout_seconds", timeoutSecondsParamSchema());
     }
 
     /** Schema for the universal {@code description} self-narration parameter. */
@@ -237,8 +240,8 @@ public class OpenAIProvider implements LlmProvider {
         return p;
     }
 
-    /** Schema for the universal optional {@code max_seconds} per-call time-box. */
-    static JsonObject maxSecondsParamSchema() {
+    /** Schema for the universal optional {@code timeout_seconds} per-call time-box. */
+    static JsonObject timeoutSecondsParamSchema() {
         JsonObject p = new JsonObject();
         p.addProperty("type", "integer");
         p.addProperty("minimum", 1);

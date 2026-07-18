@@ -1802,8 +1802,136 @@ public final class NumenScreen extends Screen {
                     TXT_FAINT, null, key));
         } else {
             out.add(new Row(colored("▾ 认知事件", TXT_FAINT).getVisualOrderText(), TXT_FAINT, null, key));
-            wrapPlain(out, text, TXT_FAINT, width);
+            // Was: wrapPlain(out, text, …) — dumped the stored cognition XML verbatim, so a bottom-pinned
+            // scroll could clip the head element's opening tag and leave a wall of raw markup on screen
+            // ("生 XML 墙"). Now each element renders as one readable line; no scroll position shows markup.
+            for (String line : humanizeCognition(text)) {
+                wrapPlain(out, line, TXT_FAINT, width);
+            }
         }
+    }
+
+    /** Attribute reader for a cognition element's opening tag: {@code name="value"} → value. */
+    private static final java.util.regex.Pattern ATTR =
+            java.util.regex.Pattern.compile("([\\w-]+)\\s*=\\s*\"([^\"]*)\"");
+
+    /**
+     * Turn a run of cognition XML elements into human-readable lines — ONE per element — so the
+     * expanded {@code 认知事件} view never surfaces raw markup. This is the fix for the "生 XML 墙":
+     * the expanded branch used to {@link #wrapPlain} the stored XML verbatim, so a bottom-pinned
+     * scroll could clip the first element's opening tag and leave the owner staring at a wall of
+     * {@code <region_snapshot seq="…" schemaVersion="…">…}. Pure and MC-free, so a bare-JVM harness
+     * asserts it against stored conversation bytes.
+     *
+     * <p>Every cognition note's inner text is already an authored Chinese sentence (region snapshots
+     * {@code 此处是 …}, item pickups {@code 你捡起了 …}, {@link
+     * com.dwinovo.numen.core.perception.region.ValuablesSweep} sightings {@code 路过时留意到 …}), so
+     * the job is: peel each complete {@code <tag …>inner</tag>} (or self-closing) element with the
+     * SAME algorithm as {@link #splitCognitivePrefix}, map its tag (and an {@code event}'s {@code
+     * kind}) to a short readable label, and surface {@code 标签 · inner}. Damage is isolated, never
+     * amplified: a stray non-cognition fragment or an unclosed tail becomes its OWN single degraded
+     * line (content is never dropped, and the well-formed elements around it still humanize) — so no
+     * scroll position can re-expose the raw-markup wall.
+     */
+    static List<String> humanizeCognition(String xml) {
+        List<String> out = new ArrayList<>();
+        if (xml == null) return out;
+        String rest = xml;
+        while (true) {
+            String t = rest.stripLeading();
+            if (t.isEmpty()) break;
+            var m = EVENT_ROOT.matcher(t);
+            if (m.lookingAt()) {                                   // head is a complete cognition element
+                String tag = m.group(1);
+                int selfClose = t.indexOf("/>");
+                int open = t.indexOf('>');
+                if (open < 0) break;                               // no tag close at all — bail to degraded
+                int end;
+                String inner;
+                if (selfClose >= 0 && selfClose < open) {          // <tag …/> — no body (mirrors split peel)
+                    end = selfClose + 2;
+                    inner = "";
+                } else {
+                    String close = "</" + tag + ">";
+                    int at = t.indexOf(close, open);
+                    if (at < 0) break;                             // unclosed — bail to degraded (never drop)
+                    end = at + close.length();
+                    inner = t.substring(open + 1, at);
+                }
+                out.add(humanizeElement(tag, t.substring(0, open + 1), inner));
+                rest = t.substring(end);
+            } else {
+                // Head is not a cognition element: isolate the fragment up to the NEXT element (if any),
+                // emit it as ONE degraded line, and keep going — a bad head never dumps the whole tail.
+                var mf = EVENT_ROOT.matcher(t);
+                int next = mf.find() ? mf.start() : -1;
+                if (next <= 0) { out.add(collapseWs(t)); break; }
+                out.add(collapseWs(t.substring(0, next)));
+                rest = t.substring(next);
+            }
+        }
+        return out;
+    }
+
+    /** One cognition element → one readable line: {@code 标签 · <inner Chinese>} (or the label alone
+     *  when the element is self-closing / has no body). Pure. */
+    private static String humanizeElement(String tag, String openTag, String inner) {
+        String label = cognitionLabel(tag, openTag);
+        String body = collapseWs(xmlUnescape(inner));
+        return body.isEmpty() ? label : label + " · " + body;
+    }
+
+    /** Map a cognition element's tag (and an {@code event}'s {@code kind}) to a short human label.
+     *  An unknown kind falls back to a generic label — the inner Chinese sentence still carries the
+     *  meaning, so a newly-added perception kind degrades to {@code 事件 · …}, never to raw markup. */
+    private static String cognitionLabel(String tag, String openTag) {
+        return switch (tag) {
+            case "region_snapshot"  -> "环境";
+            case "region_diff"      -> "环境变化";
+            case "landmark_event"   -> "地标";
+            case "system_notice"    -> "系统通知";
+            case "inference"        -> "推理";
+            case "context_snapshot" -> "上下文";
+            case "system-reminder"  -> "提醒";
+            case "event" -> switch (attr(openTag, "kind")) {
+                case "item_pickup"       -> "拾取";
+                case "sighting"          -> "见闻";
+                case "hostile_proximity" -> "威胁";
+                case "hurt"              -> "受伤";
+                case "hunger"            -> "饥饿";
+                case "status_effect"     -> "状态";
+                case "time_of_day"       -> "时段";
+                case "weather"           -> "天气";
+                case "tool_broke"        -> "工具损坏";
+                case "tool_durability"   -> "工具耐久";
+                case "autonomy"          -> "自主";
+                case "reflex"            -> "本能";
+                default -> "事件";
+            };
+            default -> "事件";
+        };
+    }
+
+    /** Read {@code name="value"} from an opening tag; empty string if absent. Pure. */
+    private static String attr(String openTag, String name) {
+        var m = ATTR.matcher(openTag);
+        while (m.find()) if (m.group(1).equals(name)) return m.group(2);
+        return "";
+    }
+
+    /** Decode the five XML entities a cognition emitter could have escaped. {@code &amp;} last so a
+     *  literal {@code &lt;} in source text is not double-decoded. Pure. */
+    private static String xmlUnescape(String s) {
+        if (s == null) return "";
+        if (s.indexOf('&') < 0) return s;
+        return s.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&");
+    }
+
+    /** Flatten inner whitespace (incl. newlines) to single spaces so each element stays ONE logical
+     *  line for {@link #wrapPlain} to pixel-wrap. Pure. */
+    private static String collapseWs(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").strip();
     }
 
     /** Emit a thinking fold. Collapsed → one clickable summary row: live turns show

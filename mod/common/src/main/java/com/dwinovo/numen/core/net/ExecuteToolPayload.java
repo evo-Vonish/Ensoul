@@ -134,10 +134,10 @@ public record ExecuteToolPayload(UUID entityUuid,
         try {
             if (tool instanceof com.dwinovo.numen.core.tool.ServerNumenTool st) {
                 // The single point where every server tool's args are read: pull the optional
-                // per-call max_seconds cap and bind it for ctx() to pick up, so ToolContext.deadline
+                // per-call timeout_seconds cap and bind it for ctx() to pick up, so ToolContext.deadline
                 // can tighten the task's self-estimated budget. Instant/query tools never build a
                 // TaskRecord, so the bound cap is simply never consulted for them.
-                com.dwinovo.numen.core.tool.ServerNumenTool.bindMaxSeconds(readMaxSeconds(args));
+                com.dwinovo.numen.core.tool.ServerNumenTool.bindMaxSeconds(readTimeoutSeconds(args));
                 try {
                     st.runOnServer(p.toolCallId(), args, companion, reply);
                 } finally {
@@ -152,15 +152,22 @@ public record ExecuteToolPayload(UUID entityUuid,
     }
 
     /**
-     * The optional {@code max_seconds} time-box the model may put on any tool call
+     * The optional {@code timeout_seconds} time-box the model may put on any tool call
      * (universally injected into every tool schema at the engine serialization layer).
      * A positive integer caps this call's runtime; absent / non-positive / unparseable
      * yields {@code 0} (no cap). This is the one place the value is read off the wire.
+     * The legacy {@code max_seconds} key is still honoured so persisted conversations
+     * (and a mid-rename model habit) replay cleanly.
      */
-    private static int readMaxSeconds(JsonObject args) {
-        if (args.has("max_seconds") && args.get("max_seconds").isJsonPrimitive()) {
+    private static int readTimeoutSeconds(JsonObject args) {
+        int v = positiveInt(args, "timeout_seconds");
+        return v > 0 ? v : positiveInt(args, "max_seconds");
+    }
+
+    private static int positiveInt(JsonObject args, String key) {
+        if (args.has(key) && args.get(key).isJsonPrimitive()) {
             try {
-                int v = args.get("max_seconds").getAsInt();
+                int v = args.get(key).getAsInt();
                 return v > 0 ? v : 0;
             } catch (RuntimeException ignored) { /* not an int → no cap */ }
         }

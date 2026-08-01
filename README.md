@@ -70,7 +70,7 @@ repositories with full commit history preserved:
 
 Licensing follows the upstream split (modeled on AE2):
 
-- **Source code — [LGPL-3.0](LICENSE).** Forks you distribute must stay open under
+- **Source code — [LGPL-3.0](engine/LICENSE).** Forks you distribute must stay open under
   the same license.
 - **Public integration API — [MIT](engine/LICENSE-API).** The surface that
   compatibility modules and MCP bridges code against stays permissive, so anyone

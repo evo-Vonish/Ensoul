@@ -36,9 +36,30 @@ public abstract class ServerNumenTool implements NumenTool {
     public abstract void runOnServer(String toolCallId, JsonObject args,
                                      NumenPlayer companion, Consumer<String> reply);
 
-    /** Helper for world-action tools: a ToolContext carrying the call id + the body's current game time. */
+    /**
+     * Per-call {@code max_seconds} cap, bound by the {@code ExecuteToolPayload} dispatch
+     * chokepoint just before {@link #runOnServer} and read by {@link #ctx}. This ambient
+     * hand-off keeps the cap out of every tool's {@code ctx(...)} call site (they'd all
+     * need editing otherwise): the whole dispatch → runOnServer → ctx() chain runs
+     * synchronously on the server tick thread, so a plain thread-local is exact and leak-free.
+     */
+    private static final ThreadLocal<Integer> PENDING_MAX_SECONDS = new ThreadLocal<>();
+
+    /** Bind this call's model-requested {@code max_seconds} ({@code <=0} = none). Dispatch chokepoint only. */
+    public static void bindMaxSeconds(int maxSeconds) {
+        if (maxSeconds > 0) PENDING_MAX_SECONDS.set(maxSeconds);
+        else PENDING_MAX_SECONDS.remove();
+    }
+
+    /** Clear the bound {@code max_seconds} once the call returns. Always paired with {@link #bindMaxSeconds} in a finally. */
+    public static void unbindMaxSeconds() {
+        PENDING_MAX_SECONDS.remove();
+    }
+
+    /** Helper for world-action tools: a ToolContext carrying the call id, the body's current game time, and any max_seconds cap. */
     protected static ToolContext ctx(String toolCallId, NumenPlayer companion) {
-        return new ToolContext(toolCallId, companion.level().getGameTime());
+        Integer cap = PENDING_MAX_SECONDS.get();
+        return new ToolContext(toolCallId, companion.level().getGameTime(), cap == null ? 0 : cap);
     }
 
     /** Helper for world-action tools: hand a built task record to the companion's queue. */

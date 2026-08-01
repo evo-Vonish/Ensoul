@@ -23,6 +23,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.HashMap;
 import java.util.List;
@@ -62,7 +63,14 @@ public final class Perceptions {
     private static final float HP_QUARTER = 0.25f;     // crossing below this re-arms an urgent alert
 
     // ---- item pickup ----
-    private static final int PICKUP_BATCH_TICKS = 100; // aggregate pickups over this window
+    private static final int PICKUP_BATCH_TICKS = 100; // tumbling window: aggregate a burst of pickups into one note
+    /**
+     * Buffer-full early flush: once the batch spans this many distinct item kinds, emit the summary now instead
+     * of waiting out {@link #PICKUP_BATCH_TICKS} — bounds both the note's length and its latency during a fast,
+     * varied haul. A single item type mined continuously never trips this, so the window timer is the backstop
+     * that still guarantees a flush (nothing starves).
+     */
+    private static final int PICKUP_MAX_KINDS = 8;
 
     // ---- hunger (poll divisor 10) ----
     private static final int HUNGER_LOW = 6;           // ≤6 → non-urgent
@@ -123,6 +131,23 @@ public final class Perceptions {
     /** Package-private so {@link Reflexes} can reach a body's state from its own hurt seam. */
     static PerceptionState stateFor(NumenPlayer body) {
         return STATES.computeIfAbsent(body.getUUID(), k -> new PerceptionState());
+    }
+
+    /**
+     * Read-only attention hook for the look brain ({@code core.look}): the eye-height world point of the
+     * threat the reflex layer is currently tracking for {@code body} — a nearby creeper first, then a
+     * recently-seen attacker — or {@code null} when no threat is live. Lets the attention brain glance back
+     * at danger during a flee or fight without reaching into the perception layer's package-private state.
+     *
+     * <p>This <em>peeks</em> existing per-companion state (never {@code computeIfAbsent}), so a body that has
+     * never been hurt or scanned simply yields {@code null} — a cheap map lookup on the common no-threat path.
+     * The value is derived purely from the reflex refs {@link Reflexes} already maintains (see
+     * {@link PerceptionState#activeThreatEyePos(long)}); this seam only reads, it never arms or clears a threat.
+     * Server-thread only, like the rest of the perception layer.
+     */
+    public static Vec3 activeThreatEyePos(NumenPlayer body) {
+        PerceptionState st = STATES.get(body.getUUID());
+        return st == null ? null : st.activeThreatEyePos(body.level().getGameTime());
     }
 
     /**
@@ -342,6 +367,12 @@ public final class Perceptions {
         long now = body.level().getGameTime();
         String name = safe(info.stack().getHoverName().getString());
         st.pickupBatch.merge(name, info.count(), Integer::sum);
+        // A fast, varied haul already spanning PICKUP_MAX_KINDS distinct items flushes now (bounded size/latency);
+        // otherwise the burst rides the tumbling window. Same-item pickups keep accumulating their count either way.
+        if (st.pickupBatch.size() >= PICKUP_MAX_KINDS) {
+            flushPickups(body, st);
+            return;
+        }
         if (st.pickupFlushAt == 0) st.pickupFlushAt = now + PICKUP_BATCH_TICKS;
     }
 

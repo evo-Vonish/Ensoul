@@ -85,7 +85,7 @@ public final class PathSettings {
     public static final boolean ALLOW_BREAK = true;
     public static final boolean ALLOW_PLACE = true;
     public static final boolean ALLOW_SPRINT = true;
-    public static final boolean ALLOW_PARKOUR = false;
+    public static final boolean ALLOW_PARKOUR = true;
     public static final boolean ALLOW_PARKOUR_PLACE = false;
     public static final boolean ALLOW_PARKOUR_ASCEND = true;
     public static final boolean ALLOW_DIAGONAL_ASCEND = false;

@@ -375,4 +375,10 @@ public final class ShootCompanionTask implements CompanionTask {
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
     }
+
+    /** 结算时刻的实时进度(契约方法):已击毁几个。start() 早退时计数为零,安全。 */
+    @Override
+    public String progressSummary() {
+        return "已击毁 " + r.getDestroyed() + "/" + r.count + " " + r.label;
+    }
 }

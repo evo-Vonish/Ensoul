@@ -320,10 +320,21 @@ public final class PlaceBlockCompanionTask implements CompanionTask {
         data.put("z", r.pos.getZ());
         return switch (finalState) {
             case SUCCESS -> TaskResult.ok(doneReason, data);
-            case TIMEOUT -> TaskResult.timeout("timed out before placing " + r.label + " at " + coords()
-                    + (tried.isEmpty() ? "" : " (tried stances: " + describeTried() + ")"));
-            case CANCELLED -> TaskResult.cancelled("place_block interrupted");
+            case TIMEOUT -> TaskResult.timeout("place_block 超时 —— " + progressSummary(), data);
+            case CANCELLED -> TaskResult.cancelled("place_block 被打断 —— " + progressSummary(), data);
             default -> TaskResult.fail(doneReason, data);
         };
+    }
+
+    /** 结算时刻的实时进度:身在何处、目标块还没放上、试过哪些站位。 */
+    @Override
+    public String progressSummary() {
+        BlockPos feet = feet();
+        String s = "停在 " + feet.getX() + "," + feet.getY() + "," + feet.getZ()
+                + "," + r.label + "@" + coords() + " 未放置";
+        if (!tried.isEmpty()) {
+            s += ",已试 " + tried.size() + " 个站位(" + describeTried() + ")";
+        }
+        return s;
     }
 }

@@ -133,13 +133,45 @@ public record ExecuteToolPayload(UUID entityUuid,
                         new TaskResultPayload(p.entityUuid(), p.toolCallId(), json));
         try {
             if (tool instanceof com.dwinovo.numen.core.tool.ServerNumenTool st) {
-                st.runOnServer(p.toolCallId(), args, companion, reply);
+                // The single point where every server tool's args are read: pull the optional
+                // per-call timeout_seconds cap and bind it for ctx() to pick up, so ToolContext.deadline
+                // can tighten the task's self-estimated budget. Instant/query tools never build a
+                // TaskRecord, so the bound cap is simply never consulted for them.
+                com.dwinovo.numen.core.tool.ServerNumenTool.bindMaxSeconds(readTimeoutSeconds(args));
+                try {
+                    st.runOnServer(p.toolCallId(), args, companion, reply);
+                } finally {
+                    com.dwinovo.numen.core.tool.ServerNumenTool.unbindMaxSeconds();
+                }
             } else {
                 replyError(player, p, "tool not server-runnable: " + p.toolName());
             }
         } catch (RuntimeException ex) {
             replyError(player, p, "invalid arguments: " + ex.getMessage());
         }
+    }
+
+    /**
+     * The optional {@code timeout_seconds} time-box the model may put on any tool call
+     * (universally injected into every tool schema at the engine serialization layer).
+     * A positive integer caps this call's runtime; absent / non-positive / unparseable
+     * yields {@code 0} (no cap). This is the one place the value is read off the wire.
+     * The legacy {@code max_seconds} key is still honoured so persisted conversations
+     * (and a mid-rename model habit) replay cleanly.
+     */
+    private static int readTimeoutSeconds(JsonObject args) {
+        int v = positiveInt(args, "timeout_seconds");
+        return v > 0 ? v : positiveInt(args, "max_seconds");
+    }
+
+    private static int positiveInt(JsonObject args, String key) {
+        if (args.has(key) && args.get(key).isJsonPrimitive()) {
+            try {
+                int v = args.get(key).getAsInt();
+                return v > 0 ? v : 0;
+            } catch (RuntimeException ignored) { /* not an int → no cap */ }
+        }
+        return 0;
     }
 
     public static void replyError(ServerPlayer player, ExecuteToolPayload p, String message) {

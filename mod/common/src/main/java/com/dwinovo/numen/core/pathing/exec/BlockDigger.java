@@ -52,6 +52,7 @@ public final class BlockDigger {
     private float progress;       // accumulated 0..1 (Carpet curBlockDamageMP)
     private boolean started;      // START_DESTROY_BLOCK has been sent for `pos`
     private int blockHitDelay;    // post-break cooldown (survives reset())
+    private Vec3 engageHold;      // last dig aim point, kept engaged through the cooldown (survives reset())
 
     public BlockDigger(NumenPlayer player) {
         this.player = player;
@@ -72,6 +73,13 @@ public final class BlockDigger {
         Level level = player.level();
         if (blockHitDelay > 0) {                    // let the previous break land first
             blockHitDelay--;
+            // Keep the eyes engaged on the just-broken block through the whole cooldown: the ENGAGED
+            // latch lapses after ENGAGED_HOLD_TICKS (3t) but the delay runs BLOCK_HIT_DELAY (5t), so
+            // without a per-tick refresh the head would relax mid-cooldown and snap back for the last
+            // couple of frames. Cosmetic only — this branch drives no break and no locomotion.
+            if (engageHold != null) {
+                InputDriver.engage(player, engageHold);
+            }
             InputDriver.halt(player);
             return false;
         }
@@ -102,7 +110,14 @@ public final class BlockDigger {
         // when the TARGET itself goes, so callers that count mined targets / treat the cell as cleared
         // aren't fooled by a leaf we broke just to open the line of sight.
         boolean targetBreak = effective.equals(target);
-        InputDriver.lookAt(player, hit.getLocation());
+        // Cosmetic: turn the head onto the block being mined via the ENGAGED channel instead of a hard
+        // snap. The break is driven entirely by the eye-position raycast (reachableHit / centerRaycast),
+        // the held tool and getDestroyProgress below — none of which read head rotation — so this
+        // changes only how the dig LOOKS, never its tick count. Remember the aim so the post-break
+        // cooldown branch can hold this gaze across the 5t delay.
+        Vec3 aim = hit.getLocation();
+        InputDriver.engage(player, aim);
+        engageHold = aim;
         Direction side = hit.getDirection();
         BlockState state = level.getBlockState(pos);
 
@@ -171,6 +186,7 @@ public final class BlockDigger {
         boolean creative = player.getAbilities().instabuild;
         int best = inv.getSelectedSlot();
         float bestSpeed = inv.getItem(best).getDestroySpeed(state);
+        int bestDura = remainingDurability(inv.getItem(best));
         // In creative, destroy speed is irrelevant (any VALID item instabreaks) but a held
         // sword/trident (canDestroyBlocksInCreative=false) makes ServerPlayerGameMode.destroyBlock
         // refuse the break outright. So: never pick such an item — if the current slot can't
@@ -178,17 +194,33 @@ public final class BlockDigger {
         // everything in creative), and skip every sword/trident candidate in the scan below.
         if (creative && !canDestroyWith(inv.getItem(best), state)) {
             bestSpeed = -1.0f;
+            bestDura = -1;
         }
         for (int i = 0; i < inv.getContainerSize(); i++) {
             ItemStack s = inv.getItem(i);
             if (creative && !canDestroyWith(s, state)) continue;
             float speed = s.getDestroySpeed(state);
-            if (speed > bestSpeed) {
+            int dura = remainingDurability(s);
+            // Fastest tool wins as before; among EQUALLY-fast ACTUAL tools (speed > 1 — not bare hand
+            // or a non-tool) prefer the one with more durability left, so a spare full pickaxe is used
+            // before a near-shattered identical one (F6, durability-aware). Tie-break only — it never
+            // changes the tool TIER the cost model priced, so the planned break cost still matches.
+            boolean better = speed > bestSpeed
+                    || (speed == bestSpeed && speed > 1.0f && dura > bestDura);
+            if (better) {
                 bestSpeed = speed;
+                bestDura = dura;
                 best = i;
             }
         }
         player.holdInHand(best);
+    }
+
+    /** Remaining uses before {@code s} breaks — {@link Integer#MAX_VALUE} for empty slots (bare hand)
+     *  and non-damageable items, so only damageable tools ever tie-break by wear. */
+    private static int remainingDurability(ItemStack s) {
+        if (s.isEmpty() || !s.isDamageableItem()) return Integer.MAX_VALUE;
+        return s.getMaxDamage() - s.getDamageValue();
     }
 
     /** Whether holding {@code stack} would let the server actually destroy {@code state} at the

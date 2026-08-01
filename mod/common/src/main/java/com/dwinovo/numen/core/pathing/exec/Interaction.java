@@ -1,5 +1,6 @@
 package com.dwinovo.numen.core.pathing.exec;
 
+import com.dwinovo.numen.core.perception.GuiEngagement;
 import com.dwinovo.numen.entity.NumenPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.InteractionHand;
@@ -319,6 +320,9 @@ public final class Interaction {
                     player, player.level(), player.getItemInHand(h), h, hit);
             if (res.consumesAction()) {
                 player.swing(h);
+                // If this click opened a station menu, register it so the GUI-engagement pass keeps
+                // the body faced and planted for the session (a lever/door opens nothing → no-op).
+                GuiEngagement.registerIfMenuOpen(player, block);
                 return true;
             }
         }
@@ -339,9 +343,11 @@ public final class Interaction {
         net.minecraft.world.phys.Vec3 rel = new net.minecraft.world.phys.Vec3(0.0, entity.getBbHeight() * 0.5, 0.0);
         for (InteractionHand h : HANDS) {
             if (entity.interact(player, h, rel).consumesAction()) {       // animals / villagers
+                GuiEngagement.registerIfMenuOpen(player, entity);          // a trade GUI opened → face it
                 return true;
             }
             if (player.interactOn(entity, h, rel).consumesAction()) {     // item frames / leads
+                GuiEngagement.registerIfMenuOpen(player, entity);
                 return true;
             }
         }

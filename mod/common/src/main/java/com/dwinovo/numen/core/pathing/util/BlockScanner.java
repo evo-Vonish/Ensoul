@@ -115,6 +115,27 @@ public final class BlockScanner {
     }
 
     /**
+     * Count chunk COLUMNS intersecting the search box that are NOT loaded — terrain a
+     * scan couldn't see (require=false, no loading/generation). Surfaced by the miner's
+     * terminal message so "nothing here" is honest about unsearched, unloaded area
+     * within the radius (D/F4) rather than claiming the whole sphere is empty. This is
+     * a cheap chunk-map sweep (no block reads); it never forces a load.
+     */
+    public static int countUnloadedChunks(Level level, BlockPos center, int radius) {
+        int minChunkX = SectionPos.blockToSectionCoord(center.getX() - radius);
+        int maxChunkX = SectionPos.blockToSectionCoord(center.getX() + radius);
+        int minChunkZ = SectionPos.blockToSectionCoord(center.getZ() - radius);
+        int maxChunkZ = SectionPos.blockToSectionCoord(center.getZ() + radius);
+        int unloaded = 0;
+        for (int cx = minChunkX; cx <= maxChunkX; cx++) {
+            for (int cz = minChunkZ; cz <= maxChunkZ; cz++) {
+                if (level.getChunk(cx, cz, ChunkStatus.FULL, false) == null) unloaded++;
+            }
+        }
+        return unloaded;
+    }
+
+    /**
      * Off-thread: read the captured chunks' section palettes (Baritone's
      * {@code WorldScanner} does the same — palette reads of already-loaded
      * chunks). Reads can race with main-thread block writes, so each chunk is

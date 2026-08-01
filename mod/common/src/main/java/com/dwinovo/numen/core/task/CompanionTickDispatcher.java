@@ -49,6 +49,11 @@ public final class CompanionTickDispatcher {
                 // look engine a smooth gaze intent. Runs every tick (idle AND walking); the engine
                 // itself yields to any fresher hard-aim / locomotion, so this can push unconditionally.
                 LookBrain.tick(ap);
+                // GUI-engagement posture ("工位姿态"): while a container menu is open, face the station
+                // and stay planted for the whole session. Runs AFTER tickOne (so its halt overrides the
+                // idle-autonomy sleepwalk that tickOne may have issued) and BEFORE the reflex layer's
+                // Perceptions::tick (so a survival reflex still wins the body — see GuiEngagement).
+                com.dwinovo.numen.core.perception.GuiEngagement.tick(ap);
             }
         }
     }
@@ -94,6 +99,7 @@ public final class CompanionTickDispatcher {
         }
         QUEUES.remove(id);   // the body is gone; don't leak its queue
         LookBrain.forget(id);   // drop the companion's attention state with its queue
+        com.dwinovo.numen.core.perception.GuiEngagement.forget(id);   // ...and any GUI-engagement registration
     }
 
     private static void tickOne(NumenPlayer player) {
@@ -112,7 +118,9 @@ public final class CompanionTickDispatcher {
         } else if (running.record().getState() == TaskState.RUNNING) {
             if (player.level().getGameTime() >= running.record().getDeadlineGameTime()) {
                 running.record().setState(TaskState.TIMEOUT);
-            } else {
+            } else if (!com.dwinovo.numen.core.perception.Reflexes.ownsBody(player)) {
+                // 身体仲裁 (刀②): while a survival reflex drives the body (flee-nav / turtle / creeper sprint /
+                // drowning / fire-lava) the task yields — its navigator must not fight the reflex for the inputs.
                 running.record().setState(running.task().tick());
             }
         }
@@ -127,6 +135,13 @@ public final class CompanionTickDispatcher {
                 ACTIVE.remove(id);
             }
         }
+
+        // Idle-autonomy L3 (sleepwalk layer, lowest priority): self-gates on reflex body
+        // ownership / brain turn in flight, and we hand it the dispatcher's own ground truth
+        // about an active task, so it acts only when nobody else is driving. It runs after
+        // the completion block so a task that just finished frees the body this same tick.
+        // See docs/idle-autonomy-L3.md.
+        com.dwinovo.numen.core.autonomy.AutonomyScheduler.tick(player, ACTIVE.containsKey(id));
 
         drainResults(player);
     }

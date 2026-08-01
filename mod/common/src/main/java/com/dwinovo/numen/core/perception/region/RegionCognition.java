@@ -10,16 +10,24 @@ import net.minecraft.server.level.ServerLevel;
  * observation events, and answers {@code recall_region}. It sits between the
  * cheap, deterministic scan ({@link RegionObservation}) and the append-only
  * store ({@link RegionStore}), applying the dispatch + §5.4 pairing rule of
- * {@code docs/numen-context-design-v1.md} (the canonical contract):
+ * {@code docs/numen-context-design-v1.md} (the canonical contract), refined by the
+ * dual-baseline rule — a region's surface and underground strata produce disjoint
+ * observation content, so each keeps its OWN baseline slot and crossing between
+ * them is never a change (跨层 ≠ 变更):
  *
  * <pre>
- *   从未观察  → append REGION_SNAPSHOT v1
- *   hash 相同 → 零追加(复访可附时效提示)
- *   hash 不同 → 结构化 diff → 重要性过滤 →
+ *   区域从未观察          → append REGION_SNAPSHOT v1
+ *   该层首访(区域已知)    → append REGION_SNAPSHOT vN(跨层切换永不产生 diff)
+ *   槽内 hash 相同        → 零追加(复访可附时效提示)
+ *   槽内 hash 不同        → 同层结构化 diff → 重要性过滤 →
  *       小变更                       → 仅 REGION_DIFF
  *       结构性变更 / 累计 diff ≥ K /
  *       diff 总量超上一快照 1.5 倍   → REGION_DIFF + 紧随 REGION_SNAPSHOT vN(成对)
  * </pre>
+ *
+ * <p>「不再可见」≠「确认消失」: an ore or feature is only reported gone when the SAME
+ * stratum is revisited and it is truly absent — never because the observer surfaced
+ * (or descended) and the other sampler cannot see it.
  *
  * <p>The pair's division of labour: the diff answers "why it changed", the fresh
  * snapshot answers "what it is now" — pushed to the tail where attention weight
@@ -68,6 +76,7 @@ public final class RegionCognition {
                 rec != null ? rec.feltHazards() : java.util.List.of();
         RegionObservation obs = RegionObservation.observe(level, key, body.blockPosition(), felt);
         if (obs == null) return;   // chunk not loaded — should not happen for the companion's own region
+        boolean stratum = obs.underground();   // selects the surface/underground baseline slot
 
         if (rec == null) {
             // First visit → snapshot v1 (首次进入区域 A → 只追加一个 snapshot).
@@ -76,8 +85,19 @@ public final class RegionCognition {
             return;
         }
 
-        if (rec.semanticHash().equals(obs.semanticHash())) {
-            // Unchanged → zero region append (test #4). Optionally note staleness on an old revisit.
+        if (!rec.hasBaseline(stratum)) {
+            // First visit to THIS stratum of an already-known region → fresh baseline snapshot vN.
+            // Never a diff: the two strata sample disjoint content, so diffing across them fabricates
+            // wholesale 消失/新增 (the view-dependent false-diff bug — version 9 in ten minutes). The
+            // other stratum's baseline is untouched; its ores stay remembered until that SAME stratum
+            // is revisited and they are truly gone (「不再可见」≠「确认消失」).
+            int version = store.recordSnapshotVersion(rec, obs, now);
+            emit(body, "region_snapshot", key, version, obs.render());
+            return;
+        }
+
+        if (rec.semanticHash(stratum).equals(obs.semanticHash())) {
+            // Unchanged in this stratum → zero region append (test #4). Optionally note staleness.
             long ageDays = (now - rec.observedAtGameTime()) / GAME_DAY;
             if (ageDays >= 1) {
                 emit(body, "region_revisit", key, 0,
@@ -87,8 +107,8 @@ public final class RegionCognition {
             return;
         }
 
-        // Hash moved → structured diff against the stored baseline.
-        RegionObservation.Diff diff = obs.diffFrom(rec.canonical());
+        // Hash moved within the stratum → structured diff against ITS OWN stored baseline.
+        RegionObservation.Diff diff = obs.diffFrom(rec.canonical(stratum));
         if (!diff.isSignificant()) {
             // Only insignificant terrain jitter (e.g. a height-band sample shifting by a block) — no
             // event and no canonical/log change, so the stored baseline stays append-only and the
@@ -99,15 +119,15 @@ public final class RegionCognition {
 
         store.recordDiff(rec, obs, diff, now);
 
-        // §5.4 pairing decision — does this diff also warrant a fresh full snapshot?
+        // §5.4 pairing decision (per-stratum bookkeeping) — does this diff also warrant a snapshot?
         //   structural: a container/workstation/bed/door/hazard appeared or vanished, or the
         //               dominant surface / biome changed (the world is *shaped* differently);
-        //   tooMany:    ≥ K diffs since the last snapshot (mental replay is getting long);
-        //   tooBig:     the trailing diffs outweigh the last snapshot by 1.5× (a fresh
+        //   tooMany:    ≥ K diffs in this stratum since its last snapshot (mental replay is long);
+        //   tooBig:     this stratum's trailing diffs outweigh its last snapshot by 1.5× (a fresh
         //               baseline is now cheaper to read than the diff chain).
         boolean structural = isStructural(diff);
-        boolean tooMany = rec.diffsSinceBaseline() >= PAIR_AFTER_DIFFS;
-        boolean tooBig = rec.trailingDiffJsonChars() > PAIR_SIZE_RATIO * rec.lastBaselineJsonChars();
+        boolean tooMany = rec.diffsSinceBaseline(stratum) >= PAIR_AFTER_DIFFS;
+        boolean tooBig = rec.trailingDiffJsonChars(stratum) > PAIR_SIZE_RATIO * rec.lastBaselineJsonChars(stratum);
 
         if (structural || tooMany || tooBig) {
             // Paired append: diff then snapshot vN, TWO events in the same flush — the diff
@@ -163,7 +183,9 @@ public final class RegionCognition {
     /**
      * Rebuild and render current cognition for {@code key} from the disk event stream, with a
      * read-time staleness note. Backs the {@code recall_region} tool. Never observes the live
-     * world — it reports remembered knowledge, which may be stale.
+     * world — it reports remembered knowledge, which may be stale. Both strata are rebuilt
+     * independently (per-stratum replay — a stratum switch in the log is never a change) and
+     * rendered side by side when both are known.
      */
     public static String recall(NumenPlayer self, RegionKey key, long now) {
         RegionStore store = RegionStore.forCompanion(self.getUUID());
@@ -171,13 +193,23 @@ public final class RegionCognition {
         if (rec == null) {
             return "你从未观察过该区域 " + key.label() + "。";
         }
-        RegionObservation rebuilt = store.rebuild(rec);
+        RegionObservation surface = RegionStore.rebuild(rec, false);
+        RegionObservation underground = RegionStore.rebuild(rec, true);
+        if (surface == null && underground == null) {
+            return "你从未观察过该区域 " + key.label() + "。";   // defensive — a record always has a slot
+        }
         long ageTicks = Math.max(0, now - rec.observedAtGameTime());
         long ageDays = ageTicks / GAME_DAY;
         String staleness = ageDays >= 1
                 ? "(上次观察于约 " + ageDays + " 个游戏日前,信息可能已过时)"
                 : "(观察于近期)";
-        return "区域 " + key.label() + " 的认知" + staleness + ":" + rebuilt.render();
+        StringBuilder sb = new StringBuilder("区域 ").append(key.label()).append(" 的认知").append(staleness).append(":");
+        if (surface != null && underground != null) {
+            sb.append("【地表】").append(surface.render()).append("【地下】").append(underground.render());
+        } else {
+            sb.append((surface != null ? surface : underground).render());
+        }
+        return sb.toString();
     }
 
     // ---- rendering ----

@@ -2,6 +2,7 @@ package com.dwinovo.numen.core.look;
 
 import com.dwinovo.numen.entity.NumenPlayer;
 import com.dwinovo.numen.core.pathing.exec.InputDriver;
+import com.dwinovo.numen.core.perception.Perceptions;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.animal.Animal;
@@ -37,9 +38,13 @@ import java.util.UUID;
  * The owner anchor is resolved for free via {@link NumenPlayer#resolveOwnerPlayer()} (a cross-dim
  * player-table lookup, near-zero cost). Nearby animals are NOT cached anywhere, so we run our own
  * light throttled scan ({@link #SCAN_PERIOD} ticks, small radius) — exactly the option the study
- * endorses. Threat glances (creeper/attacker) are deliberately NOT done here: that state lives in the
- * perception layer's package-private {@code PerceptionState}, and during a real threat the reflex
- * layer already hard-aims the head at it via {@code InputDriver.lookAt}. (See the handoff note.)
+ * endorses. Threat glances (creeper / recently-seen attacker) ARE scored here now, as a high-weight
+ * interest point: the point comes free from the perception layer via
+ * {@link Perceptions#activeThreatEyePos(NumenPlayer)} — a read-only peek at the threat the reflex layer
+ * already tracks (creeper first, then a recent attacker). It scores just below the owner ({@link #W_THREAT}),
+ * so danger reliably pulls the gaze into a panicked look-back while the companion flees. During an actual
+ * melee swing the reflex layer hard-aims the head at the target and this idle intent simply yields (the engine
+ * ignores a stale idle intent while a hard-aim or a mover owns the body), so the two never fight.
  *
  * <h2>Tuning</h2>
  * Every number below is a 26.1.2 "20 tps draft" starting point — <b>playtest-and-adjust</b>.
@@ -51,6 +56,12 @@ public final class LookBrain {
     // ------------------------------------------------------------------ interest weights (§C1)
     /** Owner social bias — dominant. Scaled into [0.5,1.0] by proximity so the owner, when present, usually wins. */
     private static final double W_OWNER = 1.0;
+    /**
+     * Active-threat glance — the panicked look-back at a creeper / recent attacker the reflex layer is tracking.
+     * Deliberately high (below the owner's 1.0 max) so danger reliably wins the gaze during a flee, yet a
+     * point-blank owner still edges it. Fixed (not proximity-scaled): the whole point is a dependable look-back.
+     */
+    private static final double W_THREAT = 0.9;
     /** Base weight of a nearby animal (scaled by proximity). */
     private static final double W_ANIMAL = 0.4;
     /** Extra weight for a MOVING animal (relative motion draws the eye). */
@@ -93,7 +104,7 @@ public final class LookBrain {
     private static final float ENV_YAW_SPREAD = 100.0f;   // ± deg from body yaw
     private static final float ENV_PITCH_MIN = -12.0f, ENV_PITCH_MAX = 18.0f;
 
-    private enum Kind { OWNER, ANIMAL, ENVIRONMENT }
+    private enum Kind { OWNER, THREAT, ANIMAL, ENVIRONMENT }
 
     /** Per-companion attention state (keyed by companion UUID). Server-thread only — no sync. */
     private static final class State {
@@ -104,6 +115,8 @@ public final class LookBrain {
         double habituation = 0.0;
         long lastScanTick = Long.MIN_VALUE;
         List<Animal> nearbyAnimals = List.of();
+        // active-threat glance point, refreshed read-only each tick from the perception layer; null = no live threat
+        Vec3 threatPoint = null;
         // frozen environment glance point (held for the dwell, then repicked)
         double envX, envY, envZ;
         boolean envValid = false;
@@ -160,10 +173,20 @@ public final class LookBrain {
         double ownerScore = ownerEligible
                 ? W_OWNER * (0.5 + 0.5 * (1.0 - body.distanceTo(owner) / OWNER_MAX_DIST))
                 : -1.0;
+
+        // Active-threat glance point (creeper / recent attacker) — a free read-only peek at the reflex layer's
+        // tracked threat. Null on the common no-threat path. Refreshed every tick (like the owner anchor) and
+        // stashed for resolvePoint / validity; the reflex layer's hard-aim during a melee swing takes the head
+        // regardless, so this intent only actually steers the gaze while fleeing (see the class note).
+        Vec3 threatPoint = Perceptions.activeThreatEyePos(body);
+        st.threatPoint = threatPoint;
+        boolean threatEligible = threatPoint != null;
+        double threatScore = threatEligible ? W_THREAT : -1.0;
+
         double envScore = W_ENVIRONMENT;   // always available as the idle-glance floor
 
         // Grow habituation on the current gaze (a stare slowly "gets boring"); it resets on a switch.
-        boolean currentValid = currentTargetValid(st, ownerEligible);
+        boolean currentValid = currentTargetValid(st, ownerEligible, threatEligible);
         st.habituation = currentValid ? Math.min(HABIT_MAX, st.habituation + HABIT_RATE) : 0.0;
 
         // Effective scores: ONLY the current target carries its habituation penalty, so a long stare
@@ -172,15 +195,18 @@ public final class LookBrain {
         double h = st.habituation;
         boolean curAnimal = st.kind == Kind.ANIMAL && bestAnimal != null && bestAnimal.getId() == st.targetEntityId;
         double ownerEff  = ownerScore      - (st.kind == Kind.OWNER ? h : 0.0);
+        double threatEff = threatScore     - (st.kind == Kind.THREAT ? h : 0.0);
         double animalEff = bestAnimalScore - (curAnimal ? h : 0.0);
         double envEff    = envScore        - (st.kind == Kind.ENVIRONMENT ? h : 0.0);
 
-        // Best rival by EFFECTIVE score (environment is the ever-present floor).
+        // Best rival by EFFECTIVE score (environment is the ever-present floor). Threat is compared LAST so that,
+        // at an exact tie, danger wins the gaze (its 0.9 already tops animals / environment and usually the owner).
         Kind bestKind = Kind.ENVIRONMENT;
         double bestEff = envEff;
         int bestId = -1;
         if (bestAnimal != null && animalEff > bestEff) { bestKind = Kind.ANIMAL; bestEff = animalEff; bestId = bestAnimal.getId(); }
         if (ownerEligible && ownerEff > bestEff)       { bestKind = Kind.OWNER;  bestEff = ownerEff;  bestId = -1; }
+        if (threatEligible && threatEff >= bestEff)    { bestKind = Kind.THREAT; bestEff = threatEff; bestId = -1; }
 
         boolean isCurrent = currentValid && bestKind == st.kind
                 && (bestKind != Kind.ANIMAL || bestId == st.targetEntityId);
@@ -201,9 +227,10 @@ public final class LookBrain {
         }
     }
 
-    private static boolean currentTargetValid(State st, boolean ownerEligible) {
+    private static boolean currentTargetValid(State st, boolean ownerEligible, boolean threatEligible) {
         switch (st.kind) {
             case OWNER:       return ownerEligible;
+            case THREAT:      return threatEligible;            // threat gone ⇒ re-home immediately (like the owner leaving)
             case ANIMAL:      return animalStillPresent(st);   // dropped from the scan box ⇒ stop staring
             case ENVIRONMENT: return st.envValid;
             default:          return false;
@@ -251,6 +278,8 @@ public final class LookBrain {
         switch (st.kind) {
             case OWNER:
                 return owner != null ? owner.getEyePosition() : null;
+            case THREAT:
+                return st.threatPoint;   // resolved read-only at the top of this tick; null re-homes via currentTargetValid
             case ANIMAL:
                 LivingEntity a = findAnimal(st);
                 return a != null ? a.getEyePosition() : null;

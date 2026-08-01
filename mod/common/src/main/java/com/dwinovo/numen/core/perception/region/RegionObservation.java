@@ -82,11 +82,13 @@ public final class RegionObservation {
     private final RegionKey key;
     /**
      * Which stratum this observation describes: {@code false} = the 4×4 surface sample (v1 behaviour),
-     * {@code true} = the region's underground stratum (the fix — see {@link #observe}). Render-only
-     * bookkeeping: it selects the prose in {@link #render()} and is persisted for round-trip fidelity,
-     * but is deliberately NOT part of {@link #canonicalString()} — the two strata already diverge on
-     * their <em>content</em> (rock walls / lava / ore vs surface block), so the hash separates them
-     * without a schema change (keeping v1 surface hashes byte-identical → no spurious diffs on reload).
+     * {@code true} = the region's underground stratum (see {@link #observe}). It selects the prose in
+     * {@link #render()}, is persisted for round-trip fidelity, and — since the dual-baseline fix — is
+     * the key {@link RegionCognition} uses to pick the region's surface/underground baseline slot in
+     * {@link RegionStore.Record}, so a stratum switch is never diffed against the other stratum's
+     * baseline (跨层 ≠ 变更). It stays deliberately NOT part of {@link #canonicalString()} — the two
+     * strata already diverge on their <em>content</em> (rock walls / lava / ore vs surface block), and
+     * keeping it out preserves v1 surface hashes byte-identical across reloads.
      */
     private final boolean underground;
     private final String dominantSurface;
@@ -269,6 +271,9 @@ public final class RegionObservation {
     public String semanticHash() { return semanticHash; }
     public List<Feature> features() { return features; }
     public List<Hazard> hazards() { return hazards; }
+
+    /** Which stratum this observation describes — the baseline-slot selector (see field doc). */
+    public boolean underground() { return underground; }
 
     // ==================================================== canonical + hash
 

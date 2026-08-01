@@ -230,13 +230,19 @@ public final class LocateBiomeTaskGoal implements CompanionTask {
                     + " blocks IN THIS DIMENSION (" + dim + ") — check the biome's "
                     + "home dimension (warped_forest/soul_sand_valley: nether; most "
                     + "others: overworld) or travel a few thousand blocks and retry", data);
-            case TIMEOUT -> TaskResult.timeout("biome search deadline hit after ~"
-                    + searched + " blocks with no " + r.biome
-                    + " — retrying immediately is fine, or travel first");
-            case CANCELLED -> TaskResult.cancelled("locate_biome interrupted");
+            case TIMEOUT -> TaskResult.timeout("locate_biome 超时 —— " + progressSummary()
+                    + ";可立即重试,或先移动一段再搜", data);
+            case CANCELLED -> TaskResult.cancelled("locate_biome 被打断 —— " + progressSummary(), data);
             case FAILED -> TaskResult.fail(failReason, data);
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
+    }
+
+    /** 结算时刻的实时进度:已采样多大半径、尚未命中目标群系。 */
+    @Override
+    public String progressSummary() {
+        int searched = Math.min(ring, SEARCH_RADIUS_RINGS) * SAMPLE_STEP_BLOCKS;
+        return "已采样 ~" + searched + " 格,未命中 " + r.biome;
     }
 
 }

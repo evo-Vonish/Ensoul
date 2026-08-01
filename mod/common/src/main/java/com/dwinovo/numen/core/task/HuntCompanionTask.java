@@ -311,4 +311,10 @@ public final class HuntCompanionTask implements CompanionTask {
             default -> TaskResult.fail("unexpected state: " + finalState, data);
         };
     }
+
+    /** 结算时刻的实时进度(契约方法):已击杀几个。start() 早退时计数为零,安全。 */
+    @Override
+    public String progressSummary() {
+        return "已击杀 " + r.getKilled() + "/" + r.count + " " + r.label;
+    }
 }

@@ -20,8 +20,12 @@ import java.util.Set;
  */
 public final class Movement {
 
-    /** Kind tag, used by the executor to pick an animation / phase order. */
-    public enum Kind { TRAVERSE, ASCEND, DESCEND, FALL, DIAGONAL, PILLAR, DIG_DOWN, PARKOUR }
+    /** Kind tag, used by the executor to pick an animation / phase order.
+     *  {@code FLY} is the creative-flight edge (creative-motion design v1): emitted
+     *  ONLY by {@code FlyPlanner}'s independent 3D air search and consumed by
+     *  {@code FlyPathExecutor} — the ground A* ({@code Moves}) never generates it,
+     *  and {@code PlayerPathExecutor} never receives it. */
+    public enum Kind { TRAVERSE, ASCEND, DESCEND, FALL, DIAGONAL, PILLAR, DIG_DOWN, PARKOUR, FLY }
 
     public final Kind kind;
     /** Feet position the entity starts this step at. */
@@ -77,6 +81,11 @@ public final class Movement {
                 int dz = dest.getZ() - src.getZ();
                 set.add(src.offset(dx, 0, 0));
                 set.add(src.offset(0, 0, dz));
+                // A sprinted diagonal can carry the body one cell past dest along the move
+                // axis before it settles — anchor that overshoot cell too, so the relocalizer
+                // holds the index there instead of reading "off path" while arrived() fights
+                // the body back toward dest (the DIAGONAL bang-bang jitter, P1-3).
+                set.add(dest.offset(Integer.signum(dx), 0, Integer.signum(dz)));
             }
             case DESCEND, FALL -> {
                 // Step horizontally into the column at source height, then fall.
@@ -85,18 +94,23 @@ public final class Movement {
                 for (int y = src.getY() - 1; y > dest.getY(); y--) {
                     set.add(new BlockPos(dest.getX(), y, dest.getZ()));
                 }
-                // Landing tolerance ±1 XZ around dest: knockback / residual
-                // momentum routinely lands a multi-block drop one cell off the
-                // planned column, and without these cells the relocalizer sees
-                // "off path" and burns the whole AWAY_BUDGET before replanning
-                // (Baritone judges fall landings by flat distance, same idea).
-                for (int dx = -1; dx <= 1; dx++) {
-                    for (int dz = -1; dz <= 1; dz++) {
-                        set.add(new BlockPos(dest.getX() + dx, dest.getY(), dest.getZ() + dz));
-                    }
+                // Landing tolerance: residual momentum / knockback routinely lands a
+                // multi-block drop one cell off the planned column, and without a tolerance
+                // the relocalizer sees "off path" and burns the whole AWAY_BUDGET before
+                // replanning (Baritone judges fall landings by flat distance, same idea).
+                // Restrict that tolerance to a 1×3 strip ALONG the travel direction (dest,
+                // one ahead, one behind) rather than a full 3×3 box — the box's off-axis
+                // corners overlap a NEIGHBOURING segment's landing box and thrash the
+                // relocalizer's index between segments (P2-9). A straight-down drop keeps
+                // just dest.
+                int fdx = Integer.signum(dest.getX() - src.getX());
+                int fdz = Integer.signum(dest.getZ() - src.getZ());
+                if (fdx != 0 || fdz != 0) {
+                    set.add(dest.offset(fdx, 0, fdz));       // overshot one ahead (carried momentum)
+                    set.add(dest.offset(-fdx, 0, -fdz));     // fell one short (braked / knocked back)
                 }
             }
-            default -> { /* TRAVERSE, PILLAR, DIG_DOWN: just src + dest */ }
+            default -> { /* TRAVERSE, PILLAR, DIG_DOWN, FLY: just src + dest */ }
         }
         validPositions = set;
         return set;

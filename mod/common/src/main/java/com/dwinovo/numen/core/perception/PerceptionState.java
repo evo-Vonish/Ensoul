@@ -1,6 +1,7 @@
 package com.dwinovo.numen.core.perception;
 
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -105,6 +106,12 @@ final class PerceptionState {
     long reflexAttackerSeenTick;
     /** True while a critical-HP episode is live; gates the once-per-episode note. */
     boolean reflexCriticalEpisode;
+    /** Game time ANY threat (attacker or proximity) last existed — arms the episode-close grace so a
+     *  chasing mob slipping outside the arming radius doesn't churn close/reopen (chase hysteresis). */
+    long reflexThreatSeenTick;
+    /** Game time the recover condition (clean verdict + HP above the line) started holding continuously;
+     *  0 = not holding. The episode only closes once it has held for the sustain window. */
+    long reflexCalmSinceTick;
     /** Game time the next reflex swing is allowed (~one hit per 12t); 0 = ready. */
     long reflexSwingUntil;
     /** Flee-drive deadline (≤ now+60t) while sprinting away; 0 = not currently fleeing. */
@@ -116,6 +123,17 @@ final class PerceptionState {
      */
     float reflexLastHitDamage;
 
+    // Reflex 2 (v4): threat-triggered assessment (刀①) — arm an engagement assessment on proximity, not just on
+    // a landed hit or HP<40%. Refreshed only on the idle proximity-scan cadence, so it's a null-check per tick.
+    /** Nearest hostile remembered by the idle proximity scan (arms the assessment before the first hit); null = none. */
+    Entity reflexNearHostile;
+
+    // Reflex 2 (v4): turtle-up (刀③) — the CORNERED escape hatch.
+    /** Game time the next turtle-up is allowed (600t between burrows); persists across episodes (anti-abuse). */
+    long reflexTurtleCooldownUntil;
+    /** True once this critical episode has already turtled (one per episode); reset when the episode ends. */
+    boolean reflexTurtledThisEpisode;
+
     // Reflex 3 (v2): creeper panic sprint — HP-independent, pre-explosion (the looting one-shot death).
     /**
      * Nearest creeper remembered by the 20t proximity scan; null = none nearby. Gates the per-tick
@@ -125,4 +143,37 @@ final class PerceptionState {
     Entity reflexCreeper;
     /** Creeper-sprint deadline (≤ now+40t) while sprinting away from a creeper; 0 = not creeper-fleeing. */
     long reflexCreeperFleeUntil;
+
+    // ---- read-only threat view for the attention brain (core.look) — derives, never writes ----
+
+    /**
+     * How long after the last hit / sighting an attacker still counts as an "active" look-back threat.
+     * Mirrors {@link Reflexes}' own {@code ATTACKER_GONE_TICKS} gone-timer so a long-finished engagement
+     * stops pulling the gaze back (a creeper ref needs no such window — the 20t reflex scan nulls it the
+     * moment the creeper leaves).
+     */
+    private static final long THREAT_ATTACKER_RECENT_TICKS = 100L;
+
+    /**
+     * The eye-height world point of the threat the reflex layer is currently tracking — creeper first (the
+     * more urgent thing to keep an eye on), then a recently-seen living attacker — or {@code null} when no
+     * threat is live. This is a pure read-only <em>derivation</em> over the existing reflex refs
+     * ({@link #reflexCreeper}, {@link #reflexAttacker}, {@link #reflexAttackerSeenTick}) that {@link Reflexes}
+     * already maintains: it reads what the spinal cord wrote and never writes anything itself. {@code now} is
+     * the current game time, used only to age out a stale attacker. Server-thread only, like the rest of this
+     * state. Consumed via {@link Perceptions#activeThreatEyePos(com.dwinovo.numen.entity.NumenPlayer)} so the
+     * look brain (a different package) can glance back at danger without reaching into these fields directly.
+     */
+    Vec3 activeThreatEyePos(long now) {
+        Entity c = reflexCreeper;
+        if (c != null && c.isAlive() && !c.isRemoved()) {
+            return c.getEyePosition();
+        }
+        Entity a = reflexAttacker;
+        if (a != null && a.isAlive() && !a.isRemoved()
+                && (now - reflexAttackerSeenTick) <= THREAT_ATTACKER_RECENT_TICKS) {
+            return a.getEyePosition();
+        }
+        return null;
+    }
 }

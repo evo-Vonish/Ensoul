@@ -5,6 +5,8 @@ import com.dwinovo.numen.core.combat.Decision;
 import com.dwinovo.numen.core.combat.EngagementAssessment;
 import com.dwinovo.numen.core.combat.McCombatAdapter;
 import com.dwinovo.numen.core.pathing.exec.InputDriver;
+import com.dwinovo.numen.core.pathing.exec.ReflexNav;
+import com.dwinovo.numen.core.pathing.exec.TurtleDrive;
 import com.dwinovo.numen.entity.CompanionLifecycle;
 import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
@@ -19,6 +21,7 @@ import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.food.FoodProperties;
 import net.minecraft.world.item.ItemStack;
@@ -105,6 +108,18 @@ public final class Reflexes {
     private static final int FLEE_MAX_TICKS = 60;
     /** Episode ends when the attacker has been dead / removed / unseen for this long. */
     private static final int ATTACKER_GONE_TICKS = 100;
+    /** Chase hysteresis: a live episode survives ALL threats being unseen for this long before it closes.
+     *  Crossing back outside the 8-block arming radius mid-chase is not safety — a chasing zombie re-enters
+     *  within a second, and every premature close+reopen minted a fresh context note (the observed
+     *  one-note-per-second reflex storm). */
+    private static final int THREAT_CLEAR_GRACE_TICKS = 100;
+    /** A clean-ENGAGE + recovered-HP verdict must hold for this long before it closes the episode. The raw
+     *  condition flaps at the boundary (HP regen/damage around the 50% line, fight/flee verdict re-scored
+     *  every REASSESS_PERIOD) and each flap re-opened the episode sub-second — the second storm engine. */
+    private static final int RECOVER_SUSTAIN_TICKS = 60;
+    /** Floor between two episode-start context notes. Whatever still churns episodes faster than this stays
+     *  ONE story in the context, not a line per churn (同主题最高seq为准 — the newest note wins anyway). */
+    private static final int CRITICAL_NOTE_COOLDOWN_TICKS = 200;
     /** How far ahead of the body the flee waypoint is placed (direction matters, not the exact point). */
     private static final double FLEE_LOOKAHEAD = 8.0;
 
@@ -121,6 +136,27 @@ public final class Reflexes {
     /** Radius the engagement engine gathers hostiles over for a reflex assessment. */
     private static final double THREAT_SCAN_RADIUS = 16.0;
 
+    // ---- Reflex 2 (v4): threat-triggered assessment (刀①) — no longer HP-gated ----
+    /**
+     * A hostile this close ARMS an engagement assessment even without a landed hit — the "满血就先评估" trigger
+     * that replaces the old blood-gate (assessment used to wait for HP&lt;40%, so the body stood frozen while
+     * arrows chipped it to 8 HP before anything fired). Scanned only on {@link #THREAT_TRIGGER_PERIOD} while the
+     * body is idle (no live attacker, no episode), so the per-tick cost stays a null-check.
+     */
+    private static final double THREAT_TRIGGER_RADIUS = 8.0;
+    /** Cadence of the idle hostile-proximity scan that arms the assessment (matches the perception proximity poll). */
+    private static final int THREAT_TRIGGER_PERIOD = 20;
+
+    // ---- Reflex 2 (v4): turtle-up (刀③) — the CORNERED escape hatch ----
+    /** Re-evaluate a live turtle (threat散去 / 天亮 / 主人靠近 → break out) on this cadence. */
+    private static final int TURTLE_REASSESS_PERIOD = 20;
+    /** No hostile within this radius (and it's bright / owner near) → the turtle breaks out. */
+    private static final double TURTLE_SAFE_RADIUS = 12.0;
+    /** Owner within this range counts as "safe to emerge" regardless of daylight. */
+    private static final double TURTLE_OWNER_NEAR = 8.0;
+    /** One turtle per episode, and at most one per this many ticks (anti-abuse / anti-flicker). */
+    private static final int TURTLE_COOLDOWN = 600;
+
     /**
      * The cached engagement verdict per companion in a LIVE critical episode ({@code nextReassess} = when to
      * re-run the engine). Populated on episode start, refreshed every {@link #REASSESS_PERIOD} ticks, and
@@ -130,6 +166,21 @@ public final class Reflexes {
     private static final Map<UUID, ReflexPlan> PLANS = new HashMap<>();
 
     private record ReflexPlan(long nextReassess, Decision decision, String limiting) {}
+
+    /**
+     * Reflex-only navigation sessions (刀②): a live {@link ReflexNav} per body currently fleeing along a planned
+     * A* route instead of the crude straight-line dash. Created lazily when the critical reflex flees, ticked each
+     * tick, and dropped (halted) the instant the flee ends, the verdict flips, or a higher reflex seizes the body —
+     * so it only ever holds entries for bodies actively pathing to safety (server-thread only, like PLANS).
+     */
+    private static final Map<UUID, ReflexNav> NAVS = new HashMap<>();
+
+    /**
+     * Live turtle-up burrows (刀③): a {@link TurtleDrive} per body currently digging in / holed up because the
+     * engagement engine returned CORNERED with a lethal race. Created when the turtle fires, ticked each tick,
+     * and dropped the moment the burrow finishes or the episode ends (server-thread only, like PLANS).
+     */
+    private static final Map<UUID, TurtleState> TURTLES = new HashMap<>();
 
     // ---- Reflex 3 (v2): creeper panic sprint (HP-independent, pre-explosion) ----
     /** A creeper within this many blocks → unconditional sprint away, regardless of HP. */
@@ -202,6 +253,9 @@ public final class Reflexes {
         boolean drowning;        // a drowning episode is live (gates the once-per-episode note)
         long drownRetargetAt;    // next allowed air-column search
         Vec3 drownTarget;        // cached horizontal swim target under a ceiling; null = swim straight up
+        long lastAirPos = Long.MIN_VALUE;   // packed BlockPos of the last cell breathed at full air — the
+                                            // free "way I came in" memory the escape falls back to when no
+                                            // air pocket is in scan range (the flooded-cave death)
 
         // fire / lava
         boolean heatEpisode;     // gates the once-per-episode note
@@ -251,8 +305,29 @@ public final class Reflexes {
             UUID id = body.getUUID();
             EXTRA.remove(id);
             PLANS.remove(id);
+            ReflexNav nav = NAVS.remove(id);
+            if (nav != null) nav.halt();
+            TurtleState t = TURTLES.remove(id);
+            if (t != null) t.drive.stop();
         });
         Constants.LOG.info("[numen-core] reflex layer (spinal cord) registered");
+    }
+
+    /**
+     * 刀②/身体仲裁: is a movement-owning reflex episode currently driving this body? The task dispatcher queries
+     * this before it advances a companion task, so a running task's navigator never fights the reflex for the
+     * body's inputs (the reflex layer ticks AFTER the dispatcher, so it already wins the input write each tick;
+     * this mutex additionally stops the task's own A* / viz from running uselessly and from leaving sneak /
+     * dig side-effects mid-flee). Cheap: a couple of field reads. Server-thread only, like the rest of the layer.
+     */
+    public static boolean ownsBody(NumenPlayer body) {
+        if (!ENABLED || Perceptions.isCreative(body)) return false;
+        PerceptionState st = Perceptions.stateFor(body);
+        long now = body.level().getGameTime();
+        if (st.reflexCriticalEpisode) return true;          // fighting / fleeing (ReflexNav) / turtling
+        if (now < st.reflexCreeperFleeUntil) return true;   // creeper panic sprint
+        ExtraState ex = EXTRA.get(body.getUUID());
+        return ex != null && (ex.drowning || ex.heatEpisode);   // drowning / fire-lava retreat
     }
 
     /**
@@ -290,9 +365,14 @@ public final class Reflexes {
      */
     private static void onHurt(PerceptionEvents.HurtInfo info) {
         if (!ENABLED) return;
+        NumenPlayer body = info.body();
+        // 龟缩期间被命中 = 掩体有洞(或坑太浅)的实证:立即让龟缩肌重验密封并补洞/挖深(幂等,仅
+        // holding 时生效),而不是蹲在假安全里干等——实测死亡 #3(“已封闭”事件后 3 秒仍被邻格僵尸
+        // 村民打穿)的修复之一。放在 living-attacker 过滤之前:箭、爆炸溅射等任何伤害都触发重验。
+        TurtleState turtle = TURTLES.get(body.getUUID());
+        if (turtle != null) turtle.drive.reverify();
         Entity attacker = livingAttacker(info.source());
         if (attacker == null) return;
-        NumenPlayer body = info.body();
         PerceptionState st = Perceptions.stateFor(body);
         st.reflexAttacker = attacker;
         st.reflexAttackerSeenTick = body.level().getGameTime();
@@ -362,20 +442,31 @@ public final class Reflexes {
     // ============================================================ reflex 2: critical-HP fight-back / flee
 
     /**
-     * The mauled-while-thinking death, now decided by the deterministic engagement engine (§3.1/§3.2) instead
-     * of the crude v2 "one blow ≥ 25% of max HP → flee" scalar, which mis-called both directions (fled a lucky
-     * big hit from a beatable mob; kept trading blows into a pile that summed to a kill). Engages when a LIVING
-     * attacker has recently hit the body AND the engine's verdict is not a clean {@link Decision#ENGAGE} (the
-     * heavy-hitter / one-shot / pack cases the old scalar tried to catch), OR HP is already below
-     * {@link #HP_CRITICAL_FRAC}. While engaged, each tick acts on the cached verdict ({@link #planFor},
-     * re-run at most every {@link #REASSESS_PERIOD} ticks — O(entities) arithmetic, never per tick):
-     * {@link Decision#ENGAGE}/{@link Decision#CORNERED} → fight back (face + native swing, one per
-     * {@link #SWING_COOLDOWN} at full charge) within {@link #MELEE_RANGE}; every other verdict → flee along the
-     * shared owner-aware {@link #fleeDirection} vector for up to {@link #FLEE_MAX_TICKS}. A dangerous verdict
-     * keeps us fleeing until the attacker is gone (an HP rebound is not safety — one more blow can be lethal);
-     * a clean-ENGAGE verdict ends the episode on HP recovery above {@link #HP_RECOVER_FRAC}. The episode also
-     * ends when the attacker is dead / gone for {@link #ATTACKER_GONE_TICKS}. Yields movement to a live creeper
-     * sprint. One non-urgent note per episode (the reflex has already reacted; it informs, never consults).
+     * The mauled-while-thinking death, decided by the deterministic engagement engine (§3.1/§3.2). This is the
+     * v4 rewrite that closes the survival loop after the "5 分钟死 4 次" night:
+     *
+     * <ul>
+     *   <li><b>刀① 拆血门 — threat-triggered, no longer HP-gated.</b> The assessment now arms on <em>contact OR
+     *       proximity</em>: a LIVING attacker having recently hit the body, OR a hostile within
+     *       {@link #THREAT_TRIGGER_RADIUS} (scanned on the {@link #THREAT_TRIGGER_PERIOD} idle cadence). At full
+     *       HP the engine's verdict is executed immediately — no more standing frozen while arrows chip the body
+     *       to 8 HP. {@link #HP_CRITICAL_FRAC} survives only as the 加急线: while wounded, {@link #planFor} is
+     *       forced to re-assess this tick (bypassing the {@link #REASSESS_PERIOD} throttle).</li>
+     *   <li><b>Verdict execution.</b> {@link Decision#ENGAGE}/{@link Decision#CORNERED} within
+     *       {@link #MELEE_RANGE} → fight back (native swing, one per {@link #SWING_COOLDOWN} at full charge);
+     *       every other verdict → flee.</li>
+     *   <li><b>刀② 智能逃跑.</b> Flight now runs a PLANNED A* retreat ({@link ReflexNav}) toward a scored safe
+     *       cell, falling back to the v1 straight-line dash only when nothing is reachable — no more sprinting off
+     *       a cliff or into a second pack.</li>
+     *   <li><b>刀③ 第四选项.</b> A non-creeper {@link Decision#CORNERED} (打不过且跑不掉,评估判死) → 龟缩
+     *       ({@link TurtleDrive}): burrow, cap, hunker down, and break out when the coast clears.</li>
+     * </ul>
+     *
+     * <p>A dangerous verdict keeps us fleeing/turtling until the threat is gone (an HP rebound is not safety — one
+     * more blow can be lethal); a clean-ENGAGE verdict ends the episode on HP recovery above
+     * {@link #HP_RECOVER_FRAC}. The episode also ends when the threat is dead / gone for
+     * {@link #ATTACKER_GONE_TICKS}. Yields movement to a live creeper sprint / drowning / fire-lava reflex. One
+     * non-urgent note per episode (the reflex has already reacted; it informs, never consults).
      */
     private static void criticalHpReflex(NumenPlayer body, PerceptionState st, long now) {
         Entity attacker = st.reflexAttacker;
@@ -383,50 +474,112 @@ public final class Reflexes {
                 && attacker.level() == body.level();
         boolean recentContact = attackerLive && (now - st.reflexAttackerSeenTick) <= ATTACKER_GONE_TICKS;
 
-        // No live, recently-seen attacker → no episode. Close any open one, drop the cached verdict, bail cheap.
-        if (!recentContact) {
-            if (st.reflexCriticalEpisode) {
-                if (st.reflexFleeUntil != 0) InputDriver.halt(body);   // stop the flee drive we owned
-                endCriticalEpisode(st, body);
-            } else {
-                PLANS.remove(body.getUUID());
-            }
+        // 刀①: the assessment is no longer HP-gated. Without a landed hit we still ARM it on proximity — a hostile
+        // within THREAT_TRIGGER_RADIUS. Scanned on a throttle (only while there's no live attacker), so the idle
+        // per-tick cost stays a null-check. This is the "满血就先评估" trigger that killed the old blood-gate.
+        if (!recentContact && now % THREAT_TRIGGER_PERIOD == 0) {
+            st.reflexNearHostile = (body.level() instanceof ServerLevel lvl)
+                    ? nearestHostile(body, lvl, THREAT_TRIGGER_RADIUS) : null;
+        }
+        boolean nearHostileLive = st.reflexNearHostile != null && st.reflexNearHostile.isAlive()
+                && !st.reflexNearHostile.isRemoved() && st.reflexNearHostile.level() == body.level()
+                && body.distanceTo(st.reflexNearHostile) <= THREAT_TRIGGER_RADIUS;
+
+        // The entity the reflex steers toward when it fights/flees: the recorded attacker if any, else the
+        // nearest hostile the proximity scan armed us with (so a pre-hit approach is handled).
+        Entity threat = recentContact ? attacker : (nearHostileLive ? st.reflexNearHostile : null);
+
+        // Nothing to assess (no attacker, no nearby hostile) and no live episode → close any open one, bail cheap.
+        if (threat == null && !st.reflexCriticalEpisode) {
+            PLANS.remove(body.getUUID());
             return;
         }
+        if (threat == null) {
+            if (turtling(body)) {   // threat gone but a burrow is still open — let the turtle break out gracefully
+                tickTurtle(body, st, now);
+                return;
+            }
+            // Chase hysteresis: "no threat this tick" is not "safe" — a chasing mob that slipped outside the
+            // arming radius re-enters within a second, and closing+reopening the episode minted a context
+            // note per crossing. Hold the episode through the grace window: finish any planned retreat,
+            // plan nothing new (no threat to steer from), close only once the calm has lasted.
+            if (now - st.reflexThreatSeenTick <= THREAT_CLEAR_GRACE_TICKS) {
+                ReflexNav nav = NAVS.get(body.getUUID());
+                if (nav != null && nav.tick() != ReflexNav.Status.RUNNING) dropNav(body);
+                return;
+            }
+            endCriticalReflex(st, body);
+            return;
+        }
+        st.reflexThreatSeenTick = now;
 
         float max = body.getMaxHealth();
         float hp = body.getHealth();
-
-        // Ask the deterministic engine (throttled to REASSESS_PERIOD) for the fight/flee verdict — it replaces
-        // the crude 25%-hit scalar with the real armor / DPS / decreasing-k survival math + one-shot guard.
-        ReflexPlan plan = planFor(body, attacker, now);
-        boolean dangerous = plan.decision() != Decision.ENGAGE;   // the engine says fighting is not a clean win
         boolean wounded = hp < max * HP_CRITICAL_FRAC;
+
+        // Ask the deterministic engine for the fight/flee verdict (throttled to REASSESS_PERIOD). HP_CRITICAL_FRAC
+        // is now only the 加急线: when wounded, force an immediate re-assessment (bypass the throttle) so a plunging
+        // HP bar is reflected this tick instead of up to 10 ticks late. The provoked entity is the recorded
+        // attacker (so a provoking neutral golem is scored); a pure proximity trigger passes null (general scan).
+        ReflexPlan plan = planFor(body, recentContact ? attacker : null, now, wounded);
+        boolean dangerous = plan.decision() != Decision.ENGAGE;   // the engine says fighting is not a clean win
 
         if (st.reflexCriticalEpisode) {
             // A dangerous verdict never ends on an HP rebound — one more blow can be lethal; it ends only when
-            // the attacker is gone (handled above). A clean-ENGAGE verdict ends the episode on HP recovery.
-            boolean recovered = !dangerous && hp > max * HP_RECOVER_FRAC;
+            // the threat is gone (handled above). A clean-ENGAGE verdict ends the episode on HP recovery —
+            // but only a SUSTAINED one: the raw condition flaps at the boundary (HP regen/damage around the
+            // recover line, verdict re-scored every REASSESS_PERIOD) and each flap re-opened the episode
+            // sub-second, minting a context note per flap (the second storm engine).
+            boolean recovered = !dangerous && hp > max * HP_RECOVER_FRAC && !turtling(body);
             if (recovered) {
-                if (st.reflexFleeUntil != 0) InputDriver.halt(body);
-                endCriticalEpisode(st, body);
-                return;
+                if (st.reflexCalmSinceTick == 0) st.reflexCalmSinceTick = now;
+                if (now - st.reflexCalmSinceTick >= RECOVER_SUSTAIN_TICKS) {
+                    endCriticalReflex(st, body);
+                    return;
+                }
+            } else {
+                st.reflexCalmSinceTick = 0;
             }
-            actCritical(body, st, now, attacker, plan.decision());
+            actCritical(body, st, now, threat, plan);
             return;
         }
 
-        // Not engaged yet. Start when the engine says the fight is not a clean win (dangerous — heavy hitter /
-        // pile / one-shot risk), or the body is already wounded. A clean ENGAGE at healthy HP is left to the
-        // brain / hunt task (informs, never consults — the reflex only steps in when survival is in question).
+        // Not engaged yet. Start when the engine says the fight is not a clean win (dangerous — flee / avoid /
+        // kite / cornered), or the body is already wounded. A clean ENGAGE at healthy HP is left to the brain /
+        // hunt task (informs, never consults — the reflex only steps in when survival is in question).
         if (dangerous || wounded) {
             st.reflexCriticalEpisode = true;
             st.reflexFleeUntil = 0;
-            emit(body, "本能反应:遭遇威胁,已本能反击/撤离(攻击者:"
-                    + Perceptions.safe(attacker.getName().getString())
-                    + (plan.limiting().isEmpty() ? "" : ";评估:" + plan.limiting()) + ")。");
-            actCritical(body, st, now, attacker, plan.decision());
+            st.reflexCalmSinceTick = 0;
+            // Note floor: whatever still churns episodes faster than the cooldown stays ONE story in the
+            // context, not a line per churn — the spinal cord keeps acting either way, only the note is gated.
+            if (st.ready("reflex_critical_note", now)) {
+                st.arm("reflex_critical_note", now, CRITICAL_NOTE_COOLDOWN_TICKS);
+                emit(body, "本能反应:遭遇威胁,已本能反击/撤离(目标:"
+                        + Perceptions.safe(threat.getName().getString())
+                        + (plan.limiting().isEmpty() ? "" : ";评估:" + plan.limiting()) + ")。");
+            }
+            actCritical(body, st, now, threat, plan);
         }
+    }
+
+    /** End a critical episode cleanly: stop any flee-drive / nav / turtle we owned, then reset the state. */
+    private static void endCriticalReflex(PerceptionState st, NumenPlayer body) {
+        if (st.reflexFleeUntil != 0) InputDriver.halt(body);   // stop the straight-line flee drive we owned
+        endCriticalEpisode(st, body);
+    }
+
+    /** The nearest live hostile ({@link Monster}) within {@code radius}, or null — the idle proximity trigger's scan. */
+    private static Entity nearestHostile(NumenPlayer body, ServerLevel level, double radius) {
+        AABB box = body.getBoundingBox().inflate(radius);
+        Monster nearest = null;
+        double best = Double.MAX_VALUE;
+        for (Monster m : level.getEntitiesOfClass(Monster.class, box)) {
+            if (!m.isAlive()) continue;
+            double d = body.distanceToSqr(m);
+            if (d < best) { best = d; nearest = m; }
+        }
+        return nearest;
     }
 
     /**
@@ -436,10 +589,10 @@ public final class Reflexes {
      * {@link #endCriticalEpisode} (and when the attacker leaves). The recorded {@code attacker} is passed as the
      * provoked entity so a currently-attacking neutral (iron golem / enderman) is scored as the threat it is.
      */
-    private static ReflexPlan planFor(NumenPlayer body, Entity attacker, long now) {
+    private static ReflexPlan planFor(NumenPlayer body, Entity attacker, long now, boolean force) {
         UUID key = body.getUUID();
         ReflexPlan cached = PLANS.get(key);
-        if (cached != null && now < cached.nextReassess()) return cached;
+        if (!force && cached != null && now < cached.nextReassess()) return cached;   // force = the wounded 加急线
         EngagementAssessment a = McCombatAdapter.assessNearby(body, attacker, THREAT_SCAN_RADIUS);
         ReflexPlan plan = new ReflexPlan(now + REASSESS_PERIOD, a.decision(), a.limitingFactor());
         PLANS.put(key, plan);
@@ -453,18 +606,36 @@ public final class Reflexes {
      * ({@link Decision#FLEE}/{@link Decision#KITE}/{@link Decision#AVOID}), or an out-of-reach attacker → flee.
      * Yields movement to a live creeper sprint, which outranks a melee exchange (an explosion is instant death).
      */
-    private static void actCritical(NumenPlayer body, PerceptionState st, long now, Entity attacker, Decision decision) {
-        if (now < st.reflexCreeperFleeUntil || envOwnsMovement(body, now)) return;   // a higher reflex (creeper / drowning / fire-lava) owns movement this tick
+    private static void actCritical(NumenPlayer body, PerceptionState st, long now, Entity threat, ReflexPlan plan) {
+        // A live turtle owns the body until it seals, holds, and breaks out — tick it and nothing else.
+        if (turtling(body)) { tickTurtle(body, st, now); return; }
 
-        double dist = body.distanceTo(attacker);
-        // Keep "last seen" fresh while the attacker is still nearby so the gone-timer only runs once it leaves.
-        if (dist <= TRACK_RADIUS) st.reflexAttackerSeenTick = now;
+        if (now < st.reflexCreeperFleeUntil || envOwnsMovement(body, now)) {
+            dropNav(body);   // a higher reflex (creeper / drowning / fire-lava) drives — release our nav, keep the episode
+            return;
+        }
+
+        double dist = body.distanceTo(threat);
+        // Keep "last seen" fresh while the recorded attacker is still nearby so the gone-timer only runs once it leaves.
+        if (dist <= TRACK_RADIUS && threat == st.reflexAttacker) st.reflexAttackerSeenTick = now;
+
+        Decision decision = plan.decision();
+
+        // 刀③: CORNERED (打不过且跑不掉) with a non-creeper threat → 龟缩. The engine's non-creeper CORNERED cases all
+        // fail the survival sim AND flight, so CORNERED itself is the "评估判死" signal; a creeper CORNERED must NOT
+        // turtle (an adjacent blast opens the cap) and is left to the creeper reflex / flee. One per episode, 600t CD.
+        if (decision == Decision.CORNERED && !plan.limiting().contains("苦力怕")
+                && now >= st.reflexTurtleCooldownUntil && !st.reflexTurtledThisEpisode) {
+            enterTurtle(body, st, now);
+            return;
+        }
 
         boolean fight = decision == Decision.ENGAGE || decision == Decision.CORNERED;
         if (fight && dist <= MELEE_RANGE) {
-            fightBack(body, st, now, attacker);
+            dropNav(body);
+            fightBack(body, st, now, threat);
         } else {
-            flee(body, st, now, attacker);
+            flee(body, st, now, threat);
         }
     }
 
@@ -486,24 +657,126 @@ public final class Reflexes {
     }
 
     /**
-     * Sprint away from the attacker along the flee vector ({@link #driveFlee}), for at most
-     * {@link #FLEE_MAX_TICKS} per bout so the body doesn't sprint off a cliff forever.
+     * 刀②: flee along a PLANNED A* retreat ({@link ReflexNav}) instead of the v1 straight-line dash that ran the
+     * body off cliffs and into second packs. The nav is created at most once per {@link #FLEE_MAX_TICKS} bout
+     * (a Monster scan + candidate ranking is not free); while it runs it owns movement. On ARRIVED (reached a
+     * safe cell 16–24 blocks out) it is dropped and the episode re-evaluates next tick. On FAILED (no reachable
+     * escape cell) it falls back to the bounded straight-line {@link #driveFlee} for a bout before re-planning.
      */
-    private static void flee(NumenPlayer body, PerceptionState st, long now, Entity attacker) {
-        if (st.reflexFleeUntil == 0) st.reflexFleeUntil = now + FLEE_MAX_TICKS;
-        if (now < st.reflexFleeUntil) {
-            driveFlee(body, attacker);
-        } else {
-            InputDriver.halt(body);   // bout spent — stop driving movement, let the brain take over
+    private static void flee(NumenPlayer body, PerceptionState st, long now, Entity threat) {
+        ReflexNav nav = NAVS.get(body.getUUID());
+        if (nav != null) {
+            switch (nav.tick()) {
+                case RUNNING -> { st.reflexFleeUntil = 0; return; }               // the nav drives — no straight bout
+                case ARRIVED -> { dropNav(body); st.reflexFleeUntil = 0; InputDriver.halt(body); return; }
+                case FAILED -> { dropNav(body); st.reflexFleeUntil = now + FLEE_MAX_TICKS; }   // dash instead, this bout
+            }
         }
+        // A straight-line bout is in progress → drive it out before planning a fresh route (bounds the re-scan cost).
+        if (now < st.reflexFleeUntil) { driveFlee(body, threat); return; }
+        // No nav, no active bout → plan a fresh A* retreat; fall back to a bounded straight dash if none is reachable.
+        ReflexNav fresh = ReflexNav.flee(body, threat);
+        if (fresh != null) {
+            NAVS.put(body.getUUID(), fresh);
+            if (fresh.tick() == ReflexNav.Status.RUNNING) { st.reflexFleeUntil = 0; return; }
+            dropNav(body);   // instantly arrived / failed — clean up and dash this tick
+        }
+        st.reflexFleeUntil = now + FLEE_MAX_TICKS;
+        driveFlee(body, threat);
+    }
+
+    /** Stop and forget this body's flee nav (halts its {@link PlayerNav}, no residue). */
+    private static void dropNav(NumenPlayer body) {
+        ReflexNav nav = NAVS.remove(body.getUUID());
+        if (nav != null) nav.halt();
     }
 
     private static void endCriticalEpisode(PerceptionState st, NumenPlayer body) {
         st.reflexCriticalEpisode = false;
         st.reflexFleeUntil = 0;
+        st.reflexCalmSinceTick = 0;
         st.reflexAttacker = null;       // don't pin a possibly-removed entity; the next hit re-arms it
         st.reflexLastHitDamage = 0.0f;  // clear the last-hit latch with the attacker
+        st.reflexNearHostile = null;    // drop the proximity-trigger ref with the episode
+        st.reflexTurtledThisEpisode = false;   // the per-episode turtle gate re-arms for the next episode
+        dropNav(body);                  // stop any flee nav
+        TurtleState t = TURTLES.remove(body.getUUID());
+        if (t != null) t.drive.stop();  // abandon any burrow (release sneak / inputs)
         PLANS.remove(body.getUUID());   // the cached verdict only lives as long as the episode does
+    }
+
+    // ============================================================ turtle-up (刀③)
+
+    /** Per-body turtle bookkeeping: the muscle + the once-per-burrow note latches (one for the block-verified
+     *  "已封闭" report, one for the honest "未能完全密封,仍暴露" report — a burrow may emit both, in either
+     *  order, e.g. exposed first and sealed later once a hit-triggered reverify patched the hole). */
+    private static final class TurtleState {
+        final TurtleDrive drive;
+        boolean sealedNoted;
+        boolean exposedNoted;
+        TurtleState(TurtleDrive drive) { this.drive = drive; }
+    }
+
+    /** True while a turtle burrow is live for this body. */
+    private static boolean turtling(NumenPlayer body) {
+        return TURTLES.containsKey(body.getUUID());
+    }
+
+    /** Begin a turtle burrow: drop any flee nav, plant, arm the once-per-episode + cooldown gates, emit the note. */
+    private static void enterTurtle(NumenPlayer body, PerceptionState st, long now) {
+        dropNav(body);
+        InputDriver.halt(body);
+        st.reflexFleeUntil = 0;
+        st.reflexTurtledThisEpisode = true;
+        st.reflexTurtleCooldownUntil = now + TURTLE_COOLDOWN;
+        TURTLES.put(body.getUUID(), new TurtleState(new TurtleDrive(body)));
+        emit(body, "本能龟缩:打不过也跑不掉,正在原地下挖并封顶,缩进掩体等待威胁散去。");
+    }
+
+    /** One tick of a live turtle: dig / seal / hold, re-evaluate on cadence, and end the episode on break-out. */
+    private static void tickTurtle(NumenPlayer body, PerceptionState st, long now) {
+        TurtleState ts = TURTLES.get(body.getUUID());
+        if (ts == null) return;
+        switch (ts.drive.tick()) {
+            case WORKING, EMERGING -> { /* in progress — keep ticking */ }
+            case SEALED -> {
+                // SEALED means "holding", not "safe": the safety claim comes ONLY from the drive's
+                // block-measured audit (cap + both side rings solid AND depth ≥ 2 — the melee attack box has
+                // no vertical inflation, so 2 blocks of depth is what exits it). The old note here trusted
+                // the state machine and reported "已封闭" for the give-up crouch too — the lie behind field
+                // death #3 (sealed-note at 07:11:49, killed by the adjacent zombie villager from 07:11:52).
+                if (ts.drive.sealedTight()) {
+                    if (!ts.sealedNoted) {
+                        ts.sealedNoted = true;
+                        emit(body, "本能龟缩:已封闭掩体(实测头顶与四周全实心,深 "
+                                + ts.drive.depthReached() + " 格),等待威胁散去。");
+                    }
+                } else if (!ts.exposedNoted) {
+                    ts.exposedNoted = true;
+                    int gaps = ts.drive.openSealGaps();
+                    emit(body, "本能龟缩:掩体未能完全密封("
+                            + (gaps > 0 ? "缺 " + gaps + " 块," : "")
+                            + "深仅 " + ts.drive.depthReached() + " 格),仍暴露,危险未解除。");
+                }
+                // Re-evaluate on cadence: coast clear (no hostile near AND bright / owner here) → break out.
+                if (now % TURTLE_REASSESS_PERIOD == 0 && turtleCoastClear(body)) {
+                    ts.drive.breakOut();
+                }
+            }
+            case DONE -> {
+                emit(body, "本能龟缩:威胁散去,已破土而出。");
+                endCriticalEpisode(st, body);   // burrow over — close the episode, hand the body back to the brain
+            }
+        }
+    }
+
+    /** The turtle emerges when no hostile is within {@link #TURTLE_SAFE_RADIUS} and it's bright / the owner is here. */
+    private static boolean turtleCoastClear(NumenPlayer body) {
+        if (!(body.level() instanceof ServerLevel level)) return true;
+        if (nearestHostile(body, level, TURTLE_SAFE_RADIUS) != null) return false;
+        if (level.isBrightOutside()) return true;
+        ServerPlayer owner = body.resolveOwnerPlayer();
+        return owner != null && owner.level() == body.level() && body.distanceTo(owner) <= TURTLE_OWNER_NEAR;
     }
 
     // ============================================================ reflex 3: creeper panic sprint
@@ -600,6 +873,9 @@ public final class Reflexes {
         if (air >= DROWN_AIR_SAFE) {                 // 280+/300 → not drowning (the near-universal case): cheapest bail
             ExtraState ex = EXTRA.get(body.getUUID());
             if (ex != null && ex.drowning) ex.drowning = false;   // an episode that just resolved (surfaced / re-oxygenated)
+            // Free breadcrumb: while breathing at FULL air, remember where — this cell (or its brink)
+            // is guaranteed breathable, and it's exactly "the way I came in" when a dive goes wrong.
+            if (air >= body.getMaxAirSupply()) extra(body).lastAirPos = body.blockPosition().asLong();
             return;
         }
         boolean submerged = body.isInWater() || body.isUnderWater();
@@ -631,6 +907,14 @@ public final class Reflexes {
             }
             if (ex.drownTarget != null) {
                 InputDriver.stepToward(body, ex.drownTarget, false);   // swim horizontally toward open air (no sprint underwater)
+            } else if (ex.lastAirPos != Long.MIN_VALUE) {
+                // No air pocket in scan range (a big flooded cave — the death Fenn actually died): swim
+                // back the way it came. The last full-air cell is (near-)guaranteed breathable and was
+                // recorded for free while entering the water. Straight-line steer; the jump stroke below
+                // keeps buoyancy so the vertical and horizontal components combine.
+                BlockPos p = BlockPos.of(ex.lastAirPos);
+                InputDriver.stepToward(body,
+                        new Vec3(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5), false);
             } else {
                 InputDriver.halt(body);              // no reachable air found — hold horizontal, still stroke up
             }

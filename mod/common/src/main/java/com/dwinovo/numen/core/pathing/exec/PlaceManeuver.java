@@ -147,7 +147,12 @@ public final class PlaceManeuver {
         // we've ground forward without success, back off a step to re-find the angle
         // (Baritone MOVE_BACK), alternating in BACK_OFF_TICKS windows.
         player.setShiftKeyDown(true);
-        InputDriver.lookAt(player, facePoint);
+        // Cosmetic: turn onto the support face via the ENGAGED channel instead of a hard snap. The
+        // place is gated by crouch + the eye-position line of sight (Placement.resolve → castFromEye),
+        // and doPlace's own click path keeps its hard-aim fallback — neither reads this head yaw — so
+        // the softer gaze changes how the placement LOOKS, not whether or when it lands. The crouch /
+        // creep / halt state machine below is unchanged.
+        InputDriver.engage(player, facePoint);
 
         // Place ONLY once actually crouching (Baritone crouch-confirm — the sneak takes a tick
         // to register) AND the raycast genuinely reaches a support face. Never fabricate a hit:

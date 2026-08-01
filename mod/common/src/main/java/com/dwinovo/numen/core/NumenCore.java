@@ -158,6 +158,19 @@ public final class NumenCore {
         ToolRegistry.register(new com.dwinovo.numen.core.tools.PillarUpTool());
         ToolRegistry.register(new com.dwinovo.numen.core.tools.BridgeToTool());
         ToolRegistry.register(new com.dwinovo.numen.core.tools.EscapeToSurfaceTool());
+
+        // Survival-closure v2 (刀③): turtle_up — burrow + cap + hunker down, the brain-orderable face of the
+        // TurtleDrive muscle the reflex layer also fires for a CORNERED companion. Appended LAST so all prior
+        // tool ordering — and prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.TurtleUpTool());
+
+        // L1 landmark naming (Wave D): remember_place / forget_place / recall_places — let the model name and
+        // annotate important locations and recall them by name (writes the LandmarkStore's label/category/note
+        // via the AgentLoopRegistry seam). Appended LAST, after TurtleUpTool, so all prior tool ordering — and
+        // prompt caching — stays stable.
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RememberPlaceTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.ForgetPlaceTool());
+        ToolRegistry.register(new com.dwinovo.numen.core.tools.RecallPlacesTool());
     }
 
 
@@ -185,5 +198,9 @@ public final class NumenCore {
                 (p, r) -> new com.dwinovo.numen.core.task.BridgeToCompanionTask(p, r));
         CompanionTaskFactory.register(com.dwinovo.numen.core.task.EscapeToSurfaceTaskRecord.class,
                 (p, r) -> new com.dwinovo.numen.core.task.EscapeToSurfaceCompanionTask(p, r));
+
+        // Survival-closure v2 (刀③): the turtle_up muscle's task runner.
+        CompanionTaskFactory.register(com.dwinovo.numen.core.task.TurtleUpTaskRecord.class,
+                (p, r) -> new com.dwinovo.numen.core.task.TurtleUpCompanionTask(p, r));
     }
 }

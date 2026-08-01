@@ -35,6 +35,13 @@ public final class MineBlockTaskRecord extends TaskRecord {
      *  by the task; drives the stop condition + the debug overlay text. */
     private int mined = 0;
 
+    /** Vein mode (optional {@code auto_mine} arg, default false): when set, hitting the first target
+     *  commits the body to the whole connected same-family vein (26-adjacency flood-fill over the scan
+     *  hit set) and mines it out, with {@code count} demoted to an upper-bound safety cap. Set once by
+     *  {@code AutoMineTool} right after construction, before the task starts; false ⇒ the default
+     *  "gather {@code count} items then stop" semantics, byte-for-byte unchanged. */
+    private boolean vein = false;
+
     public MineBlockTaskRecord(String toolCallId, long deadlineGameTime,
                                Set<Block> targets, int count, int maxRadius, String label) {
         super(TOOL_NAME, toolCallId, deadlineGameTime);
@@ -51,6 +58,17 @@ public final class MineBlockTaskRecord extends TaskRecord {
     /** Set the running item-gathered tally (the task recomputes it from the inventory each tick). */
     public void setMined(int gathered) {
         this.mined = gathered;
+    }
+
+    /** Whether this run is in connected-vein mode (see {@link #vein}). */
+    public boolean isVein() {
+        return vein;
+    }
+
+    /** Set by {@code AutoMineTool} once, immediately after building the record and before the task
+     *  starts, from the optional {@code vein} tool argument. */
+    public void setVein(boolean vein) {
+        this.vein = vein;
     }
 
     @Override

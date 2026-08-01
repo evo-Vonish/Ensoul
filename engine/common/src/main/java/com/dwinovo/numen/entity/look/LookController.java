@@ -25,6 +25,11 @@ import net.minecraft.server.level.ServerPlayer;
  *   <li><b>Hard-aim</b> — {@code InputDriver.lookAt} (tools, combat, reflex fight-back) already
  *       snapped the whole aim this tick; the controller {@link #markHardAim() yields} entirely
  *       so the head stays glued to the aim.</li>
+ *   <li><b>Engaged</b> — {@link #markEngaged the tool pack has a container menu open} (a station's
+ *       GUI, a villager trade) and the companion must square up to the target and stay planted for
+ *       the whole session. The controller eases the BODY yaw onto the target bearing and the head
+ *       onto the exact point (naturally dipping the pitch to a block centre below the eyes), like a
+ *       real player standing at a workbench — and holds it across the LLM's thinking gaps.</li>
  *   <li><b>Body-controlled</b> — {@code InputDriver.stepToward} (pathing, flee) owns {@code yRot}
  *       as the travel direction; the controller drives ONLY the head (and pitch), borrowing ±50°
  *       of the travel yaw. See {@link #markBodyControlled()}.</li>
@@ -52,6 +57,10 @@ public final class LookController {
     // ---- ownership latches (game-time of the last write of each kind) ----
     private long hardAimTick = Long.MIN_VALUE;
     private long bodyControlTick = Long.MIN_VALUE;
+
+    // ---- GUI engagement (a world point to square up to while a container menu is open) ----
+    private long engagedTick = Long.MIN_VALUE;
+    private double engX, engY, engZ;
 
     /**
      * The smoother's OWN persisted head yaw. {@code Player.aiStep} clobbers the entity's
@@ -112,6 +121,22 @@ public final class LookController {
         this.bodyControlTick = now();
     }
 
+    /**
+     * Latch + target: the companion is engaged with a GUI (a station's menu, a villager trade) and
+     * must face the world point {@code (x,y,z)} — a block centre or the trade partner's eyes — and
+     * stay planted for the whole session. The tool pack refreshes this every tick the container menu
+     * is open (and zeroes locomotion input itself); it auto-expires
+     * {@link LookTunables#ENGAGED_HOLD_TICKS} ticks after the last refresh (menu closed / handed
+     * off), after which attention naturally returns. Outranks idle attention and locomotion; yields
+     * only to a hard-aim snap. See the priority ladder in the class doc.
+     */
+    public void markEngaged(double x, double y, double z) {
+        this.engX = x;
+        this.engY = y;
+        this.engZ = z;
+        this.engagedTick = now();
+    }
+
     // ============================================================ per-tick kinematics
 
     /**
@@ -126,6 +151,56 @@ public final class LookController {
             // The aim (yRot/xRot/yHeadRot) is already snapped by the caller and re-affirmed by
             // aiStep (yHeadRot = yRot). Fully yield; the smoother resumes from this pose next tick.
             smoothHeadValid = false;
+            return;
+        }
+
+        boolean engaged = now - engagedTick <= LookTunables.ENGAGED_HOLD_TICKS;
+        if (engaged) {
+            // GUI engagement: square the body up to the target and hold. Unlike idle attention
+            // (head leads, body lazily follows), here the BODY yaw itself eases onto the target
+            // bearing — a real player at a workbench faces it — while the head eases onto the exact
+            // point (the pitch naturally dips to a block centre below the eyes). The pack has already
+            // halted locomotion, so the body only turns, never strolls. Everything rides the persisted
+            // smoother, the deadzone, and the 50° head/body cap, same as every other regime.
+            double edx = engX - body.getX();
+            double edy = engY - body.getEyeY();
+            double edz = engZ - body.getZ();
+            double ehoriz = Math.sqrt(edx * edx + edz * edz);
+            float eBody = body.getYRot();
+            float rawPitch = (float) (-Math.toDegrees(Math.atan2(edy, ehoriz)));
+            // Vertical work point (straight above/below — shaft mining, a ceiling block): yaw is
+            // visually irrelevant and its atan2 is numerically arbitrary — hold the current facing
+            // and let pitch carry the aim, like a real player digging straight down. Discriminated
+            // by PITCH: a block right beside the face is CLOSE horizontally but shallow-pitched,
+            // and the body must square onto it (a distance threshold froze exactly that case).
+            boolean vertical = Math.abs(rawPitch) >= LookTunables.ENGAGED_VERTICAL_PITCH_DEG
+                    || ehoriz < 1.0e-3;
+            float engYaw = vertical
+                    ? eBody
+                    : (float) (Math.toDegrees(Math.atan2(edz, edx)) - 90.0);
+            float engPitch = LookMath.clamp(rawPitch,
+                    -LookTunables.ENGAGED_MAX_PITCH_DEG, LookTunables.ENGAGED_MAX_PITCH_DEG);
+
+            float eHead = smoothHeadValid ? smoothHead : body.getYHeadRot();
+            float ePitch = body.getXRot();
+
+            float newBody = LookMath.approachAngle(eBody, engYaw,
+                    LookTunables.ENGAGED_BODY_OMEGA_DEG, LookTunables.BODY_K,
+                    LookTunables.DEADZONE_DEG, 0.0f);
+            body.setYRot(newBody);
+
+            float newHead = LookMath.approachAngle(eHead, engYaw,
+                    LookTunables.ENGAGED_HEAD_OMEGA_DEG, LookTunables.HEAD_K,
+                    LookTunables.DEADZONE_DEG, LookTunables.HEAD_MIN_STEP_DEG);
+            newHead = LookMath.clampHeadToBody(newHead, newBody, LookTunables.MAX_HEAD_REL_DEG);
+            body.setYHeadRot(newHead);
+            smoothHead = newHead;
+            smoothHeadValid = true;
+
+            float newPitch = LookMath.approachAngle(ePitch, engPitch,
+                    LookTunables.PITCH_OMEGA_DEG, LookTunables.PITCH_K,
+                    LookTunables.DEADZONE_DEG, 0.0f);
+            body.setXRot(newPitch);
             return;
         }
 

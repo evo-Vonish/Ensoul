@@ -63,6 +63,41 @@ public final class AgentLoopRegistry {
     }
 
     /**
+     * Wave D landmark-naming seam, pack-facing entry point (mirrors {@link #commitInference}). The pack's
+     * {@code remember_place} client-local tool calls this with the companion identity on its call
+     * ({@code call.ctx().entityUuid()}); the loop names / annotates the landmark and emits the resulting
+     * {@code added} / {@code renamed} event through the existing landmark machinery. Null {@code x/y/z} name
+     * the companion's current position. Fails soft (JSON {@code success:false}) when no loop exists. Client
+     * main thread only.
+     */
+    public static String rememberPlace(UUID entityUuid, Integer x, Integer y, Integer z,
+                                       String label, String category, String note) {
+        EntityAgentLoop loop = ENTITY_LOOPS.get(entityUuid);
+        if (loop == null) {
+            return "{\"success\":false,\"message\":\"no agent loop for entity " + entityUuid + "\"}";
+        }
+        return loop.rememberPlace(x, y, z, label, category, note);
+    }
+
+    /** Wave D {@code forget_place} seam — remove a landmark by id or label. Fails soft when no loop exists. */
+    public static String forgetPlace(UUID entityUuid, String idOrLabel) {
+        EntityAgentLoop loop = ENTITY_LOOPS.get(entityUuid);
+        if (loop == null) {
+            return "{\"success\":false,\"message\":\"no agent loop for entity " + entityUuid + "\"}";
+        }
+        return loop.forgetPlace(idOrLabel);
+    }
+
+    /** Wave D {@code recall_places} seam — the current landmark list as text. Fails soft when no loop exists. */
+    public static String listPlaces(UUID entityUuid) {
+        EntityAgentLoop loop = ENTITY_LOOPS.get(entityUuid);
+        if (loop == null) {
+            return "(无法回忆:未找到该同伴的会话循环)";
+        }
+        return loop.listPlaces();
+    }
+
+    /**
      * UUIDs of the companions whose loop is mid-turn ({@link EntityAgentLoop#canInterrupt()}
      * — thinking, awaiting tool results, or with a queued prompt). These are the
      * heartbeat targets: a server-side chunk-ticket lease should be held for each

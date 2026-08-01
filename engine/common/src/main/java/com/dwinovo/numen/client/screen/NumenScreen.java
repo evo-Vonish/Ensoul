@@ -83,7 +83,6 @@ public final class NumenScreen extends Screen {
     private static final int CTX_BAR_H = 3;
     private static final int CTX_BAND_H = 12;
     private static final int MAX_PROMPT = 1024;
-    private static final int TOOL_ARG_CHARS = 44;
 
     // ---- palette (BlockFrame "Cottage" theme — single theme for now, see UiTheme) ----
     private static final UiTheme TH = UiTheme.WARM;
@@ -1275,15 +1274,15 @@ public final class NumenScreen extends Screen {
         Set<String> failed = failedIds();
         for (Row row : rows) {
             if (y + LINE_H > bodyY && y < bodyBottom) {
-                if (row.foldKey() != null) {                 // clickable fold toggle — glyph baked into text
-                    txt(g, row.text, transX, y, row.color);
-                } else if (row.toolIds() != null) {          // tool row — status icon + text
+                if (row.toolIds() != null) {                 // tool row — status icon + narration (may also be click-to-expand)
                     boolean anyRunning = row.toolIds().stream().anyMatch(id -> !done.contains(id));
                     boolean anyFail = row.toolIds().stream().anyMatch(failed::contains);
                     String icon = anyRunning ? SPIN[(int) ((t / 120) % 4)] : (anyFail ? "✗" : "✔");
                     int ic = anyRunning ? RUN : (anyFail ? FAIL : OK);
                     txt(g, Component.literal(icon), transX, y, ic);
                     txt(g, row.text, transX + 11, y, row.color);
+                } else if (row.foldKey() != null) {          // clickable fold toggle — glyph baked into text
+                    txt(g, row.text, transX, y, row.color);
                 } else {
                     txt(g, row.text, transX, y, row.color);
                 }
@@ -1496,43 +1495,101 @@ public final class NumenScreen extends Screen {
         super.removed();
     }
 
-    /** Flatten the convo into render rows. Tool RESULT messages aren't drawn — they only mark the
-     *  matching tool call done (via {@link #doneIds()}); the call line shows the spinner/check. */
+    /**
+     * Flatten the convo into render rows, chat-panel v2 three-layer model.
+     *
+     * <p><b>Top layer — only four kinds of row surface here:</b> the owner's words, Fenn's spoken
+     * words, a thinking fold (the SPEAKING turn's own reasoning, glued before its message), and a
+     * <em>step-digest</em> row. Everything that happens <em>between two adjacent spoken messages</em>
+     * — consecutive tool-call runs, the intermediate ("middle-turn") thinking of tool-only turns, and
+     * machine-facing cognition-note user messages (system 见闻) — is aggregated into ONE collapsed
+     * digest row per interval (see {@link #emitDigest}).
+     *
+     * <p><b>The active (trailing) round is exempt:</b> whatever follows the last spoken message has no
+     * closing boundary yet, so it is laid out top-level as before (live spinners / live thinking stay
+     * visible in real time; {@link #layoutActiveInterval}). Only completed intervals aggregate.
+     *
+     * <p>Tool RESULT messages aren't drawn — they only mark the matching call done (via {@link
+     * #doneIds()}); the call line shows the spinner/check.
+     */
     private List<Row> buildRows(int width) {
         List<Row> out = new ArrayList<>();
         Set<String> done = doneIds();
         Set<String> failed = failedIds();
-        List<LlmToolCall> group = new ArrayList<>();        // a run of consecutive tool calls
         List<ConvoState.Msg> snap = loop().convo().snapshot();
+
+        // Process accumulated between two adjacent spoken messages, in time order. `group` is the
+        // pending run of consecutive tool calls; it's pushed into the interval (closing the run) the
+        // moment a thinking / cognition-note element interleaves, so the timeline order is exact.
+        List<Proc> interval = new ArrayList<>();
+        List<LlmToolCall> group = new ArrayList<>();
+        int intervalStart = -1;                     // snapshot index the interval began at → digest fold key
+
         for (int i = 0; i < snap.size(); i++) {
             switch (snap.get(i)) {
                 case ConvoState.Msg.User u -> {
-                    flushTools(out, group, done, failed, width);
-                    wrapPlain(out, u.content(), YOU, width);     // user = teal body, no label
-                    int nAtt = u.attachments().size();           // muted "N image(s)" note under the text
-                    if (nAtt > 0) {
-                        wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
+                    // The engine merges buffered cognition events WITH an owner prompt into one
+                    // user message at a turn boundary ("<region_snapshot …>…</…>正常通关MC挑战!"),
+                    // so a message can be events-only, speech-only, or MIXED. Split first: the
+                    // event prefix belongs to the interval's step timeline (system 见闻), and only
+                    // the human remainder renders as owner speech — the raw-XML wall the owner
+                    // reported came from mixed messages falling through the all-or-nothing gate.
+                    String[] parts = splitCognitivePrefix(u.content());
+                    String events = parts[0];
+                    String speech = parts[1];
+                    if (!events.isEmpty()) {
+                        if (intervalStart < 0) intervalStart = i;
+                        pushGroup(interval, group);              // close the open tool run (keep time order)
+                        interval.add(new Proc.Events("events-" + i, events));
+                    }
+                    if (!speech.isBlank()) {
+                        // Owner speaks → a top-level boundary: seal the interval as a digest, then the message.
+                        pushGroup(interval, group);
+                        emitDigest(out, interval, intervalStart, failed, width);
+                        interval = new ArrayList<>(); intervalStart = -1;
+                        wrapPlain(out, speech, YOU, width);      // user = teal body, no label
+                        int nAtt = u.attachments().size();       // muted "N image(s)" note under the text
+                        if (nAtt > 0) {
+                            wrapPlain(out, "[" + nAtt + (nAtt == 1 ? " image" : " images") + "]", TXT_MUTED, width);
+                        }
                     }
                 }
                 case ConvoState.Msg.Assistant a -> {
                     AssistantTurn turn = a.turn();
-                    if (turn.content() != null && !turn.content().isBlank()) {
-                        flushTools(out, group, done, failed, width);   // spoken reply breaks the fold
-                        // A past turn's stored reasoning folds in right before its text row,
-                        // collapsed by default (keyed by the message's snapshot index).
-                        String pastThink = loop().reasoningAt(i);
-                        if (pastThink != null && !pastThink.isBlank()) {
-                            addThinkingRows(out, "think-" + i, pastThink, false, width);
-                        }
+                    String pastThink = loop().reasoningAt(i);
+                    boolean thought = pastThink != null && !pastThink.isBlank();
+                    boolean spoke = turn.content() != null && !turn.content().isBlank();
+                    if (spoke) {
+                        // Spoken reply → a top-level boundary. Seal the preceding interval, then this
+                        // turn's OWN reasoning stays top-level glued before the reply (a speaking turn's
+                        // thinking is NOT middle-turn process), then the bold name header + body.
+                        pushGroup(interval, group);
+                        emitDigest(out, interval, intervalStart, failed, width);
+                        interval = new ArrayList<>(); intervalStart = -1;
+                        if (thought) addThinkingRows(out, "think-" + i, pastThink, false, width);
                         addHeader(out, name, AI, width);         // bold name header on its OWN line
                         wrapPlain(out, turn.content(), AI, width);
+                    } else if (thought) {
+                        // Tool-only turn that still reasoned → middle-turn thinking: into the interval
+                        // timeline, at its exact chronological slot (before this turn's tool calls).
+                        if (intervalStart < 0) intervalStart = i;
+                        pushGroup(interval, group);
+                        interval.add(new Proc.Think("think-" + i, pastThink));
                     }
-                    group.addAll(turn.toolCalls());
+                    // This turn's tool calls open (or extend) the interval that follows this point.
+                    if (!turn.toolCalls().isEmpty()) {
+                        if (intervalStart < 0) intervalStart = i;
+                        group.addAll(turn.toolCalls());
+                    }
                 }
                 case ConvoState.Msg.Tool ignored -> { /* result drives done/fail, not a row */ }
             }
         }
-        flushTools(out, group, done, failed, width);
+        // Trailing interval = the ACTIVE round (no closing boundary yet) → laid out top-level so the
+        // in-progress tool run and thinking stay live; it folds into a digest once the next message lands.
+        pushGroup(interval, group);
+        layoutActiveInterval(out, interval, done, failed, width);
+
         // Live "thinking" — the current turn's streaming reasoning transcript, shown as a fold:
         // collapsed (default) = ONE row with a live-updating tail preview, so the row count stays
         // stable while streaming; click to expand the full text. Keyed by the snapshot size so each
@@ -1550,13 +1607,88 @@ public final class NumenScreen extends Screen {
         return out;
     }
 
-    /** Emit rows for a run of consecutive tool calls. A single call is always one plain row. A run of
+    /** Close the pending tool run into the interval timeline (preserving time order), if non-empty. */
+    private static void pushGroup(List<Proc> interval, List<LlmToolCall> group) {
+        if (!group.isEmpty()) {
+            interval.add(new Proc.Tools(new ArrayList<>(group)));
+            group.clear();
+        }
+    }
+
+    /**
+     * Emit ONE collapsed step-digest row for a completed between-messages interval (mid-layer of the
+     * three-layer model), or — when the user has clicked it open (fold key {@code "digest-"+start}) —
+     * a {@code ▾ N 步} header followed by the interval's step timeline: each tool call as its own
+     * {@link #addToolRow} (itself expandable to args + result), each middle-turn thinking as a
+     * collapsed {@link #addThinkingRows}, each cognition note as a collapsed {@link #addEventRows}.
+     * No-ops on an empty interval (e.g. two adjacent owner messages).
+     */
+    private void emitDigest(List<Row> out, List<Proc> interval, int start, Set<String> failed, int width) {
+        if (interval.isEmpty()) return;
+        String key = "digest-" + (start < 0 ? 0 : start);
+        int steps = 0;
+        boolean hasEvents = false, hasThink = false, anyFail = false;
+        List<String> labels = new ArrayList<>();
+        for (Proc p : interval) {
+            if (p instanceof Proc.Tools t) {
+                for (LlmToolCall tc : t.calls()) {
+                    steps++;
+                    labels.add(ToolLine.label(tc.name(), tc.arguments()));
+                    if (failed.contains(tc.id())) anyFail = true;
+                }
+            } else if (p instanceof Proc.Think) {
+                hasThink = true;
+            } else if (p instanceof Proc.Events) {
+                hasEvents = true;
+            }
+        }
+        if (!expandedGroups.contains(key)) {                      // collapsed: one quiet summary line
+            String suffix = ToolLine.digestSuffix(hasEvents, hasThink);
+            String body = fitOneLine(ToolLine.digestBody(steps, labels), width - 2 - font.width(suffix));
+            int color = anyFail ? FAIL : TOOL;
+            out.add(new Row(colored(body + suffix, color).getVisualOrderText(), color, null, key));
+        } else {                                                  // expanded: header + step timeline
+            String hdr = steps > 0 ? "▾ " + steps + " 步" : "▾ 过程";
+            out.add(new Row(colored(hdr, TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
+            for (Proc p : interval) {
+                if (p instanceof Proc.Tools t) {
+                    for (LlmToolCall tc : t.calls()) addToolRow(out, tc, width);
+                } else if (p instanceof Proc.Think th) {
+                    addThinkingRows(out, th.key(), th.text(), false, width);
+                } else if (p instanceof Proc.Events ev) {
+                    addEventRows(out, ev.key(), ev.text(), width);
+                }
+            }
+        }
+    }
+
+    /**
+     * Lay out the ACTIVE (trailing) interval at top level, unchanged from the pre-v2 behaviour: each
+     * tool run through {@link #flushTools} (live per-tool spinners while running, auto-folding to a
+     * {@code ▸ N 步} summary once done), middle-turn thinking + cognition notes as their own collapsed
+     * folds. Intentionally NOT digested — the user must see the round in progress.
+     */
+    private void layoutActiveInterval(List<Row> out, List<Proc> interval, Set<String> done, Set<String> failed, int width) {
+        for (Proc p : interval) {
+            if (p instanceof Proc.Tools t) {
+                List<LlmToolCall> g = new ArrayList<>(t.calls());
+                flushTools(out, g, done, failed, width);
+            } else if (p instanceof Proc.Think th) {
+                addThinkingRows(out, th.key(), th.text(), false, width);
+            } else if (p instanceof Proc.Events ev) {
+                addEventRows(out, ev.key(), ev.text(), width);
+            }
+        }
+    }
+
+    /** Emit rows for a run of consecutive tool calls. A single call is always one row. A run of
      *  many stays EXPANDED while any is still running (live per-tool spinners) and AUTO-FOLDS to a muted
-     *  "N steps · names" summary once all are done — unless the user clicked it open (keyed by the first
-     *  id in {@link #expandedGroups}), in which case it shows a "▾" header + the tool rows. */
+     *  "N 步：<narrations>" summary once all are done — unless the user clicked it open (keyed by the first
+     *  id in {@link #expandedGroups}), in which case it shows a "▾" header + the per-tool rows. Each per-tool
+     *  row shows the model's {@code d} narration (chat-panel style, no raw args). */
     private void flushTools(List<Row> out, List<LlmToolCall> group, Set<String> done, Set<String> failed, int width) {
         if (group.isEmpty()) return;
-        if (group.size() == 1) {                                  // single tool — never folds
+        if (group.size() == 1) {                                  // single tool — never group-folds (still per-tool expandable)
             addToolRow(out, group.get(0), width);
             group.clear();
             return;
@@ -1564,16 +1696,16 @@ public final class NumenScreen extends Screen {
         String key = group.get(0).id();
         boolean running = group.stream().anyMatch(tc -> !done.contains(tc.id()));
         boolean expanded = running || expandedGroups.contains(key);
-        if (!expanded) {                                          // folded summary (click to expand)
-            List<String> names = new ArrayList<>();
-            for (LlmToolCall tc : group) if (!names.contains(tc.name())) names.add(tc.name());
+        if (!expanded) {                                          // folded summary (click to expand) — narrations, not names
+            List<String> labels = new ArrayList<>();
+            for (LlmToolCall tc : group) labels.add(ToolLine.label(tc.name(), tc.arguments()));
             boolean anyFail = group.stream().anyMatch(tc -> failed.contains(tc.id()));
-            String summary = "▸ " + group.size() + " steps · " + String.join(" · ", names);
+            String summary = ToolLine.groupSummary(group.size(), labels);
             out.add(new Row(colored(fitOneLine(summary, width - 2), anyFail ? FAIL : TOOL).getVisualOrderText(),
                     anyFail ? FAIL : TOOL, null, key));
         } else {
             if (!running) {                                       // manually expanded → collapsible header
-                String hdr = "▾ " + group.size() + " steps";
+                String hdr = "▾ " + group.size() + " 步";
                 out.add(new Row(colored(hdr, TXT_MUTED).getVisualOrderText(), TXT_MUTED, null, key));
             }
             for (LlmToolCall tc : group) addToolRow(out, tc, width);
@@ -1581,9 +1713,225 @@ public final class NumenScreen extends Screen {
         group.clear();
     }
 
+    /** One tool call. COLLAPSED (default): status icon + the model's {@code d} narration (or the bare tool
+     *  name when it wrote none) — no {@code <>} tags, no args JSON. EXPANDED (click): the same header line
+     *  plus faint detail rows with the tool name, the full args JSON, and the result. The per-tool fold key
+     *  ({@code "tool-"+id}) never collides with a group key (a raw id) or the event/thinking keys. */
     private void addToolRow(List<Row> out, LlmToolCall tc, int width) {
-        FormattedCharSequence seq = colored(fitOneLine(toolLine(tc), width - 2 - 11), TOOL).getVisualOrderText();
-        out.add(new Row(seq, TOOL, List.of(tc.id()), null));
+        String foldKey = "tool-" + tc.id();
+        String label = ToolLine.label(tc.name(), tc.arguments());
+        FormattedCharSequence seq = colored(fitOneLine(label, width - 2 - 11), TOOL).getVisualOrderText();
+        out.add(new Row(seq, TOOL, List.of(tc.id()), foldKey));   // toolIds → status icon; foldKey → click to expand
+        if (expandedGroups.contains(foldKey)) {
+            wrapPlain(out, tc.name(), TXT_MUTED, width);
+            String args = tc.arguments() == null ? "" : tc.arguments().replaceAll("\\s+", " ").trim();
+            if (!args.isEmpty()) wrapPlain(out, args, TXT_FAINT, width);
+            String result = resultFor(tc.id());
+            if (result != null && !result.isBlank()) {
+                wrapPlain(out, result.replaceAll("\\s+", " ").trim(), TXT_FAINT, width);
+            }
+        }
+    }
+
+    /** The tool-result content recorded for {@code toolCallId}, or null when none has landed yet. */
+    private String resultFor(String toolCallId) {
+        for (ConvoState.Msg m : loop().convo().snapshot()) {
+            if (m instanceof ConvoState.Msg.Tool t && toolCallId.equals(t.toolCallId())) return t.content();
+        }
+        return null;
+    }
+
+    /** Root tags of machine-facing cognition notes (world-cognition events, corrective
+     *  notices, inference ledger) that ride user-role messages. {@code system-reminder} is
+     *  the constitution's injection envelope — its kind attribute (context_snapshot etc.)
+     *  varies, but the wrapper tag itself marks machine-facing content. */
+    private static final java.util.regex.Pattern EVENT_ROOT = java.util.regex.Pattern.compile(
+            "<(event|region_snapshot|region_diff|landmark_event|system_notice|inference|context_snapshot|system-reminder)\\b");
+
+    /** True when a user-role message is machine-facing cognition XML (and only that) —
+     *  owner prompts are plain text; mixed messages stay fully visible to be safe. */
+    /**
+     * Split a user message into {@code [cognition-event prefix, human remainder]}. Complete
+     * {@code <tag …>…</tag>} (or self-closing) cognition elements are peeled from the head;
+     * whatever follows — typically the owner's own words merged into the same message at a
+     * turn boundary — is returned as speech. Either part may be empty. A malformed/unclosed
+     * tag stops the peel, leaving the rest as speech (never drops content).
+     */
+    private static String[] splitCognitivePrefix(String s) {
+        if (s == null) return new String[]{"", ""};
+        String rest = s;
+        StringBuilder events = new StringBuilder();
+        while (true) {
+            String t = rest.stripLeading();
+            var m = EVENT_ROOT.matcher(t);
+            if (!m.lookingAt()) break;                    // head is no longer a cognition element
+            String tag = m.group(1);
+            int selfClose = t.indexOf("/>");
+            int open = t.indexOf('>');
+            int end;
+            if (selfClose >= 0 && selfClose < open) {
+                end = selfClose + 2;                      // <tag …/>
+            } else {
+                String close = "</" + tag + ">";
+                int at = t.indexOf(close);
+                if (at < 0) break;                        // unclosed — treat the rest as speech
+                end = at + close.length();
+            }
+            events.append(t, 0, end).append('\n');
+            rest = t.substring(end);
+        }
+        return new String[]{events.toString().strip(), rest.strip()};
+    }
+
+    private static boolean isCognitiveNote(String s) {
+        if (s == null) return false;
+        String t = s.strip();
+        return t.startsWith("<") && t.endsWith(">") && EVENT_ROOT.matcher(t).find();
+    }
+
+    /** Fold a cognition-note message into one faint clickable row ({@code ▸ 认知事件 ×N}),
+     *  expandable to the raw XML — same fold mechanism as thinking/tool groups. */
+    private void addEventRows(List<Row> out, String key, String text, int width) {
+        int n = 0;
+        var m = EVENT_ROOT.matcher(text);
+        while (m.find()) n++;
+        boolean notice = text.contains("<system_notice");
+        if (!expandedGroups.contains(key)) {
+            String label = "▸ 认知事件 ×" + Math.max(1, n) + (notice ? " · 含系统通知" : "");
+            out.add(new Row(colored(fitOneLine(label, width - 2), TXT_FAINT).getVisualOrderText(),
+                    TXT_FAINT, null, key));
+        } else {
+            out.add(new Row(colored("▾ 认知事件", TXT_FAINT).getVisualOrderText(), TXT_FAINT, null, key));
+            // Was: wrapPlain(out, text, …) — dumped the stored cognition XML verbatim, so a bottom-pinned
+            // scroll could clip the head element's opening tag and leave a wall of raw markup on screen
+            // ("生 XML 墙"). Now each element renders as one readable line; no scroll position shows markup.
+            for (String line : humanizeCognition(text)) {
+                wrapPlain(out, line, TXT_FAINT, width);
+            }
+        }
+    }
+
+    /** Attribute reader for a cognition element's opening tag: {@code name="value"} → value. */
+    private static final java.util.regex.Pattern ATTR =
+            java.util.regex.Pattern.compile("([\\w-]+)\\s*=\\s*\"([^\"]*)\"");
+
+    /**
+     * Turn a run of cognition XML elements into human-readable lines — ONE per element — so the
+     * expanded {@code 认知事件} view never surfaces raw markup. This is the fix for the "生 XML 墙":
+     * the expanded branch used to {@link #wrapPlain} the stored XML verbatim, so a bottom-pinned
+     * scroll could clip the first element's opening tag and leave the owner staring at a wall of
+     * {@code <region_snapshot seq="…" schemaVersion="…">…}. Pure and MC-free, so a bare-JVM harness
+     * asserts it against stored conversation bytes.
+     *
+     * <p>Every cognition note's inner text is already an authored Chinese sentence (region snapshots
+     * {@code 此处是 …}, item pickups {@code 你捡起了 …}, {@link
+     * com.dwinovo.numen.core.perception.region.ValuablesSweep} sightings {@code 路过时留意到 …}), so
+     * the job is: peel each complete {@code <tag …>inner</tag>} (or self-closing) element with the
+     * SAME algorithm as {@link #splitCognitivePrefix}, map its tag (and an {@code event}'s {@code
+     * kind}) to a short readable label, and surface {@code 标签 · inner}. Damage is isolated, never
+     * amplified: a stray non-cognition fragment or an unclosed tail becomes its OWN single degraded
+     * line (content is never dropped, and the well-formed elements around it still humanize) — so no
+     * scroll position can re-expose the raw-markup wall.
+     */
+    static List<String> humanizeCognition(String xml) {
+        List<String> out = new ArrayList<>();
+        if (xml == null) return out;
+        String rest = xml;
+        while (true) {
+            String t = rest.stripLeading();
+            if (t.isEmpty()) break;
+            var m = EVENT_ROOT.matcher(t);
+            if (m.lookingAt()) {                                   // head is a complete cognition element
+                String tag = m.group(1);
+                int selfClose = t.indexOf("/>");
+                int open = t.indexOf('>');
+                if (open < 0) break;                               // no tag close at all — bail to degraded
+                int end;
+                String inner;
+                if (selfClose >= 0 && selfClose < open) {          // <tag …/> — no body (mirrors split peel)
+                    end = selfClose + 2;
+                    inner = "";
+                } else {
+                    String close = "</" + tag + ">";
+                    int at = t.indexOf(close, open);
+                    if (at < 0) break;                             // unclosed — bail to degraded (never drop)
+                    end = at + close.length();
+                    inner = t.substring(open + 1, at);
+                }
+                out.add(humanizeElement(tag, t.substring(0, open + 1), inner));
+                rest = t.substring(end);
+            } else {
+                // Head is not a cognition element: isolate the fragment up to the NEXT element (if any),
+                // emit it as ONE degraded line, and keep going — a bad head never dumps the whole tail.
+                var mf = EVENT_ROOT.matcher(t);
+                int next = mf.find() ? mf.start() : -1;
+                if (next <= 0) { out.add(collapseWs(t)); break; }
+                out.add(collapseWs(t.substring(0, next)));
+                rest = t.substring(next);
+            }
+        }
+        return out;
+    }
+
+    /** One cognition element → one readable line: {@code 标签 · <inner Chinese>} (or the label alone
+     *  when the element is self-closing / has no body). Pure. */
+    private static String humanizeElement(String tag, String openTag, String inner) {
+        String label = cognitionLabel(tag, openTag);
+        String body = collapseWs(xmlUnescape(inner));
+        return body.isEmpty() ? label : label + " · " + body;
+    }
+
+    /** Map a cognition element's tag (and an {@code event}'s {@code kind}) to a short human label.
+     *  An unknown kind falls back to a generic label — the inner Chinese sentence still carries the
+     *  meaning, so a newly-added perception kind degrades to {@code 事件 · …}, never to raw markup. */
+    private static String cognitionLabel(String tag, String openTag) {
+        return switch (tag) {
+            case "region_snapshot"  -> "环境";
+            case "region_diff"      -> "环境变化";
+            case "landmark_event"   -> "地标";
+            case "system_notice"    -> "系统通知";
+            case "inference"        -> "推理";
+            case "context_snapshot" -> "上下文";
+            case "system-reminder"  -> "提醒";
+            case "event" -> switch (attr(openTag, "kind")) {
+                case "item_pickup"       -> "拾取";
+                case "sighting"          -> "见闻";
+                case "hostile_proximity" -> "威胁";
+                case "hurt"              -> "受伤";
+                case "hunger"            -> "饥饿";
+                case "status_effect"     -> "状态";
+                case "time_of_day"       -> "时段";
+                case "weather"           -> "天气";
+                case "tool_broke"        -> "工具损坏";
+                case "tool_durability"   -> "工具耐久";
+                case "autonomy"          -> "自主";
+                case "reflex"            -> "本能";
+                default -> "事件";
+            };
+            default -> "事件";
+        };
+    }
+
+    /** Read {@code name="value"} from an opening tag; empty string if absent. Pure. */
+    private static String attr(String openTag, String name) {
+        var m = ATTR.matcher(openTag);
+        while (m.find()) if (m.group(1).equals(name)) return m.group(2);
+        return "";
+    }
+
+    /** Decode the five XML entities a cognition emitter could have escaped. {@code &amp;} last so a
+     *  literal {@code &lt;} in source text is not double-decoded. Pure. */
+    private static String xmlUnescape(String s) {
+        if (s == null) return "";
+        if (s.indexOf('&') < 0) return s;
+        return s.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&");
+    }
+
+    /** Flatten inner whitespace (incl. newlines) to single spaces so each element stays ONE logical
+     *  line for {@link #wrapPlain} to pixel-wrap. Pure. */
+    private static String collapseWs(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").strip();
     }
 
     /** Emit a thinking fold. Collapsed → one clickable summary row: live turns show
@@ -1629,12 +1977,6 @@ public final class NumenScreen extends Screen {
         if (font.width(s) <= pxWidth) return s;
         while (s.length() > 1 && font.width(s + "…") > pxWidth) s = s.substring(0, s.length() - 1);
         return s + "…";
-    }
-
-    private String toolLine(LlmToolCall tc) {
-        String args = tc.arguments() == null ? "" : tc.arguments().replaceAll("\\s+", " ").trim();
-        if (args.length() > TOOL_ARG_CHARS) args = args.substring(0, TOOL_ARG_CHARS) + "…";
-        return tc.name() + "  " + args;
     }
 
     /** A bold name header on its OWN line (fixed format — never merges into the body). */
@@ -1825,6 +2167,19 @@ public final class NumenScreen extends Screen {
     /** A rendered transcript line. {@code toolIds} non-null = a tool row (status icon = spinner/✔/✗).
      *  {@code foldKey} non-null = a clickable fold toggle (the group's first id); both null = plain text. */
     private record Row(FormattedCharSequence text, int color, List<String> toolIds, String foldKey) {}
+
+    /**
+     * One element on a between-messages interval's step timeline, in chronological order — the raw
+     * material a {@linkplain #emitDigest step-digest} aggregates (collapsed) or replays (expanded).
+     * {@code Tools} is a run of consecutive tool calls; {@code Think} is a middle-turn reasoning fold;
+     * {@code Events} is a machine-facing cognition-note (system 见闻). {@code key} carries the fold key
+     * each nested element keeps when the digest is expanded (non-colliding: {@code think-}/{@code events-}).
+     */
+    private sealed interface Proc {
+        record Tools(List<LlmToolCall> calls) implements Proc {}
+        record Think(String key, String text) implements Proc {}
+        record Events(String key, String text) implements Proc {}
+    }
 
     /** A composed-but-unsent image: the source file (copied into the attachments dir on send)
      *  plus its live thumbnail texture and on-screen size. */

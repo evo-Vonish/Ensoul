@@ -876,6 +876,76 @@ public final class EntityAgentLoop {
                 + ",\"message\":\"推断已落账,将出现在你的下一轮上下文中\"}";
     }
 
+    /**
+     * Wave D landmark-naming seam — the engine half of {@code remember_place}. Called by the pack tool via
+     * {@link AgentLoopRegistry#rememberPlace}: names / annotates the landmark at the given coordinate (null
+     * {@code x/y/z} → the companion's current block position), reusing the {@link LandmarkStore} +
+     * {@link LandmarkEventEmitter} machinery. The resulting {@code added} / {@code renamed} event is drained
+     * onto the buffered tail immediately (like {@link #appendWorldCognitionNotes}), so it rides the next turn.
+     * Returns the tool-result confirmation JSON; fails soft on a dead body, an unresolved body (no
+     * position/dimension), or a blank label. Client main thread only, like every loop mutation.
+     */
+    public String rememberPlace(Integer x, Integer y, Integer z, String label, String category, String note) {
+        if (label == null || label.isBlank()) {
+            return "{\"success\":false,\"message\":\"empty label — a place needs a name\"}";
+        }
+        if (dead) {
+            return "{\"success\":false,\"message\":\"body is dead — place not remembered\"}";
+        }
+        AbstractClientPlayer body = resolveEntity();
+        if (body == null) {
+            return "{\"success\":false,\"message\":\"body not loaded — cannot resolve position/dimension\"}";
+        }
+        net.minecraft.core.BlockPos pos = (x != null && y != null && z != null)
+                ? new net.minecraft.core.BlockPos(x, y, z)
+                : body.blockPosition();
+        String dim = body.level().dimension().identifier().toString();
+        String cat = (category == null || category.isBlank()) ? null : category.strip();
+        String nt = (note == null || note.isBlank()) ? null : note.strip();
+        LandmarkStore.NamingResult r = landmarks.rememberPlace(pos, dim, label.strip(), cat, nt);
+        landmarkEmitter.emit(landmarks.drainEvents());
+        Constants.LOG.info("[numen-entity#{}] remember_place {} \"{}\" at {},{},{} ({})",
+                entityUuid, r.id(), label.strip(), pos.getX(), pos.getY(), pos.getZ(),
+                r.created() ? "new" : "updated");
+        return "{\"success\":true,\"id\":\"" + r.id() + "\",\"created\":" + r.created()
+                + ",\"message\":\"" + (r.created() ? "已记住新地点" : "已更新地点")
+                + ",之后可用名字或 id 回忆\"}";
+    }
+
+    /**
+     * Wave D — the engine half of {@code forget_place}. Removes the landmark matching {@code idOrLabel}
+     * (an {@code lm_xxx} id or, case-insensitively, its label) and drains the resulting {@code removed}
+     * event onto the tail. Fails soft when the body is dead or nothing matched. Client main thread only.
+     */
+    public String forgetPlace(String idOrLabel) {
+        if (idOrLabel == null || idOrLabel.isBlank()) {
+            return "{\"success\":false,\"message\":\"empty place id/label\"}";
+        }
+        if (dead) {
+            return "{\"success\":false,\"message\":\"body is dead — nothing forgotten\"}";
+        }
+        String removed = landmarks.forgetPlace(idOrLabel);
+        if (removed == null) {
+            return "{\"success\":false,\"message\":\"no landmark matched that id or label\"}";
+        }
+        landmarkEmitter.emit(landmarks.drainEvents());
+        Constants.LOG.info("[numen-entity#{}] forget_place {} (matched {})", entityUuid, removed, idOrLabel.strip());
+        return "{\"success\":true,\"id\":\"" + removed + "\",\"message\":\"已忘记该地点\"}";
+    }
+
+    /**
+     * Wave D — the engine half of {@code recall_places}. Returns the full current landmark list as
+     * human-readable text (see {@link LandmarkStore#listPlaces()}), or a short "nothing yet" line.
+     * Read-only; no event, no persistence change. Client main thread only.
+     */
+    public String listPlaces() {
+        if (dead) {
+            return "(无法回忆:身体已消失)";
+        }
+        String text = landmarks.listPlaces();
+        return text.isEmpty() ? "(暂无已知地标。用 remember_place 给重要地点起名后即可靠名字回忆。)" : text;
+    }
+
     /** Minimal XML text escaping for event bodies we compose from free-form model text. */
     private static String escapeXmlText(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;");

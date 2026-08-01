@@ -83,4 +83,42 @@ public final class LookTunables {
     /** A look intent from the brain is considered stale after this many ticks with no refresh, after
      *  which the head relaxes back toward the body. The brain refreshes every tick it wants a gaze. */
     public static final int INTENT_TTL_TICKS = 5;
+    /**
+     * After a GUI-engagement write ({@code markEngaged} — the tool pack marks this every tick a
+     * container menu is open: a station's GUI, a villager trade), the controller holds the engaged
+     * posture — squared up to the target, body planted — for this many ticks past the last refresh.
+     * A short latch so a one-tick gap (the LLM thinking between tool calls, a dispatcher hiccup)
+     * can't drop the pose mid-session; the moment the menu truly closes the pack stops refreshing
+     * and attention naturally returns within this window. (Priority ladder: engaged outranks idle
+     * attention and locomotion, and yields only to a hard-aim snap.)
+     */
+    public static final int ENGAGED_HOLD_TICKS = 3;
+
+    // ---------------------------------------------------------------- engaged work posture rates
+    /**
+     * Body/head yaw caps (deg/tick) while ENGAGED — squaring up to a workbench, or onto the block
+     * being mined / the face being placed against. The idle rates (4°/6°) were tuned for ambient
+     * glances and are too slow for work: an axe fells a log in 8–15 ticks, so at 4°/tick a 120°
+     * offset never squares up before the block pops and the body works permanently crooked. Real
+     * players flick onto their work point in a few hundred ms (~200–400°/s); 9°/tick = 180°/s
+     * closes 90° in ~10 ticks with the same exponential ease-out, so the motion stays organic —
+     * brisk mid-turn, settling softly. Purely cosmetic: breaks/places are decided by the
+     * eye-position raycast, never by these angles.
+     */
+    public static final float ENGAGED_BODY_OMEGA_DEG = 9.0f;
+    /** Head yaw cap (deg/tick) while ENGAGED — see {@link #ENGAGED_BODY_OMEGA_DEG}. */
+    public static final float ENGAGED_HEAD_OMEGA_DEG = 9.0f;
+    /**
+     * At or beyond this |pitch| (deg) the engaged work point counts as vertical — straight
+     * above/below (shaft mining, a ceiling block) — and the body HOLDS its current yaw instead
+     * of chasing a bearing that is visually irrelevant (a real player digging straight down
+     * keeps whatever facing they had). Discriminating by PITCH, not horizontal distance: a log
+     * right beside the face sits at ~0.3 blocks horizontal but only ~30° pitch, and the body
+     * must absolutely square onto it — a distance threshold froze exactly that case (owner
+     * field report: chopping while facing away from the trunk).
+     */
+    public static final float ENGAGED_VERTICAL_PITCH_DEG = 65.0f;
+    /** Engaged pitch clamp (deg): mining a ceiling/floor block wants a deeper look-up/-down than
+     *  the ambient ±60° cone; players routinely pitch ~75–90° at their work point. */
+    public static final float ENGAGED_MAX_PITCH_DEG = 75.0f;
 }

@@ -183,13 +183,72 @@ public class OpenAIProvider implements LlmProvider {
             JsonObject fn = new JsonObject();
             fn.addProperty("name", t.name());
             fn.addProperty("description", t.description());
-            fn.add("parameters", mapToJson(t.parameterSchema()));
+            JsonElement params = mapToJson(t.parameterSchema());
+            injectCommonParams(params);
+            fn.add("parameters", params);
             JsonObject wrapper = new JsonObject();
             wrapper.addProperty("type", "function");
             wrapper.add("function", fn);
             arr.add(wrapper);
         }
         return arr;
+    }
+
+    /**
+     * The two universal optional parameters appended to <em>every</em> tool's schema
+     * at this one serialization chokepoint — transparently, so no individual tool
+     * (all 40-odd of them, plus any added concurrently) needs editing:
+     * <ul>
+     *   <li>{@code d} — a short narration the model writes on every call, in the
+     *       conversation's language, describing what it is doing right now. The chat
+     *       panel shows this human sentence instead of the raw JSON args.</li>
+     *   <li>{@code timeout_seconds} — an optional per-call time-box; when present the
+     *       server tightens the task deadline to it (see {@code ToolContext.deadline}).
+     *       The unit lives IN the name — a bare "timeout" invites millisecond guesses
+     *       from the model. (Renamed from {@code max_seconds}; the server still accepts
+     *       the legacy key so persisted conversations replay cleanly.)</li>
+     * </ul>
+     * Both are OPTIONAL (never added to {@code required}); because they are injected
+     * into {@code properties}, a schema with {@code additionalProperties:false} stays
+     * valid and the model may send them without an "unknown argument" rejection. A
+     * tool that already declares either key keeps its own definition. Each tool's own
+     * arg parsing simply ignores these two keys — nothing downstream must change.
+     */
+    static void injectCommonParams(JsonElement params) {
+        if (params == null || !params.isJsonObject()) return;
+        JsonObject schema = params.getAsJsonObject();
+        if (!schema.has("type")) schema.addProperty("type", "object");
+        JsonObject props;
+        if (schema.has("properties") && schema.get("properties").isJsonObject()) {
+            props = schema.getAsJsonObject("properties");
+        } else {
+            props = new JsonObject();
+            schema.add("properties", props);
+        }
+        if (!props.has("description")) props.add("description", narrationParamSchema());
+        if (!props.has("timeout_seconds")) props.add("timeout_seconds", timeoutSecondsParamSchema());
+    }
+
+    /** Schema for the universal {@code description} self-narration parameter. */
+    static JsonObject narrationParamSchema() {
+        JsonObject p = new JsonObject();
+        p.addProperty("type", "string");
+        p.addProperty("description",
+                "用当前对话语言写一句 ≤20 字的短语，描述你此刻用这个工具在做什么（给主人看），"
+                + "例如「挖铁矿补装备」「查看背包」「回家存货」。每次调用都要写，"
+                + "包括查询/查看类工具也要写。");
+        return p;
+    }
+
+    /** Schema for the universal optional {@code timeout_seconds} per-call time-box. */
+    static JsonObject timeoutSecondsParamSchema() {
+        JsonObject p = new JsonObject();
+        p.addProperty("type", "integer");
+        p.addProperty("minimum", 1);
+        p.addProperty("description",
+                "本次调用允许的最大执行秒数，到时会自动停止并汇报已完成的进度。"
+                + "默认由任务自行估算，通常不必填写；只有当你想给这次行动限定时长时才填。");
+        return p;
     }
 
     @Override

@@ -240,11 +240,23 @@ public final class MineCompanionTask implements CompanionTask {
         // scan every RESCAN_INTERVAL ticks (never more than one in flight).
         drainScan();
         prune();
+        boolean rescanTick = false;
         if (--rescanTimer <= 0) {
             rescanTimer = RESCAN_INTERVAL;
+            rescanTick = true;
             if (scan == null) kickScan();
         }
         drops = creative ? List.of() : droppedItems();   // creative has no natural drops to collect
+
+        // (D) One census line per rescan interval so a recurrence is diagnosable at a glance:
+        //     "known>0 active=0" (found it, all on cooldown) vs "active>0 reach=false" (found it,
+        //     can't get there) vs "active=0 drops>0" (the drops-only wedge this fix targets).
+        if (rescanTick) {
+            com.dwinovo.numen.Constants.LOG.info(
+                    "[numen-mine] known={} active={} cooling={} drops={} reach={} broke={} gathered={}/{}",
+                    knownOres.size(), activeOres().size(), coolingCount(), drops.size(),
+                    reachableTarget() != null, brokenCount, r.getMined(), r.count);
+        }
 
         // 1) Mine any target we can already reach + see from here (no pathing) —
         //    a tree gets mined from beside, never by digging under it.
@@ -265,7 +277,7 @@ public final class MineCompanionTask implements CompanionTask {
         //    shaft opens up; drops are collected by walking over them (native pickup).
         //    In vein mode, "the ore field" is the committed connected vein (activeOres).
         List<BlockPos> ores = activeOres();
-        if (!ores.isEmpty() || !drops.isEmpty()) {
+        if (!ores.isEmpty()) {   // (FIX) drops-only 支路不再无预算霸占 step-2;交给下方有界 step-2.5 sweep
             branchTicks = 0;
             sweepTicks = 0;
             if (nav == null || navIsBranch || navIsSweep) {
@@ -293,7 +305,7 @@ public final class MineCompanionTask implements CompanionTask {
         //      enough items (drops fell in a gap / rolled away / an earlier pass missed
         //      them). Before giving up, spend a bounded budget pathing over target drops
         //      in a wider radius so mined loot isn't abandoned on the ground.
-        if (!creative && gathered < effectiveCount() && brokenCount > 0) {
+        if (!creative && gathered < effectiveCount() && (brokenCount > 0 || !wideTargetDrops().isEmpty())) {
             List<BlockPos> far = wideTargetDrops();
             if (!far.isEmpty() && ++sweepTicks <= SWEEP_MAX_TICKS) {
                 if (nav == null || !navIsSweep) {

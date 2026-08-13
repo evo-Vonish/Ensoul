@@ -44,6 +44,7 @@
 | `list_companions` | 列出你当前在线的同伴(名字 + id) |
 | `acquire_companion` | 接管——暂停内置大脑,释放身体 |
 | `release_companion` | 把同伴交还给它的内置大脑 |
+| *(集群工具)* | `broadcast` / `whisper` / `trade_invite` / `trade_accept` / `trade_decline` / `trade_give` / `trade_close` —— 集群协同:喊话、私聊、近距离锁定交易。消息**不推送**,搭车在下一次工具结果末尾的 `<inbox>` 块里。详见 [docs/cluster-coordinator-v1.md](docs/cluster-coordinator-v1.md) |
 | *(引擎工具)* | 每一个 Numen 身体/感知工具(`get_self_status`、`scan_blocks`、`auto_mine`、`move_to`、`place_block` …),每个都接收一个 `companion` 参数 |
 
 ## 教你的智能体
@@ -63,6 +64,10 @@
 - `token` —— 可选的 bearer token;设置后请求必须带上它(`Authorization: Bearer <token>` 或 `?token=`)。
 - `call_timeout_seconds` —— 一次 `tools/call` 等待身体动作多久后报超时。
 - `hidden_tools` —— 不向外部智能体暴露的引擎工具(智能体内部的记账用途)。
+- `coordinator_enabled` —— 集群协同器总开关(默认开)。
+- `trade_distance` —— 交易邀请/接受的双方最大距离,格(默认 3.0)。
+- `invite_timeout_seconds` —— 交易邀请惰性过期秒数(默认 120)。
+- `mailbox_capacity` —— 每只信箱容量,溢出丢最旧(默认 50)。
 
 ## 状态
 

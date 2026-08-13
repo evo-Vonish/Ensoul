@@ -3,6 +3,8 @@ package com.dwinovo.numen.mcp;
 import com.dwinovo.numen.agent.tool.NumenTool;
 import com.dwinovo.numen.agent.tool.ToolRegistry;
 import com.dwinovo.numen.api.NumenActuator;
+import com.dwinovo.numen.mcp.coordinator.Coordinator;
+import com.dwinovo.numen.mcp.coordinator.CoordinatorTools;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -42,11 +44,19 @@ import java.util.concurrent.TimeoutException;
  * roster and control methods. Since every call is addressed to a companion and
  * each body runs its tasks independently, an agent can acquire several
  * companions and drive them in parallel.
+ *
+ * <h2>Cluster coordinator</h2>
+ * Companions acquired through this server form a cluster (see
+ * {@code mcp/docs/cluster-coordinator-v1.md}): {@code broadcast} /
+ * {@code whisper} / {@code trade_*} let the driving agents talk and trade.
+ * Incoming messages are never pushed — they piggyback at the tail of the
+ * recipient's next tool result inside an {@code <inbox>} block
+ * (see {@link #content(String, boolean, UUID)}).
  */
 public final class McpServer {
 
     private static final String PROTOCOL_VERSION = "2025-06-18";
-    private static final String SERVER_VERSION = "0.1.0";
+    private static final String SERVER_VERSION = "0.2.0";
     /** Roster / acquire / release are fast; only tool actions use the config timeout. */
     private static final int CONTROL_TIMEOUT_SECONDS = 10;
 
@@ -70,14 +80,25 @@ public final class McpServer {
             Rules: survival mode — the tools do only what a real player can (mine to get stone; there is no \
             give or setblock). You are blind between calls, so perceive before and after acting. Action \
             tools return only when the task finishes or times out. You can acquire several companions and \
-            drive them in parallel. Modded blocks, items, and GUIs (Create, AE2, Mekanism) work natively.""";
+            drive them in parallel. Modded blocks, items, and GUIs (Create, AE2, Mekanism) work natively.
+
+            Cluster (multi-agent): companions acquired through this server form a cluster. Social tools: \
+            broadcast (say something to every other agent), whisper (private message to one, by companion \
+            name), and locked trading — trade_invite (stand within a few blocks) → the other agent answers \
+            trade_accept / trade_decline → both sides trade_give items (repeatable) → trade_close. Incoming \
+            messages and trade events NEVER interrupt you: they arrive appended to the tail of tool results \
+            inside an <inbox> block — finish your current step, then answer with the same tools.""";
 
     private final McpConfig config;
+    private final Coordinator coordinator;
+    private final CoordinatorTools coordinatorTools;
     private final Gson gson = new Gson();
     private HttpServer http;
 
     public McpServer(McpConfig config) {
         this.config = config;
+        this.coordinator = new Coordinator(config.mailboxCapacity());
+        this.coordinatorTools = new CoordinatorTools(coordinator, config);
     }
 
     public void start() throws IOException {
@@ -224,6 +245,10 @@ public final class McpServer {
                 "Hand a companion back to its built-in AI when you are done driving it.",
                 objectSchema("companion", true)));
 
+        if (config.coordinatorEnabled()) {
+            for (JsonObject def : coordinatorTools.defs()) tools.add(def);
+        }
+
         for (NumenTool tool : ToolRegistry.all()) {
             if (config.isHidden(tool.name())) continue;
             tools.add(toolDef(tool.name(), tool.description(), withCompanion(tool.parameterSchema())));
@@ -297,6 +322,8 @@ public final class McpServer {
                 case "list_companions" -> content(listCompanions(), false);
                 case "acquire_companion" -> handleControl(args, true);
                 case "release_companion" -> handleControl(args, false);
+                case "broadcast", "whisper", "trade_invite", "trade_accept", "trade_decline",
+                     "trade_give", "trade_close" -> handleCluster(name, args);
                 default -> handleToolInvoke(name, args);
             };
         } catch (TimeoutException te) {
@@ -316,7 +343,20 @@ public final class McpServer {
         for (NumenActuator.Companion c : list) {
             sb.append("- ").append(c.name()).append("  (id: ").append(c.uuid()).append(")\n");
         }
+        if (config.coordinatorEnabled()) {
+            List<String> roster = coordinator.rosterLines();
+            sb.append("\nCluster participants (acquired & drivable — valid broadcast / whisper / trade partners): ");
+            sb.append(roster.isEmpty() ? "none yet" : String.join(", ", roster));
+        }
         return sb.toString().stripTrailing();
+    }
+
+    private JsonObject handleCluster(String name, JsonObject args) {
+        if (!config.coordinatorEnabled()) {
+            return content("the cluster coordinator is disabled on this server (coordinator_enabled)", true);
+        }
+        CoordinatorTools.Reply r = coordinatorTools.call(name, args, this::resolveCompanion);
+        return content(r.text(), r.error(), r.inboxOf());
     }
 
     private JsonObject handleControl(JsonObject args, boolean acquire) throws Exception {
@@ -329,10 +369,29 @@ public final class McpServer {
                 : NumenActuator.release(target))
                 .get(CONTROL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (acquire) {
-            return content(ok ? "acquired " + target + " — its built-in brain is paused; you are driving it now"
-                    : "could not acquire " + target, !ok);
+            if (ok && config.coordinatorEnabled()) {
+                coordinator.join(target, companionName(target));
+            }
+            String text = ok
+                    ? "acquired " + target + " — its built-in brain is paused; you are driving it now"
+                            + (config.coordinatorEnabled()
+                                    ? " You also joined the cluster: broadcast / whisper / trade_* are yours." : "")
+                    : "could not acquire " + target;
+            return content(text, !ok, ok && config.coordinatorEnabled() ? target : null);
+        }
+        if (config.coordinatorEnabled()) {
+            coordinator.leave(target, config.inviteTimeoutSeconds());
         }
         return content("released " + target + " — its built-in brain may act again", false);
+    }
+
+    /** Display name of a live companion (falls back to the uuid string). */
+    private String companionName(UUID target) throws Exception {
+        for (NumenActuator.Companion c : NumenActuator.companions()
+                .get(CONTROL_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            if (c.uuid().equals(target)) return c.name();
+        }
+        return target.toString();
     }
 
     private JsonObject handleToolInvoke(String toolName, JsonObject args) throws Exception {
@@ -351,7 +410,7 @@ public final class McpServer {
         } catch (RuntimeException ignored) {
             // non-JSON result — treat as plain text, not an error
         }
-        return content(result, isError);
+        return content(result, isError, config.coordinatorEnabled() ? target : null);
     }
 
     /** Resolve the {@code companion} argument (name or UUID) to a live companion's UUID, or null. */
@@ -378,9 +437,25 @@ public final class McpServer {
     // ---- result envelopes ----
 
     private JsonObject content(String text, boolean isError) {
+        return content(text, isError, null);
+    }
+
+    /**
+     * The single result-envelope exit point — and therefore the cluster
+     * coordinator's delivery ride: when {@code inboxOf} names a participant,
+     * anything parked in their mailbox is appended as an {@code <inbox>} block
+     * at the tail of this result (mailbox cleared on delivery). Messages never
+     * push; they surface strictly between the recipient's own tool calls.
+     */
+    private JsonObject content(String text, boolean isError, UUID inboxOf) {
+        String full = text;
+        if (inboxOf != null) {
+            String inbox = coordinator.drainInbox(inboxOf);
+            if (!inbox.isEmpty()) full = text + "\n" + inbox;
+        }
         JsonObject item = new JsonObject();
         item.addProperty("type", "text");
-        item.addProperty("text", text);
+        item.addProperty("text", full);
         JsonArray arr = new JsonArray();
         arr.add(item);
         JsonObject result = new JsonObject();

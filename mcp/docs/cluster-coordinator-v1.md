@@ -24,8 +24,9 @@
 **信箱 + 搭车投递**:
 
 - 每只参赛同伴一个信箱(`Deque<Envelope>`,容量 `mailbox_capacity`,默认 50,溢出丢最旧)。
-- 该 Agent 下一次任意 `tools/call` 返回时,结果文本**末尾追加**一个 `<inbox>` 块并清空信箱
-  (读后即焚)。块内按到达顺序一行一条:
+- 该 Agent 下一次任意 `tools/call` 返回时,信箱内容作为**独立的第二个 text 元素**
+  挂进 content 数组(读后即焚)——第一个元素保持字节纯净,身体工具结果始终是
+  可解析的 TaskResult JSON。块内按到达顺序一行一条:
 
 ```xml
 <inbox>
@@ -103,7 +104,13 @@
 
 ## 8. 线程模型
 
-- MCP HTTP 线程池(8)并发调用;Coordinator 全部公开方法 `synchronized`,内部
-  LinkedHashMap/ArrayDeque,无后台线程。
+- **三条车道**(v1.1 起):accept/解析层(cached 池,只读 JSON 不干活)→ 按调用类型分流到
+  **控制面**(4 线程:握手/ping/工具清单/名册/消息/交易簿记,全部 ≤10s 响应)与
+  **工作面**(16 线程:引擎身体工具 + trade_give,可能阻塞数分钟)。
+  五名选手全员长任务时,ping 与集群消息依然即时——池饿死已在 v1.1 修复。
+- Coordinator 全部公开方法 `synchronized`,内部 LinkedHashMap/ArrayDeque,无后台线程;
+  交易会话终态即删,会话表只持有活业务。
 - 距离判定与实体解析经 `Minecraft.execute` 切客户端主线程,`CompletableFuture`
-  回传;只在 HTTP 池线程上等待,绝不阻塞主线程。
+  回传;只在车道线程上等待,绝不阻塞主线程。
+- 交易腿超时独立于 `call_timeout_seconds`:drop/collect 为秒级操作,固定 30s;
+  客户端超时不取消引擎侧任务,回执会如实说明"物品可能已落地,collect_items 回收"。

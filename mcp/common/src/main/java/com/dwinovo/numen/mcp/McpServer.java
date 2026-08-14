@@ -18,8 +18,11 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -56,9 +59,19 @@ import java.util.concurrent.TimeoutException;
 public final class McpServer {
 
     private static final String PROTOCOL_VERSION = "2025-06-18";
-    private static final String SERVER_VERSION = "0.2.0";
+    private static final String SERVER_VERSION = "0.2.1";
     /** Roster / acquire / release are fast; only tool actions use the config timeout. */
     private static final int CONTROL_TIMEOUT_SECONDS = 10;
+
+    /**
+     * tools/call names answered quickly (≤10s client-thread hops) — the control lane.
+     * Everything else (engine body tools, trade_give) can block for minutes and
+     * therefore goes to the work lane, so a fleet deep in long tasks can never
+     * starve pings, roster lookups, or cluster messaging.
+     */
+    private static final Set<String> LIGHT_TOOLS = Set.of(
+            "list_companions", "acquire_companion", "release_companion",
+            "broadcast", "whisper", "trade_invite", "trade_accept", "trade_decline", "trade_close");
 
     /**
      * Sent to the connecting agent in the {@code initialize} handshake (MCP's
@@ -94,6 +107,8 @@ public final class McpServer {
     private final CoordinatorTools coordinatorTools;
     private final Gson gson = new Gson();
     private HttpServer http;
+    private ExecutorService controlExec;
+    private ExecutorService workExec;
 
     public McpServer(McpConfig config) {
         this.config = config;
@@ -104,28 +119,42 @@ public final class McpServer {
     public void start() throws IOException {
         http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         http.createContext("/mcp", this::handle);
-        http.setExecutor(Executors.newFixedThreadPool(8, r -> {
-            Thread t = new Thread(r, "numen-mcp-http");
-            t.setDaemon(true);
-            return t;
-        }));
+        controlExec = Executors.newFixedThreadPool(4, daemonFactory("numen-mcp-ctl"));
+        workExec = Executors.newFixedThreadPool(16, daemonFactory("numen-mcp-work"));
+        // Accept+parse lane: unbounded cached pool. A request lives here only long
+        // enough to read and parse its JSON, then hops to a lane — it never performs
+        // game work, so connections stay responsive even when every work thread is
+        // parked inside a multi-minute body action.
+        http.setExecutor(Executors.newCachedThreadPool(daemonFactory("numen-mcp-accept")));
         http.start();
     }
 
     public void stop() {
         if (http != null) http.stop(0);
+        if (controlExec != null) controlExec.shutdownNow();
+        if (workExec != null) workExec.shutdownNow();
+    }
+
+    private static ThreadFactory daemonFactory(String name) {
+        return r -> {
+            Thread t = new Thread(r, name);
+            t.setDaemon(true);
+            return t;
+        };
     }
 
     // ---- HTTP layer ----
 
-    private void handle(HttpExchange ex) throws IOException {
+    private void handle(HttpExchange ex) {
         try {
             if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
                 respond(ex, 405, "");
+                ex.close();
                 return;
             }
             if (!authorized(ex)) {
                 respond(ex, 401, "");
+                ex.close();
                 return;
             }
             String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
@@ -134,9 +163,21 @@ public final class McpServer {
                 parsed = JsonParser.parseString(body);
             } catch (RuntimeException parseErr) {
                 respondJson(ex, errorResponse(null, -32700, "parse error: " + parseErr.getMessage()));
+                ex.close();
                 return;
             }
+            // Hand off to the right lane — serve() owns respond + close from here on.
+            laneFor(parsed).execute(() -> serve(ex, parsed));
+        } catch (RuntimeException | IOException fatal) {
+            Constants.LOG.warn("[numen-mcp] request failed: {}", fatal.toString());
+            try { respond(ex, 500, ""); } catch (IOException ignored) {}
+            try { ex.close(); } catch (RuntimeException ignored) {}
+        }
+    }
 
+    /** Lane stage: dispatch the request, write the response, close the exchange. */
+    private void serve(HttpExchange ex, JsonElement parsed) {
+        try {
             if (parsed.isJsonArray()) {   // JSON-RPC batch
                 JsonArray out = new JsonArray();
                 for (JsonElement el : parsed.getAsJsonArray()) {
@@ -150,12 +191,32 @@ public final class McpServer {
                 if (r == null) respond(ex, 202, "");   // notification: no response
                 else respondJson(ex, r);
             }
-        } catch (RuntimeException fatal) {
+        } catch (RuntimeException | IOException fatal) {
             Constants.LOG.warn("[numen-mcp] request failed: {}", fatal.toString());
             try { respond(ex, 500, ""); } catch (IOException ignored) {}
         } finally {
-            ex.close();
+            try { ex.close(); } catch (RuntimeException ignored) {}
         }
+    }
+
+    /**
+     * Pick the lane for a parsed request. Control lane: handshakes, pings, tool
+     * listing, roster/control tools, cluster messaging and trade bookkeeping —
+     * everything answered in ≤10s. Work lane: engine body-tool invocations and
+     * trade_give, which may block for minutes. Batches may mix heavy and light
+     * calls, so they take the work lane.
+     */
+    private ExecutorService laneFor(JsonElement parsed) {
+        if (!parsed.isJsonObject()) return workExec;   // malformed → dispatch errors out, either lane
+        JsonObject req = parsed.getAsJsonObject();
+        String method = req.has("method") && req.get("method").isJsonPrimitive()
+                ? req.get("method").getAsString() : "";
+        if (!"tools/call".equals(method)) return controlExec;
+        JsonObject params = req.has("params") && req.get("params").isJsonObject()
+                ? req.getAsJsonObject("params") : new JsonObject();
+        String tool = params.has("name") && params.get("name").isJsonPrimitive()
+                ? params.get("name").getAsString() : "";
+        return LIGHT_TOOLS.contains(tool) ? controlExec : workExec;
     }
 
     private boolean authorized(HttpExchange ex) {
@@ -211,11 +272,10 @@ public final class McpServer {
     }
 
     private JsonObject initializeResult(JsonObject req) {
+        // We speak exactly one protocol version. Per MCP, a server that does not
+        // support the client's version answers with one it DOES support — never
+        // echo an unknown version back.
         String clientProto = PROTOCOL_VERSION;
-        if (req.has("params") && req.get("params").isJsonObject()) {
-            JsonObject p = req.getAsJsonObject("params");
-            if (p.has("protocolVersion")) clientProto = p.get("protocolVersion").getAsString();
-        }
         JsonObject result = new JsonObject();
         result.addProperty("protocolVersion", clientProto);
         JsonObject caps = new JsonObject();
@@ -382,7 +442,8 @@ public final class McpServer {
         if (config.coordinatorEnabled()) {
             coordinator.leave(target, config.inviteTimeoutSeconds());
         }
-        return content("released " + target + " — its built-in brain may act again", false);
+        return content(ok ? "released " + target + " — its built-in brain may act again"
+                : "could not release " + target, !ok);
     }
 
     /** Display name of a live companion (falls back to the uuid string). */
@@ -395,6 +456,12 @@ public final class McpServer {
     }
 
     private JsonObject handleToolInvoke(String toolName, JsonObject args) throws Exception {
+        // hidden_tools gates the CALL as well as the listing (case-tolerant, mirroring
+        // ToolRegistry.resolve) — the built-in brain's bookkeeping is not drivable.
+        if (config.isHidden(toolName)
+                || config.isHidden(toolName.toLowerCase(java.util.Locale.ROOT))) {
+            return content("tool not available to external drivers: " + toolName, true);
+        }
         UUID target = resolveCompanion(args);
         if (target == null) {
             return content("this tool needs a 'companion' argument (a name or id from list_companions)", true);
@@ -443,21 +510,27 @@ public final class McpServer {
     /**
      * The single result-envelope exit point — and therefore the cluster
      * coordinator's delivery ride: when {@code inboxOf} names a participant,
-     * anything parked in their mailbox is appended as an {@code <inbox>} block
-     * at the tail of this result (mailbox cleared on delivery). Messages never
-     * push; they surface strictly between the recipient's own tool calls.
+     * anything parked in their mailbox rides along as a <strong>separate second
+     * text element</strong> in the content array (mailbox cleared on delivery).
+     * The first element stays byte-pure — a body-tool result remains parseable
+     * TaskResult JSON. Messages never push; they surface strictly between the
+     * recipient's own tool calls.
      */
     private JsonObject content(String text, boolean isError, UUID inboxOf) {
-        String full = text;
-        if (inboxOf != null) {
-            String inbox = coordinator.drainInbox(inboxOf);
-            if (!inbox.isEmpty()) full = text + "\n" + inbox;
-        }
+        JsonArray arr = new JsonArray();
         JsonObject item = new JsonObject();
         item.addProperty("type", "text");
-        item.addProperty("text", full);
-        JsonArray arr = new JsonArray();
+        item.addProperty("text", text);
         arr.add(item);
+        if (inboxOf != null) {
+            String inbox = coordinator.drainInbox(inboxOf);
+            if (!inbox.isEmpty()) {
+                JsonObject box = new JsonObject();
+                box.addProperty("type", "text");
+                box.addProperty("text", inbox);
+                arr.add(box);
+            }
+        }
         JsonObject result = new JsonObject();
         result.add("content", arr);
         result.addProperty("isError", isError);

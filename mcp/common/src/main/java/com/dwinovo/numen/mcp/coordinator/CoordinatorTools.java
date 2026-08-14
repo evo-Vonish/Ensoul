@@ -46,6 +46,8 @@ public final class CoordinatorTools {
 
     private static final int CONTROL_TIMEOUT_SECONDS = 10;
     private static final int MAX_MESSAGE_CHARS = 500;
+    /** Trade legs (drop / collect) are seconds-scale ops — never inherit the 300s action default. */
+    private static final int TRADE_LEG_TIMEOUT_SECONDS = 30;
     private static final int COLLECT_RADIUS = 6;
     /** Slack on the locked-trade distance check so breathing room doesn't void a hand-off. */
     private static final double GIVE_DISTANCE_SLACK = 1.5;
@@ -199,6 +201,9 @@ public final class CoordinatorTools {
                 "trade invite needs you two within " + fmt(config.tradeDistance()) + " blocks — move closer first");
         if (far != null) return far;
         String note = str(args, "note");
+        if (note != null && note.length() > MAX_MESSAGE_CHARS) {
+            note = note.substring(0, MAX_MESSAGE_CHARS);   // same cap as messages — notes ride inboxes too
+        }
         String err = coordinator.openInvite(caller, to, note, config.inviteTimeoutSeconds());
         if (err != null) return Reply.err(TaskResult.fail(err).toJson(), caller);
         TradeSession s = coordinator.activeSessionOf(caller, config.inviteTimeoutSeconds());
@@ -237,7 +242,12 @@ public final class CoordinatorTools {
         if (!s.target().equals(caller)) {
             return Reply.err(TaskResult.fail("only the invited party can decline session " + s.id()).toJson(), caller);
         }
+        if (s.state() != TradeSession.State.INVITED) {
+            return Reply.err(TaskResult.fail("session " + s.id() + " is " + s.state()
+                    + ", not awaiting an answer — to leave a LOCKED trade, use trade_close").toJson(), caller);
+        }
         s.setState(TradeSession.State.DECLINED);
+        coordinator.endSession(s.id());
         coordinator.notifyTrade(s.initiator(), coordinator.nameOf(caller), "declined", s.id());
         return Reply.ok(TaskResult.ok("declined session " + s.id() + " — the inviter has been notified").toJson(), caller);
     }
@@ -266,30 +276,51 @@ public final class CoordinatorTools {
                 "you two drifted apart — get back within ~" + fmt(config.tradeDistance()) + " blocks to hand items over");
         if (far != null) return far;
 
-        // Leg 1 — the caller drops the items in front of them.
-        String dropJson = NumenActuator.invoke(caller, "drop_items",
-                        "{\"item_id\":\"" + itemId + "\",\"count\":" + count + "}")
-                .get(config.callTimeoutSeconds(), TimeUnit.SECONDS);
+        // Leg 1 — the caller drops the items in front of them. Seconds-scale op with a
+        // seconds-scale timeout; note that a client-side timeout does NOT cancel the
+        // engine-side task, so a timed-out drop may still land — say so honestly.
+        String dropJson;
+        try {
+            dropJson = NumenActuator.invoke(caller, "drop_items",
+                            "{\"item_id\":\"" + itemId + "\",\"count\":" + count + "}")
+                    .get(TRADE_LEG_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            coordinator.notifyTrade(receiver, coordinator.nameOf(caller), "give",
+                    s.id() + ": a give of " + count + "x " + itemId + " timed out at the drop leg — "
+                            + "if items appear on the ground between you, they are yours; collect_items to grab them");
+            return Reply.err(TaskResult.timeout("drop leg timed out — the drop task may STILL COMPLETE "
+                            + "in the world. Check the ground between you two; recover with collect_items.",
+                    Map.of("session", s.id())).toJson(), caller);
+        }
         if (!succeeded(dropJson)) {
             return Reply.err(TaskResult.fail("hand-off failed at the drop leg — " + gist(dropJson),
                     Map.of("session", s.id(), "drop_result", gist(dropJson))).toJson(), caller);
         }
         // Leg 2 — the receiver picks them up.
-        String collectJson = NumenActuator.invoke(receiver, "collect_items",
-                        "{\"item_ids\":[\"" + itemId + "\"],\"radius\":" + COLLECT_RADIUS + "}")
-                .get(config.callTimeoutSeconds(), TimeUnit.SECONDS);
-        boolean ok = succeeded(collectJson);
+        String collectJson;
+        try {
+            collectJson = NumenActuator.invoke(receiver, "collect_items",
+                            "{\"item_ids\":[\"" + itemId + "\"],\"radius\":" + COLLECT_RADIUS + "}")
+                    .get(TRADE_LEG_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            collectJson = null;   // pickup unconfirmed; items are physically on the ground
+        }
+        boolean ok = collectJson != null && succeeded(collectJson);
         String summary = ok
-                ? "handed " + count + "x " + itemId + " to " + coordinator.nameOf(receiver)
-                : "dropped " + count + "x " + itemId + " but pickup is unconfirmed — " + gist(collectJson);
+                ? "handed up to " + count + "x " + itemId + " to " + coordinator.nameOf(receiver)
+                        + " — verify exact counts with get_self_status if it matters"
+                : "dropped up to " + count + "x " + itemId + " but pickup is unconfirmed"
+                        + (collectJson == null ? " (collect timed out)" : " — " + gist(collectJson))
+                        + ". The items are on the ground between you two — either party can collect_items to recover.";
         Map<String, Object> data = new HashMap<>();
         data.put("session", s.id());
         data.put("item_id", itemId);
-        data.put("count", count);
+        data.put("count_requested", count);
         data.put("drop_result", gist(dropJson));
-        data.put("collect_result", gist(collectJson));
+        data.put("collect_result", collectJson == null ? "timeout" : gist(collectJson));
         coordinator.notifyTrade(receiver, coordinator.nameOf(caller), "give",
-                s.id() + ": " + count + "x " + itemId + " — " + (ok ? "now in your inventory" : gist(collectJson)));
+                s.id() + ": " + count + "x " + itemId + (ok ? " — should be in your inventory (verify with get_self_status)"
+                        : " — dropped but pickup unconfirmed; collect_items to grab them"));
         TaskResult tr = ok ? TaskResult.ok(summary, data) : TaskResult.fail(summary, data);
         return new Reply(tr.toJson(), !ok, caller);
     }
@@ -305,6 +336,7 @@ public final class CoordinatorTools {
         if (partner != null) {
             coordinator.notifyTrade(partner, coordinator.nameOf(caller), "close", s.id() + " closed");
         }
+        coordinator.endSession(s.id());
         return Reply.ok(TaskResult.ok("session " + s.id() + " closed").toJson(), caller);
     }
 

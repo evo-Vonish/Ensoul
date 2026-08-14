@@ -55,14 +55,17 @@ public final class Coordinator {
     public synchronized void leave(UUID who, long inviteTimeoutSeconds) {
         String name = participants.remove(who);
         mailboxes.remove(who);
+        List<TradeSession> toClose = new ArrayList<>();
         for (TradeSession s : sessions.values()) {
-            if (s.live(inviteTimeoutSeconds) && s.isParty(who)) {
-                UUID partner = s.other(who);
-                s.setState(TradeSession.State.CLOSED);
-                if (partner != null) {
-                    postTo(partner, Envelope.trade(seq.incrementAndGet(), name != null ? name : "someone",
-                            "close", s.id() + " closed — the other agent left the cluster"));
-                }
+            if (s.live(inviteTimeoutSeconds) && s.isParty(who)) toClose.add(s);
+        }
+        for (TradeSession s : toClose) {
+            UUID partner = s.other(who);
+            s.setState(TradeSession.State.CLOSED);
+            sessions.remove(s.id());
+            if (partner != null) {
+                postTo(partner, Envelope.trade(seq.incrementAndGet(), name != null ? name : "someone",
+                        "close", s.id() + " closed — the other agent left the cluster"));
             }
         }
     }
@@ -143,7 +146,7 @@ public final class Coordinator {
 
     /** @return error string, or null on success (session created + parked INVITED). */
     public synchronized String openInvite(UUID from, UUID to, String note, long inviteTimeoutSeconds) {
-        reapExpired(inviteTimeoutSeconds);
+        reapTerminal(inviteTimeoutSeconds);
         if (activeSessionOf(from, inviteTimeoutSeconds) != null) {
             return "you already have a live trade session — close it first (trade_close)";
         }
@@ -153,6 +156,11 @@ public final class Coordinator {
         String id = "t" + tradeSeq.incrementAndGet();
         sessions.put(id, new TradeSession(id, from, to, note));
         return null;
+    }
+
+    /** Remove a finished session outright — the map holds only live business. */
+    public synchronized void endSession(String id) {
+        sessions.remove(id);
     }
 
     /** The session with this id if it still matters to the caller, else null. */
@@ -171,11 +179,12 @@ public final class Coordinator {
         return null;
     }
 
-    /** Mark dead invitations EXPIRED so they stop blocking new invites. */
-    private void reapExpired(long inviteTimeoutSeconds) {
-        for (TradeSession s : sessions.values()) {
+    /** Drop dead business: flip stale INVITED sessions to EXPIRED, then evict every terminal entry. */
+    private void reapTerminal(long inviteTimeoutSeconds) {
+        sessions.values().removeIf(s -> {
             if (s.expired(inviteTimeoutSeconds)) s.setState(TradeSession.State.EXPIRED);
-        }
+            return s.state() != TradeSession.State.INVITED && s.state() != TradeSession.State.LOCKED;
+        });
     }
 
     // ---- internals ----

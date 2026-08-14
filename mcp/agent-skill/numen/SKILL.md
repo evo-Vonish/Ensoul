@@ -38,7 +38,7 @@ When several agents drive companions through the same server, they form a **clus
   3. Either side `trade_give` (`session`, `item_id`, `count`) to hand items over — repeatable.
   4. `trade_close` (`session`) ends it. One live session per companion, so close when done.
 
-**Messages never interrupt you.** Broadcasts, whispers, and trade events arrive appended to the tail of a tool result, inside an `<inbox>` block — you see them strictly between your own actions, never mid-call. Finish your current step, then answer with the same tools. You speak as the companion named in your call's `companion` argument, and only as one you've acquired.
+**Messages never interrupt you.** Broadcasts, whispers, and trade events ride along as a separate text element at the end of a tool result's content, holding an `<inbox>` block — you see them strictly between your own actions, never mid-call, and the tool result itself stays pure JSON. Finish your current step, then answer with the same tools. You speak as the companion named in your call's `companion` argument, and only as one you've acquired.
 
 ## When a call fails
 

@@ -1,6 +1,7 @@
 package com.dwinovo.numen.core.task;
 
 import com.dwinovo.numen.entity.NumenPlayer;
+import com.dwinovo.numen.core.Constants;
 import com.dwinovo.numen.core.look.LookBrain;
 import com.dwinovo.numen.core.net.TaskResultPayload;
 import com.dwinovo.numen.platform.Services;
@@ -44,17 +45,53 @@ public final class CompanionTickDispatcher {
         com.dwinovo.numen.entity.Companions.tickRespawns(server);   // timed death recoveries
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             if (p instanceof NumenPlayer ap) {
-                tickOne(ap);
-                // Lively-look attention brain: pick what this companion looks at and feed the body's
-                // look engine a smooth gaze intent. Runs every tick (idle AND walking); the engine
-                // itself yields to any fresher hard-aim / locomotion, so this can push unconditionally.
-                LookBrain.tick(ap);
-                // GUI-engagement posture ("工位姿态"): while a container menu is open, face the station
-                // and stay planted for the whole session. Runs AFTER tickOne (so its halt overrides the
-                // idle-autonomy sleepwalk that tickOne may have issued) and BEFORE the reflex layer's
-                // Perceptions::tick (so a survival reflex still wins the body — see GuiEngagement).
-                com.dwinovo.numen.core.perception.GuiEngagement.tick(ap);
+                // Per-companion isolation, same shape as Perceptions::tick: an exception out of one
+                // companion's task used to unwind the whole server tick — one tool bug crashed the
+                // server for everyone. Contain it here and fail just that task.
+                try {
+                    tickOne(ap);
+                    // Lively-look attention brain: pick what this companion looks at and feed the body's
+                    // look engine a smooth gaze intent. Runs every tick (idle AND walking); the engine
+                    // itself yields to any fresher hard-aim / locomotion, so this can push unconditionally.
+                    LookBrain.tick(ap);
+                    // GUI-engagement posture ("工位姿态"): while a container menu is open, face the station
+                    // and stay planted for the whole session. Runs AFTER tickOne (so its halt overrides the
+                    // idle-autonomy sleepwalk that tickOne may have issued) and BEFORE the reflex layer's
+                    // Perceptions::tick (so a survival reflex still wins the body — see GuiEngagement).
+                    com.dwinovo.numen.core.perception.GuiEngagement.tick(ap);
+                } catch (Throwable t) {
+                    failCrashedTask(ap, t);
+                }
             }
+        }
+    }
+
+    /**
+     * A companion's tick threw. Isolate it: drop the offending task and ship a FAILED result.
+     *
+     * <p>Failing the record matters as much as catching the throw. Left RUNNING, a deterministic
+     * task bug re-throws every tick forever while the model sits blocked on a {@code tool_call}
+     * id that will never be answered — a caught crash that repeats is barely better than one that
+     * takes the server down.
+     *
+     * <p>Builds the result directly rather than through {@code task.buildResult()}: that is the
+     * same task code that just crashed, and calling back into it here risks a second throw on the
+     * recovery path.
+     */
+    private static void failCrashedTask(NumenPlayer player, Throwable t) {
+        UUID id = player.getUUID();
+        Constants.LOG.error("[numen-core] companion task tick failed for {}", id, t);
+        Running running = ACTIVE.remove(id);
+        if (running != null) {
+            running.record().setState(TaskState.FAILED);
+            running.record().setResult(TaskResult.fail("task crashed: " + t.getClass().getSimpleName()
+                    + (t.getMessage() == null ? "" : ": " + t.getMessage())));
+            queueFor(id).complete(running.record());
+        }
+        try {
+            drainResults(player);
+        } catch (Throwable t2) {
+            Constants.LOG.error("[numen-core] shipping results after a task crash failed for {}", id, t2);
         }
     }
 
@@ -95,8 +132,14 @@ public final class CompanionTickDispatcher {
             }
             running.record().setResult(running.task().buildResult(st));
             queueFor(id).complete(running.record());
-            drainResults(player);
         }
+        // Everything still QUEUED behind the running task needs an answer too. Dropping QUEUES
+        // below stranded them silently: each carries a tool_call id the client's agent loop is
+        // blocked on, so the companion simply stopped responding — no error, no result, ever.
+        // cancelAll moves them to the outbox; drain (now unconditional — cancellations produce
+        // results even when nothing was running) actually ships them.
+        queueFor(id).cancelAll("companion removed from world");
+        drainResults(player);
         QUEUES.remove(id);   // the body is gone; don't leak its queue
         LookBrain.forget(id);   // drop the companion's attention state with its queue
         com.dwinovo.numen.core.perception.GuiEngagement.forget(id);   // ...and any GUI-engagement registration
@@ -147,10 +190,15 @@ public final class CompanionTickDispatcher {
     }
 
     private static void drainResults(NumenPlayer player) {
+        // Resolve the owner BEFORE draining. drainCompleted() empties the outbox, so doing it first
+        // and then bailing on a null owner destroyed every result finished while the owner was
+        // offline — and the old "the loop will re-ask" was wishful: the client loop is blocked on
+        // those tool_call ids and has nothing to re-ask with. Leave them queued; a reconnecting
+        // owner gets them on the next tick.
+        ServerPlayer owner = player.resolveOwnerPlayer();
+        if (owner == null) return;
         List<TaskRecord> completed = queueFor(player.getUUID()).drainCompleted();
         if (completed.isEmpty()) return;
-        ServerPlayer owner = player.resolveOwnerPlayer();
-        if (owner == null) return;   // owner offline — drop (the loop will re-ask)
         for (TaskRecord rec : completed) {
             TaskResult result = rec.getResult();
             // §8 corrective-notice producer: mechanically watch for repeated identical failures on

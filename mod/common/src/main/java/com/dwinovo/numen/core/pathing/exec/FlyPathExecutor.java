@@ -315,7 +315,7 @@ public final class FlyPathExecutor {
             return null;
         }
         LineBlockers lb = scanLine(aimPoint);
-        if (lb.protectedBlocker == null && !lb.unbreakable && lb.any) {
+        if (lb.protectedBlocker == null && !lb.undiggable && lb.any) {
             Constants.LOG.info("[numen-fly] no detour in r{} — breakthrough toward {}",
                     FlyTunables.AVOID_RADIUS, aimCell.toShortString());
             phase = Phase.BREAKTHROUGH;
@@ -336,8 +336,9 @@ public final class FlyPathExecutor {
                     + lb.protectedBlocker.toShortString()
                     + ") — I won't break it, and found no way around within "
                     + FlyTunables.AVOID_RADIUS_WIDE + " blocks";
-        } else if (lb.unbreakable) {
-            failReason = "no aerial route (unbreakable terrain in the way)";
+        } else if (lb.undiggable) {
+            failReason = "no aerial route — terrain I can't safely tunnel through in the way "
+                    + "(unbreakable, hazardous, or breaking it would flood the tunnel)";
         } else {
             failReason = "no aerial route within " + FlyTunables.AVOID_RADIUS_WIDE + " blocks";
         }
@@ -517,13 +518,23 @@ public final class FlyPathExecutor {
         return eyeHit.getType() == HitResult.Type.BLOCK ? eyeHit.getBlockPos() : null;
     }
 
-    private record LineBlockers(boolean any, BlockPos protectedBlocker, boolean unbreakable) {}
+    private record LineBlockers(boolean any, BlockPos protectedBlocker, boolean undiggable) {}
 
     /**
      * Classify every blocking cell along the (lookahead-capped) line: is any of
      * them protected ({@link BlockHelper#shouldAvoidBreaking} — the do-not-grief
-     * set the blueprint keeps in creative) or plain unbreakable/hazardous? Samples
-     * the feet- and head-line cell columns block by block.
+     * set the blueprint keeps in creative) or otherwise off-limits to the tunnel?
+     * Samples the feet- and head-line cell columns block by block.
+     *
+     * <p>The off-limits test is {@link #diggable} itself, deliberately — not the
+     * narrower {@code isBreakable}. This survey decides whether {@code onBlocked}
+     * commits to BREAKTHROUGH, and {@code tickBreakthrough} then re-vets each cell
+     * with {@code diggable}. When the two used different standards they could
+     * disagree: a hazard, or a block whose break would release a fluid, passed here
+     * and was rejected there, so BREAKTHROUGH bounced straight back to CRUISE →
+     * onBlocked → BREAKTHROUGH, burning a full 3D detour search per lap until
+     * MAX_AVOID_EPISODES ran out — then failing with the wrong reason. One standard,
+     * no ping-pong.
      */
     private LineBlockers scanLine(Vec3 aimPoint) {
         Level level = player.level();
@@ -534,7 +545,7 @@ public final class FlyPathExecutor {
         double len = Math.min(dist, FlyTunables.CORRIDOR_LOOKAHEAD);
         Vec3 dir = dirFull.scale(1.0 / dist);
         boolean any = false;
-        boolean unbreakable = false;
+        boolean undiggable = false;
         BlockPos protectedBlocker = null;
         BlockPos last = null;
         for (double t = 0.5; t <= len; t += 0.5) {
@@ -553,12 +564,12 @@ public final class FlyPathExecutor {
                 if (BlockHelper.shouldAvoidBreaking(level, c) && protectedBlocker == null) {
                     protectedBlocker = c.immutable();
                 }
-                if (!BlockHelper.isBreakable(level, c)) {
-                    unbreakable = true;
+                if (!diggable(c)) {
+                    undiggable = true;
                 }
             }
         }
-        return new LineBlockers(any, protectedBlocker, unbreakable);
+        return new LineBlockers(any, protectedBlocker, undiggable);
     }
 
     /** May the flight tunnel break this cell? The creative do-not-grief contract:

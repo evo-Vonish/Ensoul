@@ -129,8 +129,19 @@ public final class AgentLoopRegistry {
         if (loop != null) loop.dispose();
     }
 
-    /** Clear everything — called on world-disconnect / explicit reset. */
+    /**
+     * Clear everything — called on world-disconnect / explicit reset.
+     *
+     * <p>Disposes each loop before dropping the map. Clearing the map alone only unhooks the
+     * loops: a turn already in flight still completes, still bills the owner, still dispatches
+     * its tools, and still appends to the conversation log that the replacement loop is now
+     * writing. {@link #dispose(UUID)} has always done this for a single companion; the bulk
+     * path silently didn't.
+     */
     public static void clear() {
+        for (EntityAgentLoop loop : ENTITY_LOOPS.values()) {
+            loop.dispose();
+        }
         ENTITY_LOOPS.clear();
     }
 }

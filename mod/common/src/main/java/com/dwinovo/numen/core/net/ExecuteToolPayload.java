@@ -89,6 +89,16 @@ public record ExecuteToolPayload(UUID entityUuid,
         //       respawn it from the registry on a cold start) and run the tool
         //       through the CompanionTickDispatcher instead of the Mob GoalSelector.
         var server = player.level().getServer();
+        // Authorize BEFORE the respawn below, not after. The respawn materialises a dormant body
+        // into the world — a real, persistent side effect — and it used to run for ANY caller,
+        // because ownership was only checked afterwards inside handleCompanion. A stranger could
+        // therefore force-spawn someone else's companion at will and merely receive "not the owner"
+        // for their trouble. Companions.isOwner resolves from the live body when one is loaded and
+        // from the registry entry when it isn't, so it answers correctly while still dormant.
+        if (!com.dwinovo.numen.entity.Companions.isOwner(server, p.entityUuid(), player.getUUID())) {
+            replyError(player, p, "not the owner");
+            return;
+        }
         com.dwinovo.numen.entity.NumenPlayer companion =
                 com.dwinovo.numen.entity.NumenPlayer.findByUuid(server, p.entityUuid());
         if (companion == null) {
@@ -109,6 +119,8 @@ public record ExecuteToolPayload(UUID entityUuid,
      */
     private static void handleCompanion(ExecuteToolPayload p, ServerPlayer player,
                                         com.dwinovo.numen.entity.NumenPlayer companion) {
+        // Redundant with the pre-respawn gate in handle(), kept as defence in depth: this one sees
+        // the live body directly, so it also catches an ownership change between the two checks.
         if (!companion.isOwnedByPlayer(player.getUUID())) {
             replyError(player, p, "not the owner");
             return;

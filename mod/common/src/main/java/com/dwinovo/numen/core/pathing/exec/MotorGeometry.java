@@ -102,7 +102,14 @@ public final class MotorGeometry {
         /** A solid but breakable block — dig it away, then rise. */
         BREAKABLE,
         /** Bedrock / otherwise unbreakable — can't go up through it here. */
-        UNBREAKABLE
+        UNBREAKABLE,
+        /**
+         * Breakable, but sand/gravel is stacked directly on top: breaking it drops the whole
+         * column into the shaft the body is standing in — Baritone's {@code dontMineUnderFallingBlock}
+         * hazard. Digging a rung at a time under a gravel layer buries the companion and suffocates
+         * it. Treated like {@link #UNBREAKABLE} by climbers: don't dig here, go around.
+         */
+        FALLING
     }
 
     /** The next action a shaft climber should take this rung. */
@@ -130,13 +137,19 @@ public final class MotorGeometry {
      * when {@code sidestepAvailable} (escape_to_surface offers this; pillar_up never does,
      * so it fails fast with a precise reason), a breakable ceiling yields {@link Step#DIG},
      * and a clear ceiling yields {@link Step#RISE} only when {@code haveScaffold}.
+     *
+     * <p>{@link Head#FALLING} rides the {@link Head#UNBREAKABLE} arm: a gravel-loaded ceiling is
+     * breakable in the literal sense but must not be broken from underneath, so the decision — go
+     * around, or fail — is identical. It reuses {@link Step#FAIL_UNBREAKABLE} rather than adding a
+     * {@code Step} constant, because every new constant on an enum in this file has to be chased
+     * through the exhaustive switches that consume it.
      */
     public static Step shaftStep(boolean atTarget, Head head,
                                  boolean haveScaffold, boolean sidestepAvailable) {
         if (atTarget) return Step.DONE;
         return switch (head) {
             case FLUID -> sidestepAvailable ? Step.SIDESTEP : Step.FAIL_FLUID_NO_SIDESTEP;
-            case UNBREAKABLE -> sidestepAvailable ? Step.SIDESTEP : Step.FAIL_UNBREAKABLE;
+            case UNBREAKABLE, FALLING -> sidestepAvailable ? Step.SIDESTEP : Step.FAIL_UNBREAKABLE;
             case BREAKABLE -> Step.DIG;
             case CLEAR -> haveScaffold ? Step.RISE : Step.FAIL_NO_SCAFFOLD;
         };

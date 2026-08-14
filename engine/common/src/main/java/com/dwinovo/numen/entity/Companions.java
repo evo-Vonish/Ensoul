@@ -308,6 +308,31 @@ public final class Companions {
     }
 
     /**
+     * Does {@code ownerUuid} own a companion called {@code name}? Checks live bodies first, then the
+     * registry — so it still answers correctly while the companion is dormant.
+     *
+     * <p>Exists for the name-keyed gates: {@link #isOwner} needs a companion UUID, but a caller
+     * working from a name alone (the {@code /numenperm} tier command) has none, and "can't resolve
+     * it, so allow the write" is not an acceptable fallback for an ownership check. Case-insensitive,
+     * matching how the commands resolve companion names.
+     */
+    public static boolean ownsCompanionNamed(MinecraftServer server, UUID ownerUuid, String name) {
+        if (server == null || ownerUuid == null || name == null) return false;
+        String want = name.strip();
+        if (want.isEmpty()) return false;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (p instanceof NumenPlayer a && a.isOwnedByPlayer(ownerUuid)
+                    && a.getName().getString().equalsIgnoreCase(want)) {
+                return true;
+            }
+        }
+        for (Map.Entry<UUID, CompanionRegistry.Entry> e : CompanionRegistry.get(server).ownedBy(ownerUuid)) {
+            if (e.getValue().name().equalsIgnoreCase(want)) return true;
+        }
+        return false;
+    }
+
+    /**
      * Push an async world {@code <event>} to the companion's brain (it runs on the owner's client).
      * {@code urgent} wakes an idle brain to react now; otherwise it rides along on the next owner turn.
      * No-op if the owner is offline (no client to receive it).

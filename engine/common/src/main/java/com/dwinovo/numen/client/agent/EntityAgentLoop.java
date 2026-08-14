@@ -177,6 +177,17 @@ public final class EntityAgentLoop {
     private boolean aborted = false;
 
     /**
+     * Consecutive turns that died before an assistant reply landed. A single failure must NOT
+     * latch {@link #aborted}: the transport already retried it with backoff, and the latch also
+     * blocks the world-event wake path ({@code tryStartTurn} from an urgent event), so one
+     * network blip used to leave a companion that would not react to being swarmed. Only a
+     * sustained outage latches — no point re-dialling a backend that is genuinely down on the
+     * owner's token budget. Cleared by a successful turn or a fresh owner prompt.
+     */
+    private int consecutiveLlmFailures = 0;
+    private static final int MAX_CONSECUTIVE_LLM_FAILURES = 3;
+
+    /**
      * Set while an external driver (an MCP client via
      * {@link com.dwinovo.numen.api.NumenActuator}) holds this body. The built-in brain is
      * paused — no LLM turn starts — until {@link #releaseExternal}. Distinct from
@@ -424,14 +435,33 @@ public final class EntityAgentLoop {
     public ConvoState convo() { return convo; }
 
     /**
-     * Release transient per-loop state when this loop is permanently dropped (dismiss / unload
-     * without a respawn) — called by {@link AgentLoopRegistry#dispose}. Clears the death-carry
-     * queue so notes stashed for a respawn that will never come don't linger. The loop object is
-     * itself removed from the registry and GC'd, so this is belt-and-suspenders, but it keeps the
-     * "carried across death" contract explicit.
+     * Permanently drop this loop (dismiss / unload without a respawn, or {@code /numen reset}) —
+     * called by {@link AgentLoopRegistry#dispose} and {@link AgentLoopRegistry#clear}.
+     *
+     * <p>Dropping the registry entry is <strong>not</strong> enough on its own. An unhooked loop
+     * with a turn in flight keeps running: its LLM response still lands (already billed) and
+     * dispatches tools into the world, and it keeps appending to the same conversation log that
+     * a freshly created loop for this companion is now writing — two brains interleaving one
+     * JSONL. So neutralise the loop the way {@link #onEntityDied} does, then release state.
+     *
+     * <p>Deliberately does NOT synthesize cancelled tool results into the conversation the way
+     * {@link #abort()} must: writing more messages is the thing we are stopping, and the preload
+     * path already heals dangling tool calls when the history is next replayed.
      */
     public void dispose() {
+        turnGeneration++;              // any in-flight LLM response is stale → discarded on arrival
+        dispatcher.cancelAndDrain();   // stop queued + in-flight tool work (fires CompanionLifecycle.onAbort)
+        preemptedGenerations.clear();
+        awaitingLlmResponse = false;
+        awaitingEmergency = false;
+        compacting = false;
+        pendingUrgent = false;
+        aborted = true;                // a late callback can't start another turn
+        dead = true;                   // and tryStartTurn's first guard refuses outright
+        bufferedPrompts.clear();
+        bufferedAttachments.clear();
         pendingPostThaw.clear();
+        Constants.LOG.info("[numen-entity#{}] loop disposed — brain stopped, tool work cancelled", entityUuid);
     }
     /** Context size of the last request as the API counted it (0 = unknown yet) — read by the chat panel's ctx bar. */
     public int lastPromptTokens() { return lastPromptTokens; }
@@ -467,6 +497,7 @@ public final class EntityAgentLoop {
         }
         boolean wasAborted = aborted;
         aborted = false;
+        consecutiveLlmFailures = 0;   // owner is back — give the backend a clean slate of attempts
         // Always buffer first; tryStartTurn() splices buffered prompts into the
         // conversation only at a protocol-valid point. If we're mid-turn (the
         // guards in tryStartTurn fire), the prompt stays buffered and gets
@@ -1569,6 +1600,41 @@ public final class EntityAgentLoop {
         mc.execute(() -> handleResponse(gen, res, err));
     }
 
+    /**
+     * A turn consumed a user message but died before its assistant reply was recorded, so the
+     * history now ends on {@code user}. Cap it with a short assistant note: the next prompt
+     * would otherwise append a second user message back-to-back, which GLM and DeepSeek reject
+     * outright (strict role alternation) — and since both messages are already persisted, that
+     * 400 repeats on every launch. Same cap {@link #abort()} applies on the interrupt path.
+     *
+     * <p>No-op when history ends on a tool result (a mid-chain failure) — that is already valid.
+     */
+    private void capDanglingUser(String note) {
+        if (convo.lastMessage() instanceof ConvoState.Msg.User) {
+            convo.addAssistant(new AssistantTurn(note, List.of(), null));
+        }
+    }
+
+    /**
+     * Settle a failed turn: record it in the conversation (so the model can see the gap on the
+     * next turn instead of silently losing one) and count it. Latches {@link #aborted} only once
+     * {@link #MAX_CONSECUTIVE_LLM_FAILURES} failures land in a row — a transient blip leaves the
+     * brain live, so an urgent world event can still start the next turn.
+     */
+    private void failTurn(String note) {
+        capDanglingUser(note);
+        convo.resetTurnCount();
+        consecutiveLlmFailures++;
+        if (consecutiveLlmFailures >= MAX_CONSECUTIVE_LLM_FAILURES) {
+            aborted = true;
+            Constants.LOG.warn("[numen-entity#{}] {} consecutive LLM failures — brain paused until the owner speaks",
+                    entityUuid, consecutiveLlmFailures);
+        } else {
+            Constants.LOG.info("[numen-entity#{}] LLM turn failed ({}/{}) — brain stays live, awaiting the next event",
+                    entityUuid, consecutiveLlmFailures, MAX_CONSECUTIVE_LLM_FAILURES);
+        }
+    }
+
     private void handleResponse(int gen, NumenLlmClient.ChatResult res, Throwable err) {
         // Usage accounting first, BEFORE the generation check: a discarded (interrupted)
         // response was still billed by the backend, so it still counts.
@@ -1600,6 +1666,10 @@ public final class EntityAgentLoop {
         // dispatched ExecuteToolPayload would NPE in the platform sender. Drop this turn quietly.
         if (Minecraft.getInstance().getConnection() == null) {
             Constants.LOG.info("[numen-entity#{}] client disconnected — dropping LLM turn", entityUuid);
+            // Cap before latching: this history is about to be replayed from the JSONL on the
+            // next launch, and a dangling user message there bricks the FIRST prompt of the
+            // next session — a restart can't clear what the log persisted.
+            capDanglingUser("(连接断开,本轮未完成)");
             aborted = true;
             return;
         }
@@ -1607,14 +1677,15 @@ public final class EntityAgentLoop {
         if (err != null) {
             Constants.LOG.warn("[numen-entity#{}] LLM call failed: {}",
                     entityUuid, unwrap(err));
-            aborted = true;
+            failTurn("(调用失败,本轮未完成: " + truncate(String.valueOf(unwrap(err)), 200) + ")");
             return;
         }
         if (res == null || res.turn() == null) {
             Constants.LOG.warn("[numen-entity#{}] LLM returned null turn", entityUuid);
-            aborted = true;
+            failTurn("(调用失败,本轮未完成: 空回复)");
             return;
         }
+        consecutiveLlmFailures = 0;   // a reply landed — the backend is healthy again
         AssistantTurn turn = res.turn();
         // True context size of the request we just made — the auto-compaction
         // signal. 0 when the backend sent no usage frame (then auto never fires).

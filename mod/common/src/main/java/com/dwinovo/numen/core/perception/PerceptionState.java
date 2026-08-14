@@ -112,6 +112,12 @@ final class PerceptionState {
     /** Game time the recover condition (clean verdict + HP above the line) started holding continuously;
      *  0 = not holding. The episode only closes once it has held for the sustain window. */
     long reflexCalmSinceTick;
+    /** Game time the current critical episode opened; 0 = none live. Arms the flee budget, so a threat
+     *  that stays "dangerous" forever (a provoked neutral) can't hold the body indefinitely. */
+    long reflexEpisodeStartTick;
+    /** Game time before which a budget-exhausted episode won't re-arm on a merely-dangerous verdict.
+     *  A fresh wound bypasses it — the cooldown throttles churn, it never blocks real danger. */
+    long reflexEpisodeRearmAt;
     /** Game time the next reflex swing is allowed (~one hit per 12t); 0 = ready. */
     long reflexSwingUntil;
     /** Flee-drive deadline (≤ now+60t) while sprinting away; 0 = not currently fleeing. */

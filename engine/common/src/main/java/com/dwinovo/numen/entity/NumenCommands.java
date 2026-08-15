@@ -50,12 +50,23 @@ public final class NumenCommands {
             throws CommandSyntaxException {
         ServerPlayer owner = ctx.getSource().getPlayerOrException();
         ServerLevel level = (ServerLevel) owner.level();
-        NumenPlayer body = Companions.summon(
+        // Companions.summon is the single authoritative validation point (also reached from the panel's
+        // SummonRequestPayload) — this command previously had NO length cap at all (StringArgumentType
+        // .word() only rejects whitespace, not length), silently accepting names vanilla's own
+        // ADD_PLAYER broadcast would later crash on. It now reports the SAME typed reason the payload
+        // handler would, per the "one convergence, one reason" rule.
+        Companions.SummonOutcome outcome = Companions.summon(
                 level.getServer(), owner.getUUID(), name, level, owner.position());
+        if (!outcome.success()) {
+            ctx.getSource().sendFailure(Component.literal(outcome.reason()));
+            return 0;
+        }
+        NumenPlayer body = outcome.body();
         // Push the updated roster so the owner's G panel can reach the new companion.
         Companions.syncRosterToOwner(level.getServer(), owner);
         ctx.getSource().sendSuccess(() ->
-                Component.literal("Summoned companion '" + name + "' (" + body.getUUID() + ")"), false);
+                Component.literal("Summoned companion '" + body.getName().getString() + "' (" + body.getUUID() + ")"),
+                false);
         return 1;
     }
 

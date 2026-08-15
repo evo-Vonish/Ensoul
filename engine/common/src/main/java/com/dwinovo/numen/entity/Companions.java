@@ -54,15 +54,133 @@ public final class Companions {
 
     private Companions() {}
 
+    /** Maximum accepted companion name length (trimmed), enforced inside {@link #summon} itself — NOT
+     *  the same thing as {@link com.dwinovo.numen.network.payload.SummonRequestPayload#MAX_NAME} (32,
+     *  the wire codec's DECODE bound, deliberately left wide; see {@link #summon}'s javadoc for why).
+     *  This is the REAL limit: it matches vanilla's {@code ByteBufCodecs.PLAYER_NAME = stringUtf8(16)},
+     *  which is what actually encodes {@code GameProfile.name()} every time this companion's body joins
+     *  the player list in the {@code ADD_PLAYER} broadcast — {@code Utf8String.write} throws past 16. */
+    public static final int MAX_NAME_LENGTH = 16;
+
+    /** Typed outcome of {@link #summon} — see each constant's own javadoc for what it means and what a
+     *  caller should tell the owner. Exists so the panel, the {@code /numen player summon} command and
+     *  the payload handler all report the SAME reason for the SAME situation, instead of three
+     *  independently-worded (or, before this, silently swallowed) messages. */
+    public enum SummonResult {
+        /** A brand-new companion was created. */
+        OK,
+        /** {@code name} (case-insensitively, trimmed) already named a companion the SAME owner already
+         *  had — live or dormant — and it was returned/woken rather than duplicated. Not a failure; the
+         *  summon contract has always been idempotent per (owner, name). */
+        REUSED_EXISTING,
+        /** {@code name} (case-insensitively, trimmed) already names a DIFFERENT owner's companion.
+         *  Refused outright — see {@link #summon}'s javadoc for why uniqueness must be global, not
+         *  per-owner. */
+        NAME_TAKEN,
+        /** {@code name} is blank once trimmed. */
+        NAME_INVALID,
+        /** {@code name}, trimmed, is longer than {@link #MAX_NAME_LENGTH} characters. */
+        NAME_TOO_LONG
+    }
+
+    /** {@link #summon}'s full result: which {@link SummonResult} occurred, the resulting body (non-null
+     *  iff {@link #success()}), and a ready-to-show {@code reason} (empty string on success). */
+    public record SummonOutcome(SummonResult result, NumenPlayer body, String reason) {
+        public boolean success() { return body != null; }
+    }
+
     /**
      * Summon the owner's companion called {@code name}. IDEMPOTENT per (owner, name): if one already
      * exists it is reused — already live → returned as-is; dormant → brought back. Only a name with no
      * existing companion mints a fresh one. (The old "fresh random UUID every summon" minted same-name
      * duplicates that all respawned on login — that's the duplicate-companion bug.)
+     *
+     * <p>THE single convergence point for BOTH entry points ({@code /numen player summon} and the
+     * panel's {@code SummonRequestPayload}) — every summon-time rule lives HERE so both report the
+     * identical {@link SummonResult}/reason for the identical situation, and so a modified client that
+     * skips its own UI validation gains nothing: this is the authority, the UI is only a convenience.
+     *
+     * <h2>Name length — 16, enforced here, not on the wire</h2>
+     * {@code SummonRequestPayload.MAX_NAME} stays 32 on the wire deliberately: dropping the codec's
+     * DECODE bound to 16 would let a 17-31 character name trip {@code ByteBufCodecs.stringUtf8} before
+     * {@code handle()} even runs — a raw {@code DecoderException}, which is a WORSE failure mode than
+     * the one this method exists to prevent (no clean reason, just a decode error on the connection).
+     * The real cap is {@link #MAX_NAME_LENGTH} = 16, checked here, because vanilla's own
+     * {@code ByteBufCodecs.PLAYER_NAME = stringUtf8(16)} is what actually encodes the resulting
+     * {@code GameProfile.name()} in the {@code ADD_PLAYER} broadcast every time this companion joins the
+     * player list (every spawn, not just creation) — a 17-32 character name summoned under the old,
+     * unchecked cap would eventually crash broadcasting the player-info add, at some later, unrelated-
+     * looking moment. Rejecting it HERE with a typed result replaces that latent crash with an ordinary,
+     * immediate "name too long" response.
+     *
+     * <h2>Uniqueness — GLOBAL, case-insensitive, not per-owner</h2>
+     * The companion name is already a global key in four OTHER places, so per-owner uniqueness would
+     * close none of them: {@code CompanionPermissions} keys permission tiers on the lower-cased name for
+     * the WHOLE server, and its write gate ({@code NumenPermCommand} → {@link #ownsCompanionNamed})
+     * passes for anyone who owns ANY companion of that name — so without this check, Mallory could
+     * summon his own "Bob" (nothing stopped him before this method) and run {@code /numenperm Bob
+     * owners}, and the single global row {@code bob → owners} would raise the permission ceiling on
+     * Alice's separately-owned "Bob" too. {@code DeathTolls} shares the same global name key;
+     * {@code NumenSkins} caches skins by lower-cased name; and the MCP bridge's {@code resolveCompanion}
+     * falls back to a case-insensitive name match, so two case-variant "Bob"/"bob" companions would let
+     * an external agent acquire control of one body and invoke tool calls on the other. Comparison below
+     * is {@code equalsIgnoreCase} on the TRIMMED name, matching how those four stores already normalise.
+     *
+     * <p><b>Known gap (not closed by this method):</b> the collision scan below covers every currently
+     * LIVE companion (ANY owner, online or not — a spawned companion is a standing {@link ServerPlayer}
+     * independent of its owner's own connection, found via {@code server.getPlayerList()}) plus the
+     * SUMMONING owner's own DORMANT entries. It can NOT see a dormant companion belonging to a
+     * DIFFERENT owner: nothing in {@link CompanionRegistry}'s public API enumerates every entry across
+     * every owner (only {@code ownedBy(ownerUuid)} and {@code pendingDead()} exist), and adding a full
+     * enumerator there is outside this pass's assigned file set. In practice the window is narrow — a
+     * companion is dormant only right after server start, before its owner's first login this session,
+     * or mid-death-respawn-delay — but it is real; closing it needs a {@code CompanionRegistry}
+     * cross-owner accessor in a later pass.
+     *
+     * <h2>Grandfathering</h2>
+     * Enforcement is summon-time only, on PURPOSE: a pre-existing duplicate or over-length name already
+     * sitting in the registry is never renamed, merged or deleted by this method — only a NEW summon of
+     * a colliding or oversize name is refused. A retroactive migration would destroy data irreversibly
+     * and is explicitly out of scope.
      */
-    public static NumenPlayer summon(MinecraftServer server, UUID ownerUuid, String name,
-                                      ServerLevel level, Vec3 pos) {
-        UUID existing = findByOwnerName(server, ownerUuid, name);
+    public static SummonOutcome summon(MinecraftServer server, UUID ownerUuid, String name,
+                                        ServerLevel level, Vec3 pos) {
+        // strip(), not trim(): matches ownsCompanionNamed below and CompanionPermissions.key() in
+        // mod/ — Unicode-aware whitespace trimming, not just ASCII <= U+0020, so normalisation agrees
+        // across every name-keyed store this companion's name touches.
+        String trimmed = name == null ? "" : name.strip();
+        if (trimmed.isEmpty()) {
+            return outcome(SummonResult.NAME_INVALID, null, trimmed);
+        }
+        if (trimmed.length() > MAX_NAME_LENGTH) {
+            return outcome(SummonResult.NAME_TOO_LONG, null, trimmed);
+        }
+
+        // Global (any owner) scan of LIVE bodies. Own-name match wins immediately and short-circuits —
+        // grandfathering (see javadoc above) means reaching the OWNER'S OWN pre-existing companion must
+        // never be blocked by a same-named collision that already exists elsewhere, even a legacy one
+        // this pass's global-uniqueness rule would refuse if someone tried to create it FRESH today.
+        // Any OTHER owner's live match is remembered but not acted on yet — it only matters once we know
+        // this isn't secretly the summoning owner's own companion (checked next, live AND dormant).
+        NumenPlayer ownLive = null;
+        boolean otherOwnerLiveMatch = false;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (p instanceof NumenPlayer a && a.getName().getString().equalsIgnoreCase(trimmed)) {
+                if (a.isOwnedByPlayer(ownerUuid)) {
+                    ownLive = a;
+                    break;
+                }
+                otherOwnerLiveMatch = true;
+            }
+        }
+        if (ownLive != null) {
+            return outcome(SummonResult.REUSED_EXISTING, ownLive, trimmed);
+        }
+
+        // Not live under that name — check the OWNER'S OWN dormant entries (case-insensitive, so typing
+        // "bob" wakes an entry stored as "Bob"). Cross-owner DORMANT collisions are the known gap
+        // documented above; this only ever looks at ownerUuid's own entries.
+        UUID existing = findOwnDormantByName(server, ownerUuid, trimmed);
         if (existing != null) {
             NumenPlayer body = respawn(server, existing);
             if (body != null) {
@@ -76,23 +194,54 @@ public final class Companions {
                     CompanionRegistry.get(server).markAlive(existing);
                     respawnHoldUntil.remove(existing);
                 }
-                return body;
+                return outcome(SummonResult.REUSED_EXISTING, body, trimmed);
             }
-            CompanionRegistry.get(server).remove(existing);   // stale entry (no .dat) — replace it
+            CompanionRegistry.get(server).remove(existing);   // stale entry (no .dat) — name is free again
         }
+
+        // Genuinely not an existing companion of the SUMMONING owner's — only NOW does another owner's
+        // live companion under this name block creation of a brand-new one.
+        if (otherOwnerLiveMatch) {
+            return outcome(SummonResult.NAME_TAKEN, null, trimmed);
+        }
+
         UUID companionUuid = UUID.randomUUID();
-        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, name, ownerUuid, level, pos);
+        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, trimmed, ownerUuid, level, pos);
         CompanionRegistry.get(server).put(companionUuid,
-                new CompanionRegistry.Entry(name, ownerUuid, level.dimension(), body.blockPosition()));
-        return body;
+                new CompanionRegistry.Entry(trimmed, ownerUuid, level.dimension(), body.blockPosition()));
+        return outcome(SummonResult.OK, body, trimmed);
     }
 
-    /** Companion UUID of the owner's companion named {@code name}, or null if none. */
-    private static UUID findByOwnerName(MinecraftServer server, UUID ownerUuid, String name) {
+    /** Companion UUID of {@code ownerUuid}'s own DORMANT (not currently spawned) companion whose stored
+     *  name matches {@code trimmedName} case-insensitively, or null. Live matches — for ANY owner — are
+     *  handled by the scan in {@link #summon} before this is ever reached. */
+    private static UUID findOwnDormantByName(MinecraftServer server, UUID ownerUuid, String trimmedName) {
         for (Map.Entry<UUID, CompanionRegistry.Entry> e : CompanionRegistry.get(server).ownedBy(ownerUuid)) {
-            if (e.getValue().name().equals(name)) return e.getKey();
+            if (e.getValue().name().equalsIgnoreCase(trimmedName)) return e.getKey();
         }
         return null;
+    }
+
+    /** Builds the {@link SummonOutcome} for {@code result}, filling in {@link #reasonFor} for anything
+     *  that isn't a success. Centralising this — rather than each return site in {@link #summon} building
+     *  its own string — is what guarantees the command, the payload handler and (once a later wave wires
+     *  {@code SummonResultPayload}) the panel all say the exact same sentence for the exact same
+     *  {@link SummonResult}. */
+    private static SummonOutcome outcome(SummonResult result, NumenPlayer body, String attemptedName) {
+        return new SummonOutcome(result, body, reasonFor(result, attemptedName));
+    }
+
+    /** Human-readable explanation for a {@link SummonResult}, or {@code ""} for a success
+     *  ({@link SummonResult#OK}/{@link SummonResult#REUSED_EXISTING}) — there's nothing to explain about
+     *  those. */
+    private static String reasonFor(SummonResult result, String attemptedName) {
+        return switch (result) {
+            case NAME_INVALID -> "Companion name can't be blank.";
+            case NAME_TOO_LONG -> "Companion name '" + attemptedName + "' is too long (max "
+                    + MAX_NAME_LENGTH + " characters).";
+            case NAME_TAKEN -> "The name '" + attemptedName + "' is already in use by another companion.";
+            case OK, REUSED_EXISTING -> "";
+        };
     }
 
     /**

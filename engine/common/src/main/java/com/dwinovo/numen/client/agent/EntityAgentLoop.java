@@ -1060,7 +1060,7 @@ public final class EntityAgentLoop {
         // repeats the exact same call. Runaways are stopped by the owner's
         // interrupt.
         if (!NumenLlmClient.isConfigured()) {
-            Constants.LOG.warn("[numen-entity#{}] API key not set; open the Numen GUI (X) → Settings",
+            Constants.LOG.warn("[numen-entity#{}] API key not set; open the Numen GUI (G) → Settings",
                     entityUuid);
             aborted = true;
             return;

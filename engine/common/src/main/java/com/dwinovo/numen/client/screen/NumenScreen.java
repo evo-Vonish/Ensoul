@@ -200,7 +200,10 @@ public final class NumenScreen extends Screen {
     private int tickCounter;
 
     private NumenScreen(UUID uuid, String name) {
-        super(Component.literal(name == null ? "Fenn" : "Fenn - " + name));
+        // Companion name, "Numen" fallback when none is known yet — matches the header's own
+        // fallback at renderState (:970). Was hardcoded to "Fenn", a leftover default companion
+        // name from before the product supported multiple/renamed companions.
+        super(Component.literal(name == null ? "Numen" : name));
         this.uuid = uuid;
         this.name = name;
     }
@@ -1498,8 +1501,8 @@ public final class NumenScreen extends Screen {
     /**
      * Flatten the convo into render rows, chat-panel v2 three-layer model.
      *
-     * <p><b>Top layer — only four kinds of row surface here:</b> the owner's words, Fenn's spoken
-     * words, a thinking fold (the SPEAKING turn's own reasoning, glued before its message), and a
+     * <p><b>Top layer — only four kinds of row surface here:</b> the owner's words, the companion's
+     * spoken words, a thinking fold (the SPEAKING turn's own reasoning, glued before its message), and a
      * <em>step-digest</em> row. Everything that happens <em>between two adjacent spoken messages</em>
      * — consecutive tool-call runs, the intermediate ("middle-turn") thinking of tool-only turns, and
      * machine-facing cognition-note user messages (system 见闻) — is aggregated into ONE collapsed

@@ -65,7 +65,19 @@ public final class Companions {
         UUID existing = findByOwnerName(server, ownerUuid, name);
         if (existing != null) {
             NumenPlayer body = respawn(server, existing);
-            if (body != null) return body;
+            if (body != null) {
+                // A re-summon during the death window is an explicit owner request that supersedes the
+                // timed respawn: without this, CompanionRegistry still shows diedAt > 0 after the respawn
+                // above, so Companions.tickRespawns' pendingDead() sweep keeps this UUID queued and later
+                // calls respawnDead → CompanionFactory.spawn a SECOND time for the body we just returned
+                // (two ticking bodies, one identity — vanilla's PlayerList de-dupes by neither name nor UUID).
+                CompanionRegistry.Entry e = CompanionRegistry.get(server).find(existing);
+                if (e != null && e.diedAt() > 0L) {
+                    CompanionRegistry.get(server).markAlive(existing);
+                    respawnHoldUntil.remove(existing);
+                }
+                return body;
+            }
             CompanionRegistry.get(server).remove(existing);   // stale entry (no .dat) — replace it
         }
         UUID companionUuid = UUID.randomUUID();
@@ -96,7 +108,16 @@ public final class Companions {
         ServerLevel level = server.getLevel(entry.dimension());
         if (level == null) level = server.overworld();
         // pos=null: keep the position restored from the .dat.
-        return CompanionFactory.spawn(server, companionUuid, entry.name(), entry.owner(), level, null);
+        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, entry.name(), entry.owner(), level, null);
+        // Symmetry with summon(): this method has its own direct caller (ExecuteToolPayload, acting on a
+        // companion UUID without going through summon's name lookup), so the death-state clear can't live
+        // in summon() alone. Same reasoning as there — a respawn here means the entry is no longer pending,
+        // so the timed sweep in tickRespawns must not spawn a second body for it later.
+        if (entry.diedAt() > 0L) {
+            CompanionRegistry.get(server).markAlive(companionUuid);
+            respawnHoldUntil.remove(companionUuid);
+        }
+        return body;
     }
 
     /** When an owner logs in, bring back every companion of theirs. A companion that DIED while the owner

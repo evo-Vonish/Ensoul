@@ -110,6 +110,15 @@ public final class ToolDispatcher {
      * occupies the in-flight slot at a time; {@link #complete} re-enters here to
      * advance. The {@link #advancing} guard keeps a synchronously-completing tool
      * draining iteratively instead of recursing.
+     *
+     * <p>W8 control gate: before shipping each call, check {@link ClientControl#mayThink} for
+     * this companion. If control moved out from under the built-in brain WHILE its turn was
+     * mid-flight (a sub-tick race — {@code tryStartTurn} already refuses to dispatch a NEW turn,
+     * but an in-flight one can still land with tool calls attached), refuse to ship the call and
+     * complete it locally with an "external control took over" result instead. Leaving it
+     * unshipped with no result would hang the conversation on an unanswered {@code tool_call} id
+     * forever — the next request would be protocol-invalid. Keeps draining the rest of the
+     * queue the same way, so a whole turn's worth of calls all get healed, not just the first.
      */
     private void drainNext() {
         if (advancing) return;
@@ -120,6 +129,12 @@ public final class ToolDispatcher {
                 if (inv == null) {
                     sink.onAllSettled();
                     return;
+                }
+                if (!ClientControl.instance().mayThink(entityUuid)) {
+                    Constants.LOG.info("[numen-dispatch#{}] tool {} id={} not shipped — external control took over",
+                            entityUuid, inv.name(), inv.id());
+                    sink.onResult(inv, TaskResult.fail("external control took over; this call was not executed").toJson());
+                    continue;   // nothing in flight — drain the next queued call (heals the whole turn)
                 }
                 NumenTool tool = ToolRegistry.resolve(inv.name());
                 if (tool == null) {

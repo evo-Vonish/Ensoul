@@ -8,6 +8,7 @@ import com.dwinovo.numen.agent.provider.AssistantTurn;
 import com.dwinovo.numen.agent.skill.SkillRegistry;
 import com.dwinovo.numen.agent.tool.ToolInvocation;
 import com.dwinovo.numen.agent.tool.ToolRegistry;
+import com.dwinovo.numen.entity.ControlRegistry.ControlState;
 import com.dwinovo.numen.platform.Services;
 import com.dwinovo.numen.platform.services.INumenConfig;
 import com.dwinovo.numen.task.TaskResult;
@@ -173,6 +174,20 @@ public final class EntityAgentLoop {
      */
     private final List<String> bufferedAttachments = new ArrayList<>();
 
+    /**
+     * Hard cap on {@link #bufferedPrompts} — count and character bounds, whichever trips first
+     * (see {@link #enforceBufferedPromptsCap}). While an external brain holds this body (W8:
+     * {@link #mayThink} false), {@link #submitPrompt} refuses owner prompts outright, but world
+     * events still queue append-only via {@link #queueEventNote} — and an hour of external
+     * driving can accumulate enough of them that {@link #flushBufferedPrompts}'s single merged
+     * message alone trips the hard compaction gate, or exceeds the model window outright, the
+     * moment control returns.
+     */
+    private static final int MAX_BUFFERED_PROMPTS = 500;
+    /** Character-count half of the cap above — the real bound in practice: a handful of large
+     *  world-event notes blow the budget long before the entry-count cap does. */
+    private static final int MAX_BUFFERED_PROMPT_CHARS = 200_000;
+
     private boolean awaitingLlmResponse = false;
     private boolean aborted = false;
 
@@ -186,17 +201,6 @@ public final class EntityAgentLoop {
      */
     private int consecutiveLlmFailures = 0;
     private static final int MAX_CONSECUTIVE_LLM_FAILURES = 3;
-
-    /**
-     * Set while an external driver (an MCP client via
-     * {@link com.dwinovo.numen.api.NumenActuator}) holds this body. The built-in brain is
-     * paused — no LLM turn starts — until {@link #releaseExternal}. Distinct from
-     * {@link #dead} (body gone) and {@link #aborted} (owner stopped one turn): this is a
-     * deliberate hand-off of the whole body to an outside brain. World events still queue
-     * into the context tail while controlled (append-only), they just don't wake the paused
-     * brain — so it resumes with an accurate picture on release.
-     */
-    private boolean externallyDriven = false;
 
     /**
      * Runs this turn's tool calls one at a time and reports each result back
@@ -480,20 +484,36 @@ public final class EntityAgentLoop {
         return composeSystemPrompt(Services.CONFIG.getSystemPrompt());
     }
 
-    /** Owner typed a prompt in the chat GUI (text only). */
-    public void submitPrompt(String text) {
-        submitPrompt(text, List.of());
+    /**
+     * Owner typed a prompt in the chat GUI (text only).
+     * @return see the 2-arg overload.
+     */
+    public boolean submitPrompt(String text) {
+        return submitPrompt(text, List.of());
     }
 
     /**
      * Owner sent a prompt from the chat GUI, optionally with image attachments
      * (absolute paths to persisted image files). The attachments ride along with
      * the text on the same merged user message (see {@link #flushBufferedPrompts}).
+     *
+     * @return {@code true} once the prompt is queued (buffered now, flushed at the next
+     *         protocol-valid turn boundary); {@code false} when rejected outright — the body is
+     *         dead, or {@link #mayThink} is {@code false} (an external brain holds this body
+     *         right now, per the server's last pushed control state). A rejected prompt is NOT
+     *         buffered at all: buffering an owner message while externally driven is exactly
+     *         what let a stale prompt zombie-start a built-in turn the moment control returned,
+     *         pre-redesign. The caller (the chat panel) is expected to render the rejection.
      */
-    public void submitPrompt(String text, List<String> attachments) {
+    public boolean submitPrompt(String text, List<String> attachments) {
         if (dead) {
-            Constants.LOG.info("[numen-entity#{}] prompt ignored — body is dead", entityUuid);
-            return;
+            Constants.LOG.info("[numen-entity#{}] prompt rejected — body is dead", entityUuid);
+            return false;
+        }
+        if (!mayThink()) {
+            Constants.LOG.info("[numen-entity#{}] prompt rejected — not BUILTIN (external control holds this body)",
+                    entityUuid);
+            return false;
         }
         boolean wasAborted = aborted;
         aborted = false;
@@ -506,6 +526,7 @@ public final class EntityAgentLoop {
         // and its tool results (which the API rejects with HTTP 400).
         boolean deferred = awaitingLlmResponse || dispatcher.busy();
         bufferedPrompts.add(text);
+        enforceBufferedPromptsCap();
         if (attachments != null && !attachments.isEmpty()) bufferedAttachments.addAll(attachments);
         Constants.LOG.info("[numen-entity#{}] user prompt ({} chars, {} image(s)){}{}: {}",
                 entityUuid, text.length(),
@@ -514,6 +535,7 @@ public final class EntityAgentLoop {
                 deferred ? " — buffered (mid-turn)" : "",
                 truncate(text, 200));
         tryStartTurn();
+        return true;
     }
 
     /** Driven once per client tick (see {@code AgentLoopRegistry.tickAll}) — backstop timeout + cooldown clock. */
@@ -531,8 +553,14 @@ public final class EntityAgentLoop {
      * {@code landmarks.record} filters to tracked station types (non-stations fall away),
      * updates disk-only on a re-use, and queues an {@code added}/{@code repurposed} event
      * for a genuine change — emitted at the next turn boundary.
+     *
+     * <p>Package-private (not {@code private}): {@link AgentLoopRegistry#harvestExternal} calls
+     * this same path for a headless {@code NumenActuator.invoke} result, so an external brain's
+     * place_block/interact_at is remembered too — otherwise the built-in brain re-crafts and
+     * re-places duplicates after handback (W9). Touches {@link #landmarks} only, never {@link
+     * #convo} — safe to call from outside a normal turn's result flow.
      */
-    private void harvestLandmarks(String toolName, String resultJson) {
+    void harvestLandmarks(String toolName, String resultJson) {
         try {
             JsonObject root = JsonParser.parseString(resultJson).getAsJsonObject();
             if (!root.has("success") || !root.get("success").getAsBoolean()) return;
@@ -611,6 +639,11 @@ public final class EntityAgentLoop {
      * </ol>
      *
      * No-op when nothing is running and nothing is queued.
+     *
+     * <p>Control-gating (W8): never itself starts or resumes a turn, so no explicit {@link
+     * #mayThink} guard is needed here — whatever it clears stays cleared, and any subsequent
+     * resume attempt (a fresh {@link #submitPrompt}, an urgent {@link #injectEvent}, {@link
+     * #tryStartTurn} itself) already checks {@link #mayThink} at its own choke point.
      */
     public void abort() {
         if (isBusy()) {
@@ -663,40 +696,37 @@ public final class EntityAgentLoop {
         }
     }
 
-    // ---- external control (an MCP client / Claude drives the body directly, via NumenActuator) ----
+    // ---- external control (server-authoritative — see ControlRegistry / ClientControl) ----
 
     /**
-     * An external driver takes control of this body ({@link com.dwinovo.numen.api.NumenActuator#acquire}).
-     * Pauses the built-in brain (no LLM turn starts) and stops any in-flight internal turn/task —
-     * reusing the owner-interrupt path {@link #abort()} when one is running, which heals the
-     * conversation to stay protocol-valid, preserves queued prompts/events, and fires
-     * {@code CompanionLifecycle.onAbort} so the body itself stops. When the loop is idle there is
-     * nothing to stop, so no interrupt is issued (and queued prompts/events are left untouched).
-     * Idempotent. Client main thread only.
+     * True while an external driver (MCP / an outside brain via {@link
+     * com.dwinovo.numen.api.NumenActuator}) holds this body, per the server's last-pushed {@link
+     * ClientControl} snapshot.
+     *
+     * <p><b>DERIVED, never stored here.</b> Pre-redesign, a private {@code externallyDriven}
+     * boolean was the ONLY holder of control state in the whole system — a relog, a game
+     * restart, or {@code /numen reset} silently reset it to {@code false} while the server (which
+     * did not exist as an authority yet) retained nothing, so a companion could come back up
+     * BUILTIN while an MCP session still believed it held the body. This loop no longer asserts
+     * control state at all, only reads {@link ClientControl}, which itself only ever mirrors the
+     * server's {@code ControlRegistry} (see that class's design doc). See {@link #mayThink} for
+     * the gate every turn-start site actually uses.
      */
-    public void acquireExternal() {
-        if (externallyDriven) return;
-        externallyDriven = true;
-        if (isBusy()) abort();   // stop the running internal turn + free the body; queued prompts survive
-        Constants.LOG.info("[numen-entity#{}] external control acquired — built-in brain paused", entityUuid);
-    }
-
-    /**
-     * The external driver released control ({@link com.dwinovo.numen.api.NumenActuator#release}) —
-     * the built-in brain may act again. Does not auto-start a turn; it waits for the next owner
-     * prompt or event (any world events that queued during takeover flush on that turn).
-     * Idempotent.
-     */
-    public void releaseExternal() {
-        if (!externallyDriven) return;
-        externallyDriven = false;
-        aborted = false;   // clear the abort latch acquireExternal may have set, so the brain can resume
-        Constants.LOG.info("[numen-entity#{}] external control released — built-in brain resumed", entityUuid);
-    }
-
-    /** True while an external driver (MCP / Claude via NumenActuator) holds this body. */
     public boolean isExternallyDriven() {
-        return externallyDriven;
+        return ClientControl.instance().stateOf(entityUuid) == ControlState.EXTERNAL;
+    }
+
+    /**
+     * Whether the BUILT-IN brain may start a turn for this body right now — {@code true} only
+     * when the server's last-pushed control state is {@code BUILTIN} (not {@code EXTERNAL}, not
+     * {@code NONE}). THE choke point (W8): every turn-start site funnels through this, directly
+     * or via {@link #tryStartTurn} — see the design doc's {@code gatedSites}: {@link
+     * #tryStartTurn}, {@link #submitPrompt}, the urgent-event wake path in {@link #injectEvent},
+     * {@link #preemptWithEmergencyTurn}, and (in {@link ToolDispatcher}) {@code drainNext} before
+     * shipping a call to the server.
+     */
+    private boolean mayThink() {
+        return ClientControl.instance().mayThink(entityUuid);
     }
 
     /**
@@ -706,6 +736,12 @@ public final class EntityAgentLoop {
      * stays protocol-valid AND the brain learns why it stopped — resolve every in-flight tool call with
      * the death cause, and cap a trailing user message (mirrors {@link #restoreFromDisk}). Latch
      * {@link #dead} so no turn starts until respawn.
+     *
+     * <p>Control-gating (W8): never resumes anything itself, so no {@link #mayThink} guard is
+     * needed here either — {@code dead} freezes {@link #tryStartTurn} and {@link #injectEvent}
+     * outright, on top of whatever {@link #mayThink} would already have said. Per the design
+     * doc's state machine EXTERNAL is retained across death (never released), so a companion an
+     * outside brain holds stays theirs after this respawns it.
      */
     public void onEntityDied(String cause) {
         // FREEZE hard: stop all LLM output/work and feed the model NOTHING now (adding a tool result
@@ -749,6 +785,11 @@ public final class EntityAgentLoop {
      * resolve any tool call that was interrupted by the death (so the conversation is valid and the
      * brain learns its task was cut short), then inject a {@code <event>} detailing the death cause.
      * Nothing was fed to the model while dead, so it stayed fully stopped for the whole timer.
+     *
+     * <p>Control-gating (W8): the {@link #injectEvent} call below is itself gated on {@link
+     * #mayThink} — if an external brain still holds this body (the common case; EXTERNAL survives
+     * death), the death/respawn event still queues into the tail (append-only) but does NOT wake
+     * or resume the built-in brain. Nothing extra needed here.
      */
     public void onRespawned(String payloadCause) {
         boolean wasFrozen = dead;                 // same-session death (mid-task) vs a fresh loop after relog
@@ -795,6 +836,12 @@ public final class EntityAgentLoop {
      * queue as owner prompts, so it splices in only at a protocol-valid boundary. {@code urgent} wakes
      * an idle brain to react now; otherwise it sits in the queue and the brain sees it on the next
      * owner-driven turn (no extra LLM call, no unprompted chatter). Dropped while frozen by death.
+     *
+     * <p>Control-gating (W8): the event always queues (append-only, unchanged) regardless of who
+     * holds the body — the built-in brain must resume with an accurate picture on release — but
+     * an {@code urgent} wake/preempt only fires while {@link #mayThink} is true. See {@code
+     * gatedSites} in the design doc: "the event still QUEUES into the context tail... but must
+     * not wake or preempt while not BUILTIN."
      */
     public void injectEvent(String xml, boolean urgent) {
         if (dead) {
@@ -814,9 +861,15 @@ public final class EntityAgentLoop {
                 entityUuid, urgent ? " (urgent)" : "", truncate(xml, 120));
         if (urgent) {
             // Remember this turn is urgent-triggered → it runs at emergency effort, even
-            // if it can't start until a mid-flight tool chain / compaction settles.
+            // if it can't start until a mid-flight tool chain / compaction settles, OR until
+            // control returns to BUILTIN (see mayThink() below) and its own next trigger fires.
             pendingUrgent = true;
-            if (awaitingLlmResponse && !dispatcher.busy() && !compacting) {
+            if (!mayThink()) {
+                // Control-gated (W8): queued above already; must not wake or preempt a brain
+                // that is not the one allowed to run right now. It picks this up (still
+                // classified emergency, via pendingUrgent) on its own next trigger.
+                Constants.LOG.debug("[numen-entity#{}] urgent event queued only — not BUILTIN", entityUuid);
+            } else if (awaitingLlmResponse && !dispatcher.busy() && !compacting) {
                 if (awaitingEmergency) {
                     // REFRACTORY: an emergency turn is already racing toward a reaction.
                     // Preempting it would restart the latency clock — under a sustained
@@ -860,6 +913,7 @@ public final class EntityAgentLoop {
             note = EventEnvelope.stamp(note, seq, currentGameTime());
         }
         bufferedPrompts.add(note);
+        enforceBufferedPromptsCap();
         return seq;
     }
 
@@ -868,6 +922,71 @@ public final class EntityAgentLoop {
         return EventEnvelope.isStampable(note)
                 ? EventEnvelope.stamp(note, eventSeq.next(), currentGameTime())
                 : note;
+    }
+
+    /**
+     * W8 — guard against the release-time context bomb. While an external brain drives this body
+     * for a long stretch, world events keep queueing into {@link #bufferedPrompts} via {@link
+     * #queueEventNote} (append-only, unchanged — {@link #mayThink} only gates the built-in brain
+     * WAKING, never the queue itself), even though nothing flushes them. Unbounded, an hour of
+     * external driving could fold into ONE user message ({@link #flushBufferedPrompts} joins
+     * every entry) large enough to trip the hard compaction gate on the very first turn back, or
+     * exceed the model's window outright.
+     *
+     * <p>When either {@link #MAX_BUFFERED_PROMPTS} or {@link #MAX_BUFFERED_PROMPT_CHARS} is
+     * crossed, drop the OLDEST entries (least likely to still matter) until back under both
+     * bounds, then append one elision marker recording how many were dropped and their {@code
+     * seq} range. Nothing already in the tail is rewritten — only trimmed from the front — and
+     * the marker is itself a new append, so the append-only contract holds. No-op while under
+     * both bounds.
+     */
+    private void enforceBufferedPromptsCap() {
+        int totalChars = 0;
+        for (String s : bufferedPrompts) totalChars += s.length();
+        if (bufferedPrompts.size() <= MAX_BUFFERED_PROMPTS && totalChars <= MAX_BUFFERED_PROMPT_CHARS) {
+            return;
+        }
+        int dropped = 0;
+        Long firstSeq = null;
+        Long lastSeq = null;
+        while (!bufferedPrompts.isEmpty()
+                && (bufferedPrompts.size() > MAX_BUFFERED_PROMPTS || totalChars > MAX_BUFFERED_PROMPT_CHARS)) {
+            String removed = bufferedPrompts.remove(0);
+            totalChars -= removed.length();
+            Long seq = extractSeq(removed);
+            if (seq != null) {
+                if (firstSeq == null) firstSeq = seq;
+                lastSeq = seq;
+            }
+            dropped++;
+        }
+        String range = firstSeq != null ? (" seq " + firstSeq + ".." + lastSeq) : "";
+        Constants.LOG.warn("[numen-entity#{}] buffered-tail cap hit — elided {} oldest entr{}{}",
+                entityUuid, dropped, dropped == 1 ? "y" : "ies", range);
+        bufferedPrompts.add(stampIfEvent("<system_notice provenance=\"system\">上下文缓冲区已达上限,"
+                + "已丢弃 " + dropped + " 条较早的世界事件/提示" + range + ",这些信息已不在你的上下文中。"
+                + "(原因:一个外部大脑长时间控制着这具身体,期间的世界事件持续入队但从未被消费。)</system_notice>"));
+    }
+
+    /**
+     * Best-effort extraction of a stamped note's {@code seq="…"} attribute, for the elision
+     * marker's seq range above. {@code null} for anything unstamped (plain text, or the rare
+     * pre-envelope note). Deliberately a small local parse rather than a new method on {@link
+     * EventEnvelope} (package-private there, and this is display/log bookkeeping, not envelope
+     * logic) — mirrors {@link EventEnvelope#isStampable}'s own "no full XML parser" stance.
+     */
+    private static Long extractSeq(String note) {
+        if (note == null) return null;
+        int i = note.indexOf(" seq=\"");
+        if (i < 0) return null;
+        int start = i + 6;
+        int end = note.indexOf('"', start);
+        if (end < 0) return null;
+        try {
+            return Long.parseLong(note.substring(start, end));
+        } catch (NumberFormatException ex) {
+            return null;
+        }
     }
 
     /**
@@ -1023,8 +1142,11 @@ public final class EntityAgentLoop {
             Constants.LOG.debug("[numen-entity#{}] tryStartTurn skipped: aborted", entityUuid);
             return;
         }
-        if (externallyDriven) {
-            Constants.LOG.debug("[numen-entity#{}] tryStartTurn skipped: externally driven", entityUuid);
+        if (!mayThink()) {
+            // Control-gated (W8): the server's last-pushed state for this companion is not
+            // BUILTIN — either an external brain holds it, or the owner stood it down (baseline
+            // NONE). Either way the built-in brain does not start a turn.
+            Constants.LOG.debug("[numen-entity#{}] tryStartTurn skipped: not BUILTIN (server control state)", entityUuid);
             return;
         }
         if (awaitingLlmResponse) {
@@ -1355,8 +1477,16 @@ public final class EntityAgentLoop {
      * executes tools nor appends an assistant message, and its {@code onReasoning} is gated off.
      * When it lands we harvest its thinking into a note for the next turn (see
      * {@link #harvestPreemptedTurn}).
+     *
+     * <p>Control-gated (W8): {@link #injectEvent}'s sole caller only reaches this once it has
+     * already checked {@link #mayThink}, but the guard is repeated here too — cheap, and it keeps
+     * this method safe to call from anywhere in the future without re-deriving that invariant.
      */
     private void preemptWithEmergencyTurn() {
+        if (!mayThink()) {
+            Constants.LOG.debug("[numen-entity#{}] preempt skipped: not BUILTIN (server control state)", entityUuid);
+            return;
+        }
         lastPreemptTick = clientTicks;       // start the preempt cooldown window (one per 60 ticks)
         int supersededGen = turnGeneration;
         preemptedGenerations.add(supersededGen);

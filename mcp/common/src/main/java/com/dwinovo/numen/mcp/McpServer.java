@@ -16,7 +16,9 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -49,6 +51,14 @@ public final class McpServer {
     private static final String SERVER_VERSION = "0.1.0";
     /** Roster / acquire / release are fast; only tool actions use the config timeout. */
     private static final int CONTROL_TIMEOUT_SECONDS = 10;
+    /**
+     * Lease TTL requested on every {@code acquire_companion} — the server clamps it (60s-20min,
+     * see {@code ControlRegistry}) and renews it on every authorized call, so this is only a "how
+     * long before an idle caller must be considered gone" budget, not a hard ceiling on a call in
+     * progress. 5 minutes taken as a reasonable default; the design doc's openQuestions still
+     * flags the right value for the filmed-competition format as undecided (W10).
+     */
+    private static final int DEFAULT_LEASE_TTL_SECONDS = 300;
 
     /**
      * Sent to the connecting agent in the {@code initialize} handshake (MCP's
@@ -75,6 +85,18 @@ public final class McpServer {
     private final McpConfig config;
     private final Gson gson = new Gson();
     private HttpServer http;
+    /**
+     * STOP-GAP (pending W10's {@code McpSession}): the lease token an {@code acquire_companion}
+     * most recently won for a companion, keyed by companion — NOT keyed by MCP session/connection.
+     * The mutual-exclusion invariant already guarantees at most one holder per companion at a
+     * time, so "the current token for this companion" is a sound proxy for "this bridge process's
+     * belief about who holds it" until real per-session token scoping lands (session TTL sweeper,
+     * release-on-disconnect, multiple concurrent sessions inside one bridge). Written only on a
+     * successful acquire; read (never removed) by every subsequent {@code tools/call} so a stale
+     * or absent entry surfaces as {@link NumenActuator#invoke}'s own "you do not hold this
+     * companion" refusal rather than a NPE here.
+     */
+    private final Map<UUID, String> leaseTokens = new ConcurrentHashMap<>();
 
     public McpServer(McpConfig config) {
         this.config = config;
@@ -116,6 +138,12 @@ public final class McpServer {
                 respond(ex, 401, "");
                 return;
             }
+            // Resolved once per request and threaded through to acquire_companion so the lease
+            // is attributed to the connecting brain's own identity (not a single shared "mcp"
+            // controller id) -- this is what lets the owner's console tell two competing agents
+            // apart. Null on a loopback bind with no token presented; call sites fall back to a
+            // generic identity in that case (see handleControl).
+            McpConfig.Agent agent = resolveAgent(ex);
             String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             JsonElement parsed;
             try {
@@ -128,13 +156,13 @@ public final class McpServer {
             if (parsed.isJsonArray()) {   // JSON-RPC batch
                 JsonArray out = new JsonArray();
                 for (JsonElement el : parsed.getAsJsonArray()) {
-                    JsonObject r = dispatch(el.getAsJsonObject());
+                    JsonObject r = dispatch(el.getAsJsonObject(), agent);
                     if (r != null) out.add(r);
                 }
                 if (out.isEmpty()) respond(ex, 202, "");
                 else respondJson(ex, out);
             } else {
-                JsonObject r = dispatch(parsed.getAsJsonObject());
+                JsonObject r = dispatch(parsed.getAsJsonObject(), agent);
                 if (r == null) respond(ex, 202, "");   // notification: no response
                 else respondJson(ex, r);
             }
@@ -215,7 +243,7 @@ public final class McpServer {
     // ---- JSON-RPC dispatch ----
 
     /** @return the response object, or null for a notification (no id → no reply). */
-    private JsonObject dispatch(JsonObject req) {
+    private JsonObject dispatch(JsonObject req, McpConfig.Agent agent) {
         JsonElement id = req.get("id");
         String method = req.has("method") ? req.get("method").getAsString() : "";
 
@@ -229,7 +257,7 @@ public final class McpServer {
                 case "initialize" -> okResponse(id, initializeResult(req));
                 case "ping" -> okResponse(id, new JsonObject());
                 case "tools/list" -> okResponse(id, toolsListResult());
-                case "tools/call" -> okResponse(id, toolsCallResult(req));
+                case "tools/call" -> okResponse(id, toolsCallResult(req, agent));
                 default -> errorResponse(id, -32601, "method not found: " + method);
             };
         } catch (RuntimeException ex) {
@@ -333,7 +361,7 @@ public final class McpServer {
 
     // ---- tools/call ----
 
-    private JsonObject toolsCallResult(JsonObject req) {
+    private JsonObject toolsCallResult(JsonObject req, McpConfig.Agent agent) {
         JsonObject params = req.has("params") && req.get("params").isJsonObject()
                 ? req.getAsJsonObject("params") : new JsonObject();
         String name = params.has("name") ? params.get("name").getAsString() : "";
@@ -343,8 +371,8 @@ public final class McpServer {
         try {
             return switch (name) {
                 case "list_companions" -> content(listCompanions(), false);
-                case "acquire_companion" -> handleControl(args, true);
-                case "release_companion" -> handleControl(args, false);
+                case "acquire_companion" -> handleControl(args, true, agent);
+                case "release_companion" -> handleControl(args, false, agent);
                 default -> handleToolInvoke(name, args);
             };
         } catch (TimeoutException te) {
@@ -367,20 +395,40 @@ public final class McpServer {
         return sb.toString().stripTrailing();
     }
 
-    private JsonObject handleControl(JsonObject args, boolean acquire) throws Exception {
+    /**
+     * {@code agent} is the caller resolved from the request's own bearer/query token (see {@link
+     * #resolveAgent}) — attributing the lease to a real per-brain identity, rather than one
+     * generic "mcp" controller, is what lets two competing agents (e.g. Claude Code and Codex,
+     * each with their own configured agent + token) show up distinctly on the owner's console.
+     * Falls back to a generic identity only when nothing was presented (a bare loopback bind with
+     * no token configured) — matches the pre-per-agent-auth default of allowing that connection
+     * through at all.
+     */
+    private JsonObject handleControl(JsonObject args, boolean acquire, McpConfig.Agent agent) throws Exception {
         UUID target = resolveCompanion(args);
         if (target == null) {
             return content("no such companion — call list_companions to see valid names/ids", true);
         }
-        boolean ok = (acquire
-                ? NumenActuator.acquire(target)
-                : NumenActuator.release(target))
-                .get(CONTROL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (acquire) {
-            return content(ok ? "acquired " + target + " — its built-in brain is paused; you are driving it now"
-                    : "could not acquire " + target, !ok);
+            String controllerId = agent != null ? agent.id() : "mcp";
+            String label = agent != null ? agent.label() : "MCP (unauthenticated loopback)";
+            NumenActuator.AcquireResult result = NumenActuator.acquire(target, controllerId, label,
+                            DEFAULT_LEASE_TTL_SECONDS)
+                    .get(CONTROL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!result.ok()) {
+                return content("could not acquire " + target
+                        + (result.reason().isEmpty() ? "" : ": " + result.reason()), true);
+            }
+            leaseTokens.put(target, result.sessionToken());
+            return content("acquired " + target + " — its built-in brain is paused; you are driving it now", false);
         }
-        return content("released " + target + " — its built-in brain may act again", false);
+        // Release: hand back whatever token this bridge process last won for the companion (see
+        // the leaseTokens field doc) rather than trust the caller to have kept track of it.
+        String token = leaseTokens.getOrDefault(target, "");
+        boolean ok = NumenActuator.release(target, token).get(CONTROL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        if (ok) leaseTokens.remove(target, token);   // only clear if it was still OUR token that got released
+        return content(ok ? "released " + target + " — its built-in brain may act again"
+                : "could not release " + target + " (you may not currently hold it)", !ok);
     }
 
     private JsonObject handleToolInvoke(String toolName, JsonObject args) throws Exception {
@@ -390,7 +438,8 @@ public final class McpServer {
         }
         JsonObject toolArgs = args.deepCopy();
         toolArgs.remove("companion");
-        String result = NumenActuator.invoke(target, toolName, toolArgs.toString())
+        String token = leaseTokens.getOrDefault(target, "");
+        String result = NumenActuator.invoke(target, toolName, toolArgs.toString(), token)
                 .get(config.callTimeoutSeconds(), TimeUnit.SECONDS);
         boolean isError = false;
         try {

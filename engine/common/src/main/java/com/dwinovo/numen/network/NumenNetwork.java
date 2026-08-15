@@ -110,5 +110,21 @@ public final class NumenNetwork {
                 com.dwinovo.numen.network.payload.SetCompanionOpPayload.TYPE,
                 com.dwinovo.numen.network.payload.SetCompanionOpPayload.STREAM_CODEC,
                 com.dwinovo.numen.network.payload.SetCompanionOpPayload::handle);
+
+        // S→C: full control-state snapshot (who drives each of the owner's companions right now —
+        // BUILTIN/EXTERNAL/NONE) from ControlRegistry. Sent on every transition, on login, and as a
+        // level-triggered keep-alive, so a dropped packet can never leave a body permanently gated.
+        Services.NETWORK.registerServerToClient(
+                com.dwinovo.numen.network.payload.ControlStatePayload.TYPE,
+                com.dwinovo.numen.network.payload.ControlStatePayload.STREAM_CODEC,
+                com.dwinovo.numen.network.payload.ControlStatePayload::handle);
+
+        // C→S: the owner's client asking ControlRegistry to acquire/release/heartbeat/force-release
+        // a lease, or set a companion's baseline brain (BUILTIN/NONE). A request, never an assertion —
+        // ControlStatePayload above is the only channel by which a client's control view changes.
+        Services.NETWORK.registerClientToServer(
+                com.dwinovo.numen.network.payload.ControlRequestPayload.TYPE,
+                com.dwinovo.numen.network.payload.ControlRequestPayload.STREAM_CODEC,
+                com.dwinovo.numen.network.payload.ControlRequestPayload::handle);
     }
 }

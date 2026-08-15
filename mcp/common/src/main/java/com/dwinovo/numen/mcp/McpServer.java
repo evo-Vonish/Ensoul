@@ -81,6 +81,15 @@ public final class McpServer {
     }
 
     public void start() throws IOException {
+        // A LAN-visible bind with any blank-token agent has no usable credential at
+        // all -- refuse to come up rather than silently serving unauthenticated
+        // traffic to a Minecraft account. See McpConfig#unguarded.
+        if (config.unguarded()) {
+            throw new IOException("refusing to bind " + config.host() + ":" + config.port()
+                    + " -- this host is not loopback (127.0.0.1/localhost) and at least one configured "
+                    + "agent in mcp_server.json has a blank token. Give every agent a token before "
+                    + "exposing this server beyond localhost.");
+        }
         http = HttpServer.create(new InetSocketAddress(config.host(), config.port()), 0);
         http.createContext("/mcp", this::handle);
         http.setExecutor(Executors.newFixedThreadPool(8, r -> {
@@ -137,12 +146,51 @@ public final class McpServer {
         }
     }
 
+    /**
+     * Loopback keeps the original zero-friction behaviour in this pass: the
+     * per-agent schema is migrated and a token is minted regardless of {@code
+     * host}, but enforcement only turns on once the bind is network-visible, so
+     * an existing local setup is not broken by the migration itself. The instant
+     * {@code host} is LAN-exposed, every request must resolve to a real per-agent
+     * token: see {@link McpConfig#agentForToken} for the equality (never
+     * substring) comparison, and {@link McpConfig#unguarded} for the startup-time
+     * refusal that backstops this at the config level.
+     */
     private boolean authorized(HttpExchange ex) {
-        if (config.token().isBlank()) return true;
+        if (!config.lanExposed()) return true;
+        return resolveAgent(ex) != null;
+    }
+
+    /**
+     * The agent that owns the bearer/query token on this request, or null if none
+     * was presented or it matches no configured agent. Exposed beyond {@link
+     * #authorized} because a later wave attributes each MCP session to the agent
+     * that opened it (at {@code initialize} time) using this same resolution.
+     */
+    private McpConfig.Agent resolveAgent(HttpExchange ex) {
+        return config.agentForToken(presentedToken(ex));
+    }
+
+    /** Authorization header first, then the query string's {@code token=} parameter — equality only. */
+    private static String presentedToken(HttpExchange ex) {
         String auth = ex.getRequestHeaders().getFirst("Authorization");
-        if (auth != null && auth.equals("Bearer " + config.token())) return true;
+        if (auth != null && auth.startsWith("Bearer ")) {
+            return auth.substring("Bearer ".length());
+        }
         String query = ex.getRequestURI().getQuery();
-        return query != null && query.contains("token=" + config.token());
+        if (query == null || query.isEmpty()) return null;
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            String key = eq < 0 ? pair : pair.substring(0, eq);
+            if (!"token".equals(key)) continue;
+            String value = eq < 0 ? "" : pair.substring(eq + 1);
+            try {
+                return java.net.URLDecoder.decode(value, StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException malformed) {
+                return value; // malformed percent-encoding — fall back to the raw (still equality-compared) value
+            }
+        }
+        return null;
     }
 
     private void respondJson(HttpExchange ex, JsonElement json) throws IOException {

@@ -65,8 +65,16 @@ public record McpConfig(
     /** One credential per connecting brain. {@code token} may be blank — see the class javadoc. */
     public record Agent(String id, String label, String token) {}
 
-    /** Tools the built-in brain manages for itself — never handed to an external driver. */
-    private static final List<String> DEFAULT_HIDDEN = List.of("todowrite", "load_skill");
+    /**
+     * Tools the built-in brain manages for itself — never handed to an external driver.
+     *
+     * <p>W13 removed {@code load_skill}: skills are now reachable two ways — as a {@code
+     * prompts/get} result (the skill body, structured MCP-native) via {@link McpResources}, AND
+     * still as this ordinary tool call for a client that only implements {@code tools/call}. Both
+     * paths read the same {@link com.dwinovo.numen.agent.skill.SkillRegistry}, so hiding the tool
+     * would only have made the second, more-compatible path unreachable for no benefit.
+     */
+    private static final List<String> DEFAULT_HIDDEN = List.of("todowrite");
     private static final int DEFAULT_SESSION_TTL_SECONDS = 120;
     private static final int DEFAULT_CALL_TIMEOUT_SECONDS = 300;
     private static final String DEFAULT_HOST = "127.0.0.1";

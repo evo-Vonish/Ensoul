@@ -44,6 +44,10 @@ import java.util.UUID;
  *   <li><b>the brain has a turn in flight</b> — not directly observable server-side (the agent loop runs on the
  *       owner's client), so it is bridged by the same quiet-settle window: the brain keeps queuing tool calls,
  *       each refreshing {@code lastBusyTick}, so autonomy only engages after a genuine idle gap.</li>
+ *   <li><b>control authority is not BUILTIN</b> (W5) — {@code ControlRegistry.effective(companion) != BUILTIN}.
+ *       This layer IS the built-in brain's own lowest-priority limb, so it must yield whenever an external
+ *       brain holds the body (EXTERNAL) or nothing is designated to drive it (NONE) — otherwise an external
+ *       driver that thinks for minutes between calls gets back a body that sleepwalked off on its own.</li>
  * </ul>
  * When it yields it abandons any unfinished idle work immediately — <em>no cleanup debt</em> (§3).
  *
@@ -174,10 +178,18 @@ public final class AutonomyScheduler {
         long now = level.getGameTime();
         State s = STATES.computeIfAbsent(id, k -> new State(now));
 
-        // ===== arbitration gate (§3): reflex > owner task > brain-turn > idle autonomy =====
+        // ===== arbitration gate (§3): reflex > owner task > brain-turn > control-authority > idle autonomy =====
         boolean reflexOwns = Reflexes.ownsBody(body);
         boolean pending = CompanionTickDispatcher.queueFor(id).hasPending();
-        if (AutonomyLogic.shouldYield(reflexOwns, ownerTaskActive, pending)) {
+        // Control-authority term (W5): the sleepwalk layer is the BUILT-IN brain's own lowest limb, so it
+        // must stand down whenever some other brain holds the body (EXTERNAL) or nobody is designated to
+        // drive it at all (NONE) — otherwise an external agent that perceives/thinks for minutes between
+        // calls comes back to a body that strolled off on its own, narrated as an autonomy journal event
+        // the external side has no way to read. Computed fresh every tick (cheap HashMap lookup), same as
+        // reflexOwns/pending above — control can change hands between one tick and the next.
+        boolean notBuiltin = com.dwinovo.numen.entity.ControlRegistry.effective(id)
+                != com.dwinovo.numen.entity.ControlRegistry.ControlState.BUILTIN;
+        if (AutonomyLogic.shouldYield(reflexOwns, ownerTaskActive, pending, notBuiltin)) {
             onBusy(body, s, now);   // abandon any unfinished leg (no cleanup debt), close/flush the session
             return;
         }

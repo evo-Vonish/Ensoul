@@ -24,12 +24,17 @@ public final class CoreServerTools {
 
     private CoreServerTools() {}
 
-    /** Ship a body-bound tool to the server and park its call until the result returns. */
+    /** Ship a body-bound tool to the server and park its call until the result returns.
+     *  Attaches this client's control token for the target companion (D1) — {@code ""} when this
+     *  client is the built-in brain (the common case) or holds no lease, else the session token
+     *  {@code ControlRequestPayload}'s ACQUIRE handed us — so the server's {@code ControlRegistry}
+     *  can tell which brain is making the call, not just which owner. */
     public static void ship(ToolCall call) {
         UUID entity = call.ctx().entityUuid();
         IN_FLIGHT.put(call.id(), call);
+        String controlToken = com.dwinovo.numen.client.agent.ClientControl.instance().tokenFor(entity);
         Services.NETWORK.sendToServer(
-                new ExecuteToolPayload(entity, call.id(), call.toolName(), call.rawArgs()));
+                new ExecuteToolPayload(entity, call.id(), call.toolName(), call.rawArgs(), controlToken));
     }
 
     /** A server result came back (core's TaskResultPayload) — complete the parked call. */
@@ -38,9 +43,13 @@ public final class CoreServerTools {
         if (call != null) call.complete(resultJson);
     }
 
-    /** Owner interrupted: forget this companion's parked calls and tell the body to stop. */
+    /** Owner interrupted: forget this companion's parked calls and tell the body to stop.
+     *  Sent with {@code ownerForce=true} (D1) — this is the owner's own panel Stop, which the design
+     *  doc's control state machine always lets land regardless of which brain currently holds the
+     *  companion's lease; the control token is attached anyway for the log line on the server side. */
     public static void abort(UUID companionUuid) {
         IN_FLIGHT.values().removeIf(c -> companionUuid.equals(c.ctx().entityUuid()));
-        Services.NETWORK.sendToServer(new CancelTasksPayload(companionUuid));
+        String controlToken = com.dwinovo.numen.client.agent.ClientControl.instance().tokenFor(companionUuid);
+        Services.NETWORK.sendToServer(new CancelTasksPayload(companionUuid, controlToken, true));
     }
 }

@@ -53,15 +53,27 @@ import java.util.UUID;
  * though tools live under a single namespace; this is forward-compatible for
  * multi-namespace tool registries). The arguments arrive as the raw JSON
  * string the LLM emitted; server parses with Gson and re-validates.
+ *
+ * <h2>Control token (D1)</h2>
+ * {@code controlToken} names WHICH BRAIN on the sender's client is making this call — the built-in
+ * brain sends {@code ""} ("my owner's built-in brain"), an external controller sends the session
+ * token it was handed by {@code ControlRequestPayload}'s ACQUIRE. This is deliberately a WIRE-FORMAT
+ * field, not inferred from {@code toolCallId}'s shape: a {@code toolCallId} prefix can distinguish
+ * "the built-in brain" from "some external caller" but not one external caller from another, which is
+ * the entire point of the mutual-exclusion invariant this field exists to enforce (see the design
+ * doc's destructiveDecisions D1 — the rejected alternative). Checked against {@code ControlRegistry}
+ * in {@link #handle}; this record change is why client and server of this mod MUST ship together.
  */
 public record ExecuteToolPayload(UUID entityUuid,
                                   String toolCallId,
                                   String toolName,
-                                  String argumentsJson) implements CustomPacketPayload {
+                                  String argumentsJson,
+                                  String controlToken) implements CustomPacketPayload {
 
     public static final int MAX_TOOL_CALL_ID_LENGTH = 128;
     public static final int MAX_TOOL_NAME_LENGTH = 128;
     public static final int MAX_ARGUMENTS_JSON_LENGTH = 16 * 1024;
+    public static final int MAX_CONTROL_TOKEN_LENGTH = 64;
 
     public static final Type<ExecuteToolPayload> TYPE = new Type<>(
             Identifier.fromNamespaceAndPath(Constants.MOD_ID, "execute_tool"));
@@ -72,6 +84,7 @@ public record ExecuteToolPayload(UUID entityUuid,
                     ByteBufCodecs.stringUtf8(MAX_TOOL_CALL_ID_LENGTH), ExecuteToolPayload::toolCallId,
                     ByteBufCodecs.stringUtf8(MAX_TOOL_NAME_LENGTH), ExecuteToolPayload::toolName,
                     ByteBufCodecs.stringUtf8(MAX_ARGUMENTS_JSON_LENGTH), ExecuteToolPayload::argumentsJson,
+                    ByteBufCodecs.stringUtf8(MAX_CONTROL_TOKEN_LENGTH), ExecuteToolPayload::controlToken,
                     ExecuteToolPayload::new);
 
     @Override
@@ -99,6 +112,22 @@ public record ExecuteToolPayload(UUID entityUuid,
             replyError(player, p, "not the owner");
             return;
         }
+        // Control gate (D1): ownership answers "whose companion is this" — the check above; control
+        // answers "which brain may drive it right now", and the two are independent (an owner who
+        // force-released control to NONE, or whose external session holds it, still OWNS the
+        // companion, but this caller may still not act on it). Placed here for the exact same reason
+        // the ownership check above was moved ahead of the respawn: the respawn below materialises a
+        // dormant body, a real persistent side effect, and a gate placed after a side effect repeats
+        // that bug verbatim. ControlRegistry.authorize never touches the world, so it is safe to run
+        // before the respawn even though the companion may not be live yet — it resolves ownership and
+        // lease state from the registry, not the live body. Rejection replies through the existing
+        // replyError path so neither brain ever dead-waits on an unanswered tool_call id.
+        var controlDecision = com.dwinovo.numen.entity.ControlRegistry.authorize(
+                server, p.entityUuid(), player.getUUID(), p.controlToken());
+        if (!controlDecision.allowed()) {
+            replyError(player, p, controlDecision.reason());
+            return;
+        }
         com.dwinovo.numen.entity.NumenPlayer companion =
                 com.dwinovo.numen.entity.NumenPlayer.findByUuid(server, p.entityUuid());
         if (companion == null) {
@@ -123,6 +152,18 @@ public record ExecuteToolPayload(UUID entityUuid,
         // the live body directly, so it also catches an ownership change between the two checks.
         if (!companion.isOwnedByPlayer(player.getUUID())) {
             replyError(player, p, "not the owner");
+            return;
+        }
+        // Same defence-in-depth reasoning for control (D1): a lease can expire, be released, or be
+        // force-released in the tick between handle()'s gate and this call. authorize() also RENEWS an
+        // EXTERNAL lease on success (a fresh heartbeat), so re-running it here is not wasted work even
+        // on the happy path — every call from the current holder keeps its own lease fresh, on top of
+        // the per-tick RUNNING-task renewal a queued task gets from CompanionTickDispatcher (W6).
+        var server = player.level().getServer();
+        var controlDecision = com.dwinovo.numen.entity.ControlRegistry.authorize(
+                server, p.entityUuid(), player.getUUID(), p.controlToken());
+        if (!controlDecision.allowed()) {
+            replyError(player, p, controlDecision.reason());
             return;
         }
         NumenTool tool = ToolRegistry.get(p.toolName());

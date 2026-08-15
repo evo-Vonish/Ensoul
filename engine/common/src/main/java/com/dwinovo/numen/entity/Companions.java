@@ -161,6 +161,12 @@ public final class Companions {
         ServerPlayer owner = body.resolveOwnerPlayer();
         if (owner != null) {   // immediate, same-session (carries the respawn delay for the client countdown)
             Services.NETWORK.sendToPlayer(owner, new NumenDeathPayload(uuid, cause, RESPAWN_DELAY_TICKS * 50L));
+            // W6 (control-authority, NOT a release): death does not release a live external lease — the
+            // holder keeps the body across death/respawn exactly like the pre-existing in-flight-task
+            // resolution does (NumenDeathPayload's freeze path), so a brain that was mid-mission does not
+            // lose the companion to a stray death. Push a resend so the console/holder LEARN about the
+            // death promptly via the state channel rather than waiting for the 20-tick keep-alive.
+            ControlRegistry.syncToOwner(server, owner);
         }
         // Persist the death (cause + game-time) in the world-saved registry so it survives a logout during
         // the respawn window — without this, a relog lost the pending state and the body silently respawned
@@ -214,6 +220,9 @@ public final class Companions {
         body.clearFire();
         CompanionRegistry.get(server).markAlive(uuid);
         syncRosterToOwner(server, owner);
+        // W6: same reasoning as onDeath — the lease (if any) was retained across death and is still
+        // live now that the body is back; resend so the console/holder see the companion again promptly.
+        ControlRegistry.syncToOwner(server, owner);
         Services.NETWORK.sendToPlayer(owner, new NumenRespawnPayload(uuid, entry.deathCause()));
     }
 
@@ -299,6 +308,11 @@ public final class Companions {
         if (e != null) reg.put(companionUuid, e.withGameType(mode));
         NumenPlayer body = NumenPlayer.findByUuid(server, companionUuid);
         if (body != null) body.setGameMode(mode);
+        // W6 item 7 (decision, not an oversight): game mode is the human OWNER's own switch and stays
+        // deliberately UNGATED by control — the owner outranks any brain, including whichever one
+        // currently holds the lease, so this never consults ControlRegistry.authorize. It must still
+        // push a control-state resend so the console stays accurate (the lease itself is untouched).
+        syncControlToOwnerOf(server, companionUuid);
     }
 
     /** A companion's persisted game mode (survival if unknown). */
@@ -312,6 +326,30 @@ public final class Companions {
         CompanionRegistry reg = CompanionRegistry.get(server);
         CompanionRegistry.Entry e = reg.find(companionUuid);
         if (e != null) reg.put(companionUuid, e.withOpEnabled(opEnabled));
+        // W6 item 7 (decision, not an oversight) — same reasoning as setGameMode above: the OP master
+        // switch is the human owner's own control, deliberately ungated, but still worth a prompt resend.
+        syncControlToOwnerOf(server, companionUuid);
+    }
+
+    /**
+     * Resolve {@code companionUuid}'s owner (live body first, else the registry entry — same fallback
+     * order as {@link #isOwner}) and push a {@link ControlRegistry#syncToOwner} resend if that owner is
+     * online. Shared by {@link #setGameMode} and {@link #setOpEnabled}: both are the owner's OWN
+     * switches and intentionally bypass control, but a bypass must still be visible on the console
+     * promptly rather than waiting for {@code ControlRegistry.tick}'s 20-tick keep-alive. Silently a
+     * no-op if the companion or its owner can't be resolved (mirrors {@code syncRosterToOwner}'s own
+     * null-owner guard) — there's nothing to push to.
+     */
+    private static void syncControlToOwnerOf(MinecraftServer server, UUID companionUuid) {
+        NumenPlayer live = NumenPlayer.findByUuid(server, companionUuid);
+        UUID ownerUuid = live != null ? live.getOwnerUuid() : null;
+        if (ownerUuid == null) {
+            CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
+            ownerUuid = e != null ? e.owner() : null;
+        }
+        if (ownerUuid == null) return;
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerUuid);
+        if (owner != null) ControlRegistry.syncToOwner(server, owner);
     }
 
     /** Whether the companion's OP master switch is on (default false — the today-equivalent, no command privileges). */
@@ -393,6 +431,13 @@ public final class Companions {
     /** Permanently forget a companion (death / dismissal): despawn + drop the index entry. */
     public static void dismiss(MinecraftServer server, NumenPlayer body) {
         UUID uuid = body.getUUID();
+        // W6 item 5: a permanently dismissed companion has no control state left to hold. force-release
+        // BEFORE forget — forceRelease runs the handover hook (drains any live external lease's queue
+        // with an honest cause and notifies the console) while the record still exists; forget() alone
+        // would silently drop a live holder's lease with no notification at all. No-op when nothing is
+        // leased (the common case), so this is always safe to call unconditionally.
+        ControlRegistry.forceRelease(server, uuid, "companion dismissed");
+        ControlRegistry.forget(uuid);
         CompanionFactory.despawn(server, body);
         CompanionRegistry.get(server).remove(uuid);
     }
@@ -420,6 +465,11 @@ public final class Companions {
         for (UUID id : ids) {
             NumenPlayer live = NumenPlayer.findByUuid(server, id);
             if (live != null) CompanionFactory.despawn(server, live);
+            // W6 item 5 — same reasoning as dismiss() above: force-release before forget so a live
+            // external lease's handover hook still runs (drains its queue, notifies the console) before
+            // the record disappears for good.
+            ControlRegistry.forceRelease(server, id, "companion dismissed");
+            ControlRegistry.forget(id);
             reg.remove(id);
         }
         return ids.size();

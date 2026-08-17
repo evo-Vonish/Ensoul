@@ -49,7 +49,7 @@ import java.util.List;
  * else, a blank token would mean "any machine on the LAN drives this Minecraft
  * account unauthenticated" — so {@link #unguarded()} refuses to let the server
  * start in that combination rather than silently serving open traffic. See
- * {@link McpServer#authorized}.
+ * {@code McpHttpServer}'s per-request check.
  */
 public record McpConfig(
         boolean enabled,
@@ -94,7 +94,7 @@ public record McpConfig(
     /**
      * True when this config would let a network-visible bind serve traffic with no
      * usable credential at all — a LAN-exposed host plus at least one agent whose
-     * token is blank. {@link McpServer#start} refuses to bind while this holds.
+     * token is blank. {@code McpHttpServer.start} refuses to bind while this holds.
      */
     public boolean unguarded() {
         if (!lanExposed()) return false;

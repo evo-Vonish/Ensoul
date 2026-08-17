@@ -123,14 +123,61 @@ public final class AgentLoopRegistry {
         }
     }
 
-    /** Drop one entity's loop (e.g. when it dies / unloads). */
+    /**
+     * Drop one entity's loop (e.g. when it dies / unloads).
+     *
+     * <p>W8: does NOT touch control state — there is none to destroy here anymore. Control is
+     * server-authoritative ({@code ControlRegistry}); dropping the client-side conversation loop
+     * has no bearing on who is allowed to drive the body. A fresh loop created later for the same
+     * UUID (see {@link #getOrCreate}) simply reads whatever {@link ClientControl} reports at that
+     * point, same as any other loop.
+     */
     public static void dispose(UUID entityUuid) {
         EntityAgentLoop loop = ENTITY_LOOPS.remove(entityUuid);
         if (loop != null) loop.dispose();
     }
 
-    /** Clear everything — called on world-disconnect / explicit reset. */
+    /**
+     * Clear everything — called on world-disconnect / explicit reset.
+     *
+     * <p>Disposes each loop before dropping the map. Clearing the map alone only unhooks the
+     * loops: a turn already in flight still completes, still bills the owner, still dispatches
+     * its tools, and still appends to the conversation log that the replacement loop is now
+     * writing. {@link #dispose(UUID)} has always done this for a single companion; the bulk
+     * path silently didn't.
+     *
+     * <p>W8: like {@link #dispose}, this must NOT issue a release — {@code /numen reset} (the
+     * command that reaches this) clears CONVERSATIONS, not leases. Deliberately no {@code
+     * NumenActuator.release} call here: control is a server concept now, wholly independent of
+     * whether the client happens to have a loop object materialised for a companion.
+     */
     public static void clear() {
+        for (EntityAgentLoop loop : ENTITY_LOOPS.values()) {
+            loop.dispose();
+        }
         ENTITY_LOOPS.clear();
+    }
+
+    /**
+     * W9 — the engine half of {@link com.dwinovo.numen.api.NumenActuator#invoke}'s post-call
+     * landmark harvest. External tool calls bypass the built-in dispatcher's {@code
+     * ToolDispatcher.Sink} entirely (that is the whole point of a headless invoke), so without
+     * this an external agent's {@code place_block}/{@code interact_at} is invisible to {@link
+     * LandmarkStore} — after handback the built-in brain has no memory of it and re-crafts /
+     * re-places duplicates. Routes to the SAME harvest path the Sink uses for the built-in
+     * brain's own tool results ({@link EntityAgentLoop#harvestLandmarks}): records into {@code
+     * LandmarkStore} and lets the existing emitter queue its {@code <landmark_event>} tail note
+     * for whenever the built-in brain next runs a turn. Deliberately does NOT touch the
+     * conversation — this is memory bookkeeping only, not a message a paused brain "hears".
+     *
+     * <p>No-op (not an error) when no loop exists yet for this companion — read-only lookup, NOT
+     * {@link #getOrCreate}. A companion whose built-in brain has never been used has no {@link
+     * LandmarkStore} to harvest into, and creating a loop here would reintroduce exactly the
+     * disk-replay side effect W9 removes from {@code NumenActuator.acquire}. Client main thread
+     * only, like every other loop entry point.
+     */
+    public static void harvestExternal(UUID entityUuid, String toolName, String resultJson) {
+        EntityAgentLoop loop = ENTITY_LOOPS.get(entityUuid);
+        if (loop != null) loop.harvestLandmarks(toolName, resultJson);
     }
 }

@@ -98,6 +98,15 @@ public final class NumenCore {
         CompanionLifecycle.onDeath(CompanionTickDispatcher::clearActiveTask);
         CompanionLifecycle.onRemove(CompanionTickDispatcher::onCompanionRemoved);
         CompanionLifecycle.onAbort(CoreServerTools::abort);
+
+        // W6 item 4: wire the two callback slots com.dwinovo.numen.entity.ControlRegistry (engine)
+        // declared but left as no-ops — it must not import mod/ code, so this one-line registration
+        // from core's own hub is the seam. Without this the lease-expiry sweep can never see a RUNNING
+        // task (every lease would silently expire out from under a moving body) and a handover (release
+        // / expiry / force-release / dismissal) would never cancel the mod's task queue, stranding
+        // whatever tool_call ids were parked on the losing brain instead of answering them.
+        com.dwinovo.numen.entity.ControlRegistry.setTaskRunningPredicate(CompanionTickDispatcher::hasRunningTask);
+        com.dwinovo.numen.entity.ControlRegistry.setHandoverHook(CompanionTickDispatcher::onControlHandover);
     }
 
     private static void registerTools() {

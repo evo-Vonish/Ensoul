@@ -62,6 +62,9 @@ public final class PlayerPathExecutor {
     private int index = 0;
     private int ticksOnCurrent = 0;
     private int ticksAway = 0;
+    /** Whether a scaffold placement has COMPLETED on this move. Historical record only — read by
+     *  {@code canReplanNow} to tell "not started placing yet" from "mid-place". It is NOT the gate
+     *  for whether to place: that reads the world, so a plank broken after placement gets re-laid. */
     private boolean placedThisMove = false;
     /** Set when we sprint-skipped a traverse straight into an ascend (Baritone
      *  sprintableAscend) — the ascend then sprints up instead of jumping from a standstill. */
@@ -238,7 +241,15 @@ public final class PlayerPathExecutor {
         //    un-wedge a body standing in the cell it's trying to place into; we instead let
         //    the movement-timeout replan rescue a stalled placement — a bounded fallback,
         //    not the in-move nudge-back. Revisit only if ascend-place wedging shows up.)
-        if (mv.toPlace != null && !placedThisMove) {
+        //    Gated on the WORLD, not on placedThisMove. The latch only records that we placed
+        //    once; it says nothing about whether the plank is still there. A bridge board broken
+        //    under us after placement (creeper, griefer, gravity, water wash) left the latch true
+        //    forever, so this branch never re-ran and the body drove into the gap — and it could
+        //    not be rescued either, because canReplanNow's ASCEND arm is false in exactly that
+        //    state (placed, but !canWalkOn), which silences every replan watchdog until the task
+        //    deadline. Re-checking the support each tick makes the branch self-healing: re-place
+        //    it, or FAIL out to a replan.
+        if (mv.toPlace != null && !BlockHelper.canWalkOn(player.level(), mv.toPlace)) {
             if (placeManeuver == null) {
                 placeManeuver = new PlaceManeuver(player, mv.toPlace, this::scaffoldSlot,
                         () -> BlockHelper.canWalkOn(player.level(), mv.toPlace));

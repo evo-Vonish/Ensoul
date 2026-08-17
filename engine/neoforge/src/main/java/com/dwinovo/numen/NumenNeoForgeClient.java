@@ -56,6 +56,10 @@ public class NumenNeoForgeClient {
         com.dwinovo.numen.client.data.ClientNumenInventory.clear();
         com.dwinovo.numen.client.hud.NumenToasts.clear();
         com.dwinovo.numen.client.agent.ClientDeaths.clearAll();
+        // W7: wipe this client's control-lease view alongside the rest of the disconnect teardown —
+        // with nothing left to push a replacement, a stale EXTERNAL/held snapshot must not survive into
+        // the next session's companion roster (see ClientControl.clear).
+        com.dwinovo.numen.client.agent.ClientControl.instance().clear();
     }
 
     static void registerGuiLayers(net.neoforged.neoforge.client.event.RegisterGuiLayersEvent event) {

@@ -43,7 +43,8 @@ public final class PillarDrive {
         NEED_SCAFFOLD,
         /** The head-room cell is a fluid (or breaking it would loose lava) — never dig it. */
         CEILING_FLUID,
-        /** The head-room cell is unbreakable (bedrock) or a block we won't grief. */
+        /** The head-room cell is a dead end: unbreakable (bedrock), a block we won't grief, or
+         *  breakable-but-loaded — sand/gravel stacked on it that would bury the shaft. */
         CEILING_UNBREAKABLE
     }
 
@@ -85,7 +86,10 @@ public final class PillarDrive {
         MotorGeometry.Head head = classifyHead(level, ceiling);
         switch (head) {
             case FLUID -> { return Result.CEILING_FLUID; }
-            case UNBREAKABLE -> { return Result.CEILING_UNBREAKABLE; }
+            // FALLING rides the UNBREAKABLE result deliberately: callers already treat that as
+            // "this column is a dead end, sidestep or abort", which is exactly right for a gravel
+            // ceiling — and it needs no new Result constant for every caller to re-handle.
+            case UNBREAKABLE, FALLING -> { return Result.CEILING_UNBREAKABLE; }
             case BREAKABLE -> {
                 // Break the ceiling first — sneak so a stray input can't walk us off the column.
                 player.setShiftKeyDown(true);
@@ -156,6 +160,12 @@ public final class PillarDrive {
         }
         if (wouldExposeLava(level, c)) {
             return MotorGeometry.Head.FLUID;                 // breaking it would let lava pour into the shaft
+        }
+        if (BlockHelper.breakReleasesFallingBlock(level, c)) {
+            // Sand/gravel resting on this cell. Break it and the stack drops into the shaft we are
+            // standing in — and since the climber just digs the next rung, it keeps digging into
+            // the falling column and buries itself. Baritone's dontMineUnderFallingBlock veto.
+            return MotorGeometry.Head.FALLING;
         }
         return MotorGeometry.Head.BREAKABLE;
     }

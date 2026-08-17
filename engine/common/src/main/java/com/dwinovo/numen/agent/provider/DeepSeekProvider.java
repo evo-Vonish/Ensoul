@@ -25,11 +25,24 @@ import com.google.gson.JsonObject;
  *       default behaviour, which captures every unknown top-level field.</li>
  * </ol>
  *
- * <h2>What LiteLLM does NOT do for DeepSeek (and neither do we now)</h2>
+ * <h2>Where we now go beyond LiteLLM</h2>
  * <ul>
- *   <li>No {@code fill_reasoning_content} safety net like the Moonshot
- *       provider has. LiteLLM bets the framework-level preservation is
- *       enough; we follow that bet.</li>
+ *   <li><b>{@code reasoning_content} backstop:</b> LiteLLM bets the
+ *       framework-level preservation is always enough. It isn't. The field
+ *       goes missing whenever the extras capture had nothing to capture —
+ *       a stream that carried no {@code reasoning_content} (non-thinking
+ *       model, cut-off stream, a turn recovered after an error), or history
+ *       replayed from a {@link com.dwinovo.numen.agent.llm.ConvoLog} written
+ *       before this field was round-tripped. DeepSeek then 400s the whole
+ *       request, and because the offending assistant message is already
+ *       <em>persisted</em>, every subsequent launch replays it and 400s
+ *       again — the one failure here that a restart cannot clear. We mirror
+ *       {@link MoonshotProvider}'s single-space fill in
+ *       {@link #assistantToRequestMessage}.</li>
+ * </ul>
+ *
+ * <h2>What LiteLLM does that we don't</h2>
+ * <ul>
  *   <li>No content-list to string conversion is needed in our code path
  *       (we always emit content as a plain string from the agent layer).</li>
  * </ul>
@@ -51,6 +64,25 @@ public final class DeepSeekProvider extends OpenAIProvider {
     @Override public String name() { return NAME; }
 
     @Override public String defaultBaseUrl() { return DEFAULT_BASE_URL; }
+
+    /**
+     * Thinking-mode backstop, mirroring {@link MoonshotProvider}: DeepSeek rejects an
+     * assistant message that carries {@code tool_calls} without {@code reasoning_content}
+     * ({@code 400 The reasoning_content in the thinking mode must be passed back to the
+     * API}). The parent already echoes captured extras; this fires only when the field
+     * is genuinely absent, filling the minimum value the API accepts.
+     *
+     * <p>Worth the three lines even though LiteLLM omits them: a bad message here is
+     * written to the conversation log, so the 400 survives restarts.
+     */
+    @Override
+    public JsonObject assistantToRequestMessage(AssistantTurn turn) {
+        JsonObject m = super.assistantToRequestMessage(turn);
+        if (m.has("tool_calls") && !m.has("reasoning_content")) {
+            m.addProperty("reasoning_content", " ");
+        }
+        return m;
+    }
 
     /**
      * Documented balance endpoint ({@code GET /user/balance}, Bearer key):

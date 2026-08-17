@@ -1,5 +1,6 @@
 package com.dwinovo.numen.core.perm;
 
+import com.dwinovo.numen.entity.Companions;
 import com.dwinovo.numen.entity.NumenPlayer;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -76,17 +77,19 @@ public final class NumenPermCommand {
             return 0;
         }
 
-        // Owner gate: if the companion is live, only its owner may change its tier. If it isn't
-        // currently in the world we can't resolve ownership (the store is name-keyed and survives
-        // respawns) — allow the set and note that it takes effect on the companion's next command.
-        NumenPlayer live = findLiveCompanion(src.getServer(), companion);
-        boolean notInWorld = live == null;
-        if (live != null && !live.isOwnedByPlayer(executor.getUUID())) {
-            src.sendFailure(Component.literal("Companion '" + live.getName().getString()
-                    + "' isn't yours — only its owner can change its tier."));
+        // Owner gate. This used to check ownership only when the companion was live and let the set
+        // through unchecked when it wasn't — "we can't resolve ownership, so allow it". That is a
+        // privilege escalation, and the tier is exactly the wrong thing to hand out: it is the level
+        // run_command executes at. Any player could wait for someone's companion to go dormant (or
+        // simply pick a name) and grant it `owners`. Companions.ownsCompanionNamed resolves through
+        // the registry as well as live bodies, so dormancy is no longer a hole to walk through.
+        if (!Companions.ownsCompanionNamed(src.getServer(), executor.getUUID(), companion)) {
+            src.sendFailure(Component.literal("Companion '" + companion
+                    + "' isn't yours (or doesn't exist) — only its owner can change its tier."));
             return 0;
         }
 
+        boolean notInWorld = findLiveCompanion(src.getServer(), companion) == null;
         CompanionPermissions.set(companion, tier);
         String note = notInWorld ? " (companion not currently in world — applies on next command)" : "";
         src.sendSuccess(() -> Component.literal("Set companion '" + companion + "' permission tier to '"

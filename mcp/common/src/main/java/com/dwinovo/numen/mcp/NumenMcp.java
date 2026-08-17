@@ -1,5 +1,7 @@
 package com.dwinovo.numen.mcp;
 
+import com.dwinovo.numen.mcp.transport.McpHttpServer;
+
 import java.nio.file.Path;
 
 /**
@@ -7,15 +9,20 @@ import java.nio.file.Path;
  * client init.
  *
  * <p>This mod is a thin adapter over numen-api's {@code NumenActuator}: it stands
- * up an MCP (Model Context Protocol) server so an external agent (Claude Desktop,
- * via the {@code mcp-remote} stdio bridge) can list the owner's companions, take
- * control of a body, and call its tools directly — the external agent is the
- * brain, the companion is its hands and eyes. Client-only, because companions
- * and their tool registry live in the owner's game client.
+ * up an MCP (Model Context Protocol) server so an external agent (Claude Code,
+ * Codex, Kimi Code, or Claude Desktop via the {@code mcp-remote} stdio bridge) can
+ * list the owner's companions, take control of a body, and call its tools directly
+ * — the external agent is the brain, the companion is its hands and eyes.
+ * Client-only, because companions and their tool registry live in the owner's game
+ * client.
+ *
+ * <p>Each connecting brain gets its own session and its own control leases, so
+ * several agents can drive different companions at the same time without their
+ * leases colliding — see {@code McpSession}.
  */
 public final class NumenMcp {
 
-    private static McpServer server;
+    private static McpHttpServer server;
 
     private NumenMcp() {}
 
@@ -25,7 +32,7 @@ public final class NumenMcp {
             Constants.LOG.info("[numen-mcp] disabled in config (config/numen/mcp_server.json)");
             return;
         }
-        server = new McpServer(cfg);
+        server = new McpHttpServer(cfg);
         try {
             server.start();
             Constants.LOG.info("[numen-mcp] MCP server up on http://{}:{}/mcp — reach it from Claude Desktop via "

@@ -54,33 +54,194 @@ public final class Companions {
 
     private Companions() {}
 
+    /** Maximum accepted companion name length (trimmed), enforced inside {@link #summon} itself — NOT
+     *  the same thing as {@link com.dwinovo.numen.network.payload.SummonRequestPayload#MAX_NAME} (32,
+     *  the wire codec's DECODE bound, deliberately left wide; see {@link #summon}'s javadoc for why).
+     *  This is the REAL limit: it matches vanilla's {@code ByteBufCodecs.PLAYER_NAME = stringUtf8(16)},
+     *  which is what actually encodes {@code GameProfile.name()} every time this companion's body joins
+     *  the player list in the {@code ADD_PLAYER} broadcast — {@code Utf8String.write} throws past 16. */
+    public static final int MAX_NAME_LENGTH = 16;
+
+    /** Typed outcome of {@link #summon} — see each constant's own javadoc for what it means and what a
+     *  caller should tell the owner. Exists so the panel, the {@code /numen player summon} command and
+     *  the payload handler all report the SAME reason for the SAME situation, instead of three
+     *  independently-worded (or, before this, silently swallowed) messages. */
+    public enum SummonResult {
+        /** A brand-new companion was created. */
+        OK,
+        /** {@code name} (case-insensitively, trimmed) already named a companion the SAME owner already
+         *  had — live or dormant — and it was returned/woken rather than duplicated. Not a failure; the
+         *  summon contract has always been idempotent per (owner, name). */
+        REUSED_EXISTING,
+        /** {@code name} (case-insensitively, trimmed) already names a DIFFERENT owner's companion.
+         *  Refused outright — see {@link #summon}'s javadoc for why uniqueness must be global, not
+         *  per-owner. */
+        NAME_TAKEN,
+        /** {@code name} is blank once trimmed. */
+        NAME_INVALID,
+        /** {@code name}, trimmed, is longer than {@link #MAX_NAME_LENGTH} characters. */
+        NAME_TOO_LONG
+    }
+
+    /** {@link #summon}'s full result: which {@link SummonResult} occurred, the resulting body (non-null
+     *  iff {@link #success()}), and a ready-to-show {@code reason} (empty string on success). */
+    public record SummonOutcome(SummonResult result, NumenPlayer body, String reason) {
+        public boolean success() { return body != null; }
+    }
+
     /**
      * Summon the owner's companion called {@code name}. IDEMPOTENT per (owner, name): if one already
      * exists it is reused — already live → returned as-is; dormant → brought back. Only a name with no
      * existing companion mints a fresh one. (The old "fresh random UUID every summon" minted same-name
      * duplicates that all respawned on login — that's the duplicate-companion bug.)
+     *
+     * <p>THE single convergence point for BOTH entry points ({@code /numen player summon} and the
+     * panel's {@code SummonRequestPayload}) — every summon-time rule lives HERE so both report the
+     * identical {@link SummonResult}/reason for the identical situation, and so a modified client that
+     * skips its own UI validation gains nothing: this is the authority, the UI is only a convenience.
+     *
+     * <h2>Name length — 16, enforced here, not on the wire</h2>
+     * {@code SummonRequestPayload.MAX_NAME} stays 32 on the wire deliberately: dropping the codec's
+     * DECODE bound to 16 would let a 17-31 character name trip {@code ByteBufCodecs.stringUtf8} before
+     * {@code handle()} even runs — a raw {@code DecoderException}, which is a WORSE failure mode than
+     * the one this method exists to prevent (no clean reason, just a decode error on the connection).
+     * The real cap is {@link #MAX_NAME_LENGTH} = 16, checked here, because vanilla's own
+     * {@code ByteBufCodecs.PLAYER_NAME = stringUtf8(16)} is what actually encodes the resulting
+     * {@code GameProfile.name()} in the {@code ADD_PLAYER} broadcast every time this companion joins the
+     * player list (every spawn, not just creation) — a 17-32 character name summoned under the old,
+     * unchecked cap would eventually crash broadcasting the player-info add, at some later, unrelated-
+     * looking moment. Rejecting it HERE with a typed result replaces that latent crash with an ordinary,
+     * immediate "name too long" response.
+     *
+     * <h2>Uniqueness — GLOBAL, case-insensitive, not per-owner</h2>
+     * The companion name is already a global key in four OTHER places, so per-owner uniqueness would
+     * close none of them: {@code CompanionPermissions} keys permission tiers on the lower-cased name for
+     * the WHOLE server, and its write gate ({@code NumenPermCommand} → {@link #ownsCompanionNamed})
+     * passes for anyone who owns ANY companion of that name — so without this check, Mallory could
+     * summon his own "Bob" (nothing stopped him before this method) and run {@code /numenperm Bob
+     * owners}, and the single global row {@code bob → owners} would raise the permission ceiling on
+     * Alice's separately-owned "Bob" too. {@code DeathTolls} shares the same global name key;
+     * {@code NumenSkins} caches skins by lower-cased name; and the MCP bridge's {@code resolveCompanion}
+     * falls back to a case-insensitive name match, so two case-variant "Bob"/"bob" companions would let
+     * an external agent acquire control of one body and invoke tool calls on the other. Comparison below
+     * is {@code equalsIgnoreCase} on the TRIMMED name, matching how those four stores already normalise.
+     *
+     * <p><b>Known gap (not closed by this method):</b> the collision scan below covers every currently
+     * LIVE companion (ANY owner, online or not — a spawned companion is a standing {@link ServerPlayer}
+     * independent of its owner's own connection, found via {@code server.getPlayerList()}) plus the
+     * SUMMONING owner's own DORMANT entries. It can NOT see a dormant companion belonging to a
+     * DIFFERENT owner: nothing in {@link CompanionRegistry}'s public API enumerates every entry across
+     * every owner (only {@code ownedBy(ownerUuid)} and {@code pendingDead()} exist), and adding a full
+     * enumerator there is outside this pass's assigned file set. In practice the window is narrow — a
+     * companion is dormant only right after server start, before its owner's first login this session,
+     * or mid-death-respawn-delay — but it is real; closing it needs a {@code CompanionRegistry}
+     * cross-owner accessor in a later pass.
+     *
+     * <h2>Grandfathering</h2>
+     * Enforcement is summon-time only, on PURPOSE: a pre-existing duplicate or over-length name already
+     * sitting in the registry is never renamed, merged or deleted by this method — only a NEW summon of
+     * a colliding or oversize name is refused. A retroactive migration would destroy data irreversibly
+     * and is explicitly out of scope.
      */
-    public static NumenPlayer summon(MinecraftServer server, UUID ownerUuid, String name,
-                                      ServerLevel level, Vec3 pos) {
-        UUID existing = findByOwnerName(server, ownerUuid, name);
+    public static SummonOutcome summon(MinecraftServer server, UUID ownerUuid, String name,
+                                        ServerLevel level, Vec3 pos) {
+        // strip(), not trim(): matches ownsCompanionNamed below and CompanionPermissions.key() in
+        // mod/ — Unicode-aware whitespace trimming, not just ASCII <= U+0020, so normalisation agrees
+        // across every name-keyed store this companion's name touches.
+        String trimmed = name == null ? "" : name.strip();
+        if (trimmed.isEmpty()) {
+            return outcome(SummonResult.NAME_INVALID, null, trimmed);
+        }
+        if (trimmed.length() > MAX_NAME_LENGTH) {
+            return outcome(SummonResult.NAME_TOO_LONG, null, trimmed);
+        }
+
+        // Global (any owner) scan of LIVE bodies. Own-name match wins immediately and short-circuits —
+        // grandfathering (see javadoc above) means reaching the OWNER'S OWN pre-existing companion must
+        // never be blocked by a same-named collision that already exists elsewhere, even a legacy one
+        // this pass's global-uniqueness rule would refuse if someone tried to create it FRESH today.
+        // Any OTHER owner's live match is remembered but not acted on yet — it only matters once we know
+        // this isn't secretly the summoning owner's own companion (checked next, live AND dormant).
+        NumenPlayer ownLive = null;
+        boolean otherOwnerLiveMatch = false;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (p instanceof NumenPlayer a && a.getName().getString().equalsIgnoreCase(trimmed)) {
+                if (a.isOwnedByPlayer(ownerUuid)) {
+                    ownLive = a;
+                    break;
+                }
+                otherOwnerLiveMatch = true;
+            }
+        }
+        if (ownLive != null) {
+            return outcome(SummonResult.REUSED_EXISTING, ownLive, trimmed);
+        }
+
+        // Not live under that name — check the OWNER'S OWN dormant entries (case-insensitive, so typing
+        // "bob" wakes an entry stored as "Bob"). Cross-owner DORMANT collisions are the known gap
+        // documented above; this only ever looks at ownerUuid's own entries.
+        UUID existing = findOwnDormantByName(server, ownerUuid, trimmed);
         if (existing != null) {
             NumenPlayer body = respawn(server, existing);
-            if (body != null) return body;
-            CompanionRegistry.get(server).remove(existing);   // stale entry (no .dat) — replace it
+            if (body != null) {
+                // A re-summon during the death window is an explicit owner request that supersedes the
+                // timed respawn: without this, CompanionRegistry still shows diedAt > 0 after the respawn
+                // above, so Companions.tickRespawns' pendingDead() sweep keeps this UUID queued and later
+                // calls respawnDead → CompanionFactory.spawn a SECOND time for the body we just returned
+                // (two ticking bodies, one identity — vanilla's PlayerList de-dupes by neither name nor UUID).
+                CompanionRegistry.Entry e = CompanionRegistry.get(server).find(existing);
+                if (e != null && e.diedAt() > 0L) {
+                    CompanionRegistry.get(server).markAlive(existing);
+                    respawnHoldUntil.remove(existing);
+                }
+                return outcome(SummonResult.REUSED_EXISTING, body, trimmed);
+            }
+            CompanionRegistry.get(server).remove(existing);   // stale entry (no .dat) — name is free again
         }
+
+        // Genuinely not an existing companion of the SUMMONING owner's — only NOW does another owner's
+        // live companion under this name block creation of a brand-new one.
+        if (otherOwnerLiveMatch) {
+            return outcome(SummonResult.NAME_TAKEN, null, trimmed);
+        }
+
         UUID companionUuid = UUID.randomUUID();
-        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, name, ownerUuid, level, pos);
+        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, trimmed, ownerUuid, level, pos);
         CompanionRegistry.get(server).put(companionUuid,
-                new CompanionRegistry.Entry(name, ownerUuid, level.dimension(), body.blockPosition()));
-        return body;
+                new CompanionRegistry.Entry(trimmed, ownerUuid, level.dimension(), body.blockPosition()));
+        return outcome(SummonResult.OK, body, trimmed);
     }
 
-    /** Companion UUID of the owner's companion named {@code name}, or null if none. */
-    private static UUID findByOwnerName(MinecraftServer server, UUID ownerUuid, String name) {
+    /** Companion UUID of {@code ownerUuid}'s own DORMANT (not currently spawned) companion whose stored
+     *  name matches {@code trimmedName} case-insensitively, or null. Live matches — for ANY owner — are
+     *  handled by the scan in {@link #summon} before this is ever reached. */
+    private static UUID findOwnDormantByName(MinecraftServer server, UUID ownerUuid, String trimmedName) {
         for (Map.Entry<UUID, CompanionRegistry.Entry> e : CompanionRegistry.get(server).ownedBy(ownerUuid)) {
-            if (e.getValue().name().equals(name)) return e.getKey();
+            if (e.getValue().name().equalsIgnoreCase(trimmedName)) return e.getKey();
         }
         return null;
+    }
+
+    /** Builds the {@link SummonOutcome} for {@code result}, filling in {@link #reasonFor} for anything
+     *  that isn't a success. Centralising this — rather than each return site in {@link #summon} building
+     *  its own string — is what guarantees the command, the payload handler and (once a later wave wires
+     *  {@code SummonResultPayload}) the panel all say the exact same sentence for the exact same
+     *  {@link SummonResult}. */
+    private static SummonOutcome outcome(SummonResult result, NumenPlayer body, String attemptedName) {
+        return new SummonOutcome(result, body, reasonFor(result, attemptedName));
+    }
+
+    /** Human-readable explanation for a {@link SummonResult}, or {@code ""} for a success
+     *  ({@link SummonResult#OK}/{@link SummonResult#REUSED_EXISTING}) — there's nothing to explain about
+     *  those. */
+    private static String reasonFor(SummonResult result, String attemptedName) {
+        return switch (result) {
+            case NAME_INVALID -> "Companion name can't be blank.";
+            case NAME_TOO_LONG -> "Companion name '" + attemptedName + "' is too long (max "
+                    + MAX_NAME_LENGTH + " characters).";
+            case NAME_TAKEN -> "The name '" + attemptedName + "' is already in use by another companion.";
+            case OK, REUSED_EXISTING -> "";
+        };
     }
 
     /**
@@ -96,7 +257,16 @@ public final class Companions {
         ServerLevel level = server.getLevel(entry.dimension());
         if (level == null) level = server.overworld();
         // pos=null: keep the position restored from the .dat.
-        return CompanionFactory.spawn(server, companionUuid, entry.name(), entry.owner(), level, null);
+        NumenPlayer body = CompanionFactory.spawn(server, companionUuid, entry.name(), entry.owner(), level, null);
+        // Symmetry with summon(): this method has its own direct caller (ExecuteToolPayload, acting on a
+        // companion UUID without going through summon's name lookup), so the death-state clear can't live
+        // in summon() alone. Same reasoning as there — a respawn here means the entry is no longer pending,
+        // so the timed sweep in tickRespawns must not spawn a second body for it later.
+        if (entry.diedAt() > 0L) {
+            CompanionRegistry.get(server).markAlive(companionUuid);
+            respawnHoldUntil.remove(companionUuid);
+        }
+        return body;
     }
 
     /** When an owner logs in, bring back every companion of theirs. A companion that DIED while the owner
@@ -140,6 +310,12 @@ public final class Companions {
         ServerPlayer owner = body.resolveOwnerPlayer();
         if (owner != null) {   // immediate, same-session (carries the respawn delay for the client countdown)
             Services.NETWORK.sendToPlayer(owner, new NumenDeathPayload(uuid, cause, RESPAWN_DELAY_TICKS * 50L));
+            // W6 (control-authority, NOT a release): death does not release a live external lease — the
+            // holder keeps the body across death/respawn exactly like the pre-existing in-flight-task
+            // resolution does (NumenDeathPayload's freeze path), so a brain that was mid-mission does not
+            // lose the companion to a stray death. Push a resend so the console/holder LEARN about the
+            // death promptly via the state channel rather than waiting for the 20-tick keep-alive.
+            ControlRegistry.syncToOwner(server, owner);
         }
         // Persist the death (cause + game-time) in the world-saved registry so it survives a logout during
         // the respawn window — without this, a relog lost the pending state and the body silently respawned
@@ -193,6 +369,9 @@ public final class Companions {
         body.clearFire();
         CompanionRegistry.get(server).markAlive(uuid);
         syncRosterToOwner(server, owner);
+        // W6: same reasoning as onDeath — the lease (if any) was retained across death and is still
+        // live now that the body is back; resend so the console/holder see the companion again promptly.
+        ControlRegistry.syncToOwner(server, owner);
         Services.NETWORK.sendToPlayer(owner, new NumenRespawnPayload(uuid, entry.deathCause()));
     }
 
@@ -278,6 +457,11 @@ public final class Companions {
         if (e != null) reg.put(companionUuid, e.withGameType(mode));
         NumenPlayer body = NumenPlayer.findByUuid(server, companionUuid);
         if (body != null) body.setGameMode(mode);
+        // W6 item 7 (decision, not an oversight): game mode is the human OWNER's own switch and stays
+        // deliberately UNGATED by control — the owner outranks any brain, including whichever one
+        // currently holds the lease, so this never consults ControlRegistry.authorize. It must still
+        // push a control-state resend so the console stays accurate (the lease itself is untouched).
+        syncControlToOwnerOf(server, companionUuid);
     }
 
     /** A companion's persisted game mode (survival if unknown). */
@@ -291,6 +475,30 @@ public final class Companions {
         CompanionRegistry reg = CompanionRegistry.get(server);
         CompanionRegistry.Entry e = reg.find(companionUuid);
         if (e != null) reg.put(companionUuid, e.withOpEnabled(opEnabled));
+        // W6 item 7 (decision, not an oversight) — same reasoning as setGameMode above: the OP master
+        // switch is the human owner's own control, deliberately ungated, but still worth a prompt resend.
+        syncControlToOwnerOf(server, companionUuid);
+    }
+
+    /**
+     * Resolve {@code companionUuid}'s owner (live body first, else the registry entry — same fallback
+     * order as {@link #isOwner}) and push a {@link ControlRegistry#syncToOwner} resend if that owner is
+     * online. Shared by {@link #setGameMode} and {@link #setOpEnabled}: both are the owner's OWN
+     * switches and intentionally bypass control, but a bypass must still be visible on the console
+     * promptly rather than waiting for {@code ControlRegistry.tick}'s 20-tick keep-alive. Silently a
+     * no-op if the companion or its owner can't be resolved (mirrors {@code syncRosterToOwner}'s own
+     * null-owner guard) — there's nothing to push to.
+     */
+    private static void syncControlToOwnerOf(MinecraftServer server, UUID companionUuid) {
+        NumenPlayer live = NumenPlayer.findByUuid(server, companionUuid);
+        UUID ownerUuid = live != null ? live.getOwnerUuid() : null;
+        if (ownerUuid == null) {
+            CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
+            ownerUuid = e != null ? e.owner() : null;
+        }
+        if (ownerUuid == null) return;
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerUuid);
+        if (owner != null) ControlRegistry.syncToOwner(server, owner);
     }
 
     /** Whether the companion's OP master switch is on (default false — the today-equivalent, no command privileges). */
@@ -305,6 +513,31 @@ public final class Companions {
         if (live != null) return live.isOwnedByPlayer(ownerUuid);
         CompanionRegistry.Entry e = CompanionRegistry.get(server).find(companionUuid);
         return e != null && e.owner().equals(ownerUuid);
+    }
+
+    /**
+     * Does {@code ownerUuid} own a companion called {@code name}? Checks live bodies first, then the
+     * registry — so it still answers correctly while the companion is dormant.
+     *
+     * <p>Exists for the name-keyed gates: {@link #isOwner} needs a companion UUID, but a caller
+     * working from a name alone (the {@code /numenperm} tier command) has none, and "can't resolve
+     * it, so allow the write" is not an acceptable fallback for an ownership check. Case-insensitive,
+     * matching how the commands resolve companion names.
+     */
+    public static boolean ownsCompanionNamed(MinecraftServer server, UUID ownerUuid, String name) {
+        if (server == null || ownerUuid == null || name == null) return false;
+        String want = name.strip();
+        if (want.isEmpty()) return false;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (p instanceof NumenPlayer a && a.isOwnedByPlayer(ownerUuid)
+                    && a.getName().getString().equalsIgnoreCase(want)) {
+                return true;
+            }
+        }
+        for (Map.Entry<UUID, CompanionRegistry.Entry> e : CompanionRegistry.get(server).ownedBy(ownerUuid)) {
+            if (e.getValue().name().equalsIgnoreCase(want)) return true;
+        }
+        return false;
     }
 
     /**
@@ -347,6 +580,13 @@ public final class Companions {
     /** Permanently forget a companion (death / dismissal): despawn + drop the index entry. */
     public static void dismiss(MinecraftServer server, NumenPlayer body) {
         UUID uuid = body.getUUID();
+        // W6 item 5: a permanently dismissed companion has no control state left to hold. force-release
+        // BEFORE forget — forceRelease runs the handover hook (drains any live external lease's queue
+        // with an honest cause and notifies the console) while the record still exists; forget() alone
+        // would silently drop a live holder's lease with no notification at all. No-op when nothing is
+        // leased (the common case), so this is always safe to call unconditionally.
+        ControlRegistry.forceRelease(server, uuid, "companion dismissed");
+        ControlRegistry.forget(uuid);
         CompanionFactory.despawn(server, body);
         CompanionRegistry.get(server).remove(uuid);
     }
@@ -374,6 +614,11 @@ public final class Companions {
         for (UUID id : ids) {
             NumenPlayer live = NumenPlayer.findByUuid(server, id);
             if (live != null) CompanionFactory.despawn(server, live);
+            // W6 item 5 — same reasoning as dismiss() above: force-release before forget so a live
+            // external lease's handover hook still runs (drains its queue, notifies the console) before
+            // the record disappears for good.
+            ControlRegistry.forceRelease(server, id, "companion dismissed");
+            ControlRegistry.forget(id);
             reg.remove(id);
         }
         return ids.size();

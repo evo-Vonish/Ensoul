@@ -36,6 +36,8 @@ public class NumenMod {
         // When an owner logs in, bring their dormant companions back.
         NeoForge.EVENT_BUS.addListener(NumenMod::onPlayerLoggedIn);
         NeoForge.EVENT_BUS.addListener(NumenMod::onPlayerChangedDimension);
+        // W7: the owner-logout hook — see the sibling registration + rationale in onPlayerLoggedOut below.
+        NeoForge.EVENT_BUS.addListener(NumenMod::onPlayerLoggedOut);
 
         CommonClass.init();
         Constants.LOG.info("Numen mod initialised on NeoForge.");
@@ -54,6 +56,27 @@ public class NumenMod {
         if (server != null) {
             com.dwinovo.numen.entity.Companions.respawnAllOwnedBy(server, player.getUUID());
             com.dwinovo.numen.entity.Companions.syncRosterToOwner(server, player);
+        }
+    }
+
+    /**
+     * W7: release every control lease the departing owner holds. There is NO server-side logout handler
+     * on either loader before this (a repo-wide search for LoggedOut / DISCONNECT / ServerPlayConnectionEvents
+     * found only the two CLIENT hooks and the companion fake player's no-op connection) — this is the
+     * single most important missing hook for automatic release. Unconditional: the MCP bridge is hosted
+     * INSIDE the owner's own game client (NumenMcp.initClient and the agent-loop machinery are client-side),
+     * so once that client disconnects, every external agent driving that owner's companions is PROVABLY
+     * gone — waiting for the lease TTL instead would leave bodies frozen for minutes with nobody left who
+     * could release them. Guarded against the companion body itself logging out (not an owner logout at
+     * all — {@code CompanionLifecycle.onRemove} already handles a companion leaving the world); releaseAllOwnedBy
+     * itself no-ops per-companion when nothing is leased, so this call is always safe.
+     */
+    private static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (!(event.getEntity() instanceof ServerPlayer sp)) return;
+        if (sp instanceof com.dwinovo.numen.entity.NumenPlayer) return;  // not the companion itself
+        MinecraftServer server = sp.level().getServer();
+        if (server != null) {
+            com.dwinovo.numen.entity.ControlRegistry.releaseAllOwnedBy(server, sp.getUUID(), "owner disconnected");
         }
     }
 

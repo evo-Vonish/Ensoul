@@ -120,7 +120,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
     /** Find a neighbour column with a safe ceiling to shift into, and start walking there. */
     private TaskState beginSidestep() {
         if (sidesteps >= MAX_SIDESTEPS) {
-            return fail("boxed in by lava/water/bedrock overhead after " + progressSummary()
+            return fail("boxed in by lava/water/bedrock/falling-gravel overhead after " + progressSummary()
                     + " and " + sidesteps + " sidesteps — no safe way up from here");
         }
         Level level = player.level();
@@ -138,7 +138,7 @@ public final class EscapeToSurfaceCompanionTask implements CompanionTask {
                 return TaskState.RUNNING;
             }
         }
-        return fail("blocked by lava/water/bedrock overhead after " + progressSummary()
+        return fail("blocked by lava/water/bedrock/falling-gravel overhead after " + progressSummary()
                 + " — no adjacent column has a safe ceiling to climb through");
     }
 

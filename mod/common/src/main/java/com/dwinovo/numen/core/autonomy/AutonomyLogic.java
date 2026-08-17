@@ -24,9 +24,17 @@ final class AutonomyLogic {
      * @param reflexOwnsBody       a survival reflex episode is driving the body ({@code Reflexes.ownsBody})
      * @param ownerTaskActive      a queued/running owner task is driving the body
      * @param brainOrPendingActive the brain has a turn in flight, or a tool call is pending
+     * @param notBuiltinBrain      {@code ControlRegistry.effective(companion) != BUILTIN} — the idle
+     *                             sleepwalk layer is the built-in brain's OWN lowest-priority limb and
+     *                             must never run a body an external brain currently holds (or one
+     *                             standing at baseline {@code NONE}): an external driver that thinks
+     *                             for minutes between calls must get back exactly the body it left, not
+     *                             one that wandered off and journaled it where the external side can't
+     *                             even read the journal.
      */
-    static boolean shouldYield(boolean reflexOwnsBody, boolean ownerTaskActive, boolean brainOrPendingActive) {
-        return reflexOwnsBody || ownerTaskActive || brainOrPendingActive;
+    static boolean shouldYield(boolean reflexOwnsBody, boolean ownerTaskActive, boolean brainOrPendingActive,
+                                boolean notBuiltinBrain) {
+        return reflexOwnsBody || ownerTaskActive || brainOrPendingActive || notBuiltinBrain;
     }
 
     /**

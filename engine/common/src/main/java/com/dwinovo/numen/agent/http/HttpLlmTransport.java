@@ -4,8 +4,10 @@ import com.dwinovo.numen.Constants;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandler;
@@ -13,11 +15,21 @@ import java.net.http.HttpResponse.BodyHandlers;
 import java.net.http.HttpResponse.BodySubscribers;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * HTTPS transport for OpenAI-protocol chat completions. Built on the JDK
@@ -47,13 +59,60 @@ import java.util.function.Consumer;
  *       status code and full response body</li>
  *   <li>network / DNS / timeout → future fails with the wrapped IOException</li>
  * </ul>
+ *
+ * <h2>Transient-failure policy</h2>
+ * A single upstream hiccup used to abort the companion's whole turn. Both call
+ * shapes now retry {@value #MAX_ATTEMPTS} times total on 429 / 5xx / IOException,
+ * with exponential backoff plus jitter, honouring a server {@code Retry-After}
+ * header when one is present. Permanent 4xx (bad key, bad model id, malformed
+ * body) are never retried — the server would reject them identically forever.
+ *
+ * <p><strong>Streaming retries are guarded:</strong> once any chunk has reached the
+ * caller's handler the request is no longer replayable (the partial turn is already
+ * out), so retries stop there and the failure propagates.
  */
 public final class HttpLlmTransport {
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * Whole-exchange deadline — <strong>buffered calls only</strong> ({@link #post} /
+     * {@link #get}). They produce no incremental progress, so a flat deadline is the
+     * only liveness signal available.
+     */
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(120);
 
+    /**
+     * Streaming calls deliberately get <strong>no</strong> whole-exchange deadline.
+     * {@code HttpRequest.timeout()} bounds the entire response body, not just the
+     * connect/header phase, so a 120s cap silently guillotined every reasoning model
+     * that thinks longer than that (DeepSeek V4, GLM, kimi-k2-thinking routinely do)
+     * — mid-stream, after the user already paid for the tokens.
+     *
+     * <p>Liveness is enforced by an <em>idle</em> watchdog instead: the stream is killed
+     * only after this long with no traffic at all. Any line counts as activity — data
+     * lines and {@code :} keep-alive comments alike — so a model that is thinking but
+     * whose gateway is still breathing is never cut off.
+     */
+    private static final Duration SSE_IDLE_TIMEOUT = Duration.ofSeconds(90);
+
+    /** How often the watchdog samples idleness. Cheap: one daemon thread for the whole game. */
+    private static final long WATCHDOG_PERIOD_MS = 5_000L;
+
+    /** Total attempts (1 initial + 2 retries) for transient failures — 429, 5xx, network blips. */
+    private static final int MAX_ATTEMPTS = 3;
+    private static final long RETRY_BASE_DELAY_MS = 1_000L;
+    private static final long RETRY_MAX_DELAY_MS = 20_000L;
+
     private static final AtomicInteger REQUEST_ID_SOURCE = new AtomicInteger();
+
+    /** Watchdog ticks + retry delays. Daemon so it never holds the game open on quit. */
+    private static final ScheduledExecutorService SCHEDULER =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "numen-http-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
 
     private final HttpClient client;
     private final java.util.Map<String, String> extraHeaders;
@@ -95,13 +154,16 @@ public final class HttpLlmTransport {
     public CompletableFuture<JsonObject> post(String url, String apiKey, JsonObject body) {
         String requestId = nextRequestId();
         String bodyStr = body.toString();
-        long t0 = System.nanoTime();
         Constants.LOG.debug("[numen-http][{}] POST {} ({} bytes, buffered)",
                 requestId, url, bodyStr.length());
 
         HttpRequest request = baseRequest(url, apiKey, "application/json", bodyStr);
-        return client.sendAsync(request, BodyHandlers.ofString(StandardCharsets.UTF_8))
-                .thenCompose(resp -> interpretBuffered(requestId, t0, resp));
+        // Buffered: nothing has been handed to a caller mid-flight, so every attempt is replayable.
+        return retrying(requestId, 1, () -> {
+            long t0 = System.nanoTime();
+            return client.sendAsync(request, BodyHandlers.ofString(StandardCharsets.UTF_8))
+                    .thenCompose(resp -> interpretBuffered(requestId, t0, resp));
+        }, () -> true);
     }
 
     /**
@@ -111,7 +173,6 @@ public final class HttpLlmTransport {
      */
     public CompletableFuture<JsonObject> get(String url, String apiKey) {
         String requestId = nextRequestId();
-        long t0 = System.nanoTime();
         Constants.LOG.debug("[numen-http][{}] GET {}", requestId, url);
         HttpRequest.Builder b = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -121,8 +182,11 @@ public final class HttpLlmTransport {
                 .header("Accept", "application/json")
                 .GET()
                 .build();
-        return client.sendAsync(request, BodyHandlers.ofString(StandardCharsets.UTF_8))
-                .thenCompose(resp -> interpretBuffered(requestId, t0, resp));
+        return retrying(requestId, 1, () -> {
+            long t0 = System.nanoTime();
+            return client.sendAsync(request, BodyHandlers.ofString(StandardCharsets.UTF_8))
+                    .thenCompose(resp -> interpretBuffered(requestId, t0, resp));
+        }, () -> true);
     }
 
     /**
@@ -146,12 +210,26 @@ public final class HttpLlmTransport {
     public CompletableFuture<Void> postSse(String requestId, String url, String apiKey, JsonObject body,
                                             Consumer<JsonObject> chunkHandler) {
         String bodyStr = body.toString();
-        long t0 = System.nanoTime();
         AtomicLong chunkCount = new AtomicLong();
         Constants.LOG.debug("[numen-http][{}] POST {} ({} bytes, streaming)",
                 requestId, url, bodyStr.length());
 
-        HttpRequest request = baseRequest(url, apiKey, "text/event-stream", bodyStr);
+        // Retry gate: once a chunk has reached the caller's handler the turn is already
+        // partially emitted downstream, so replaying the request would double-deliver it.
+        return retrying(requestId, 1,
+                () -> sseAttempt(requestId, url, apiKey, bodyStr, chunkHandler, chunkCount),
+                () -> chunkCount.get() == 0);
+    }
+
+    /** One streaming attempt: no whole-exchange deadline, an idle watchdog instead. */
+    private CompletableFuture<Void> sseAttempt(String requestId, String url, String apiKey, String bodyStr,
+                                               Consumer<JsonObject> chunkHandler, AtomicLong chunkCount) {
+        long t0 = System.nanoTime();
+        AtomicLong lastActivity = new AtomicLong(t0);
+        CompletableFuture<Void> result = new CompletableFuture<>();
+
+        // No .timeout(): the watchdog below owns liveness for streaming (see SSE_IDLE_TIMEOUT).
+        HttpRequest request = baseRequest(url, apiKey, "text/event-stream", bodyStr, null);
 
         // Branch on status: 2xx → SSE subscriber; non-2xx → buffer to string so
         // we can surface the (typically JSON) error body in LlmHttpException.
@@ -160,40 +238,160 @@ public final class HttpLlmTransport {
         // decides which path applied based on status code.
         BodyHandler<String> handler = ri -> {
             if (ri.statusCode() / 100 == 2) {
-                SseSubscriber sub = new SseSubscriber(requestId, chunkHandler, chunkCount);
+                SseSubscriber sub = new SseSubscriber(requestId, chunkHandler, chunkCount, lastActivity);
                 // 4-arg overload: subscriber, finisher → String, charset, line separator
                 return BodySubscribers.fromLineSubscriber(sub, s -> "", StandardCharsets.UTF_8, "\n");
             }
             return BodySubscribers.ofString(StandardCharsets.UTF_8);
         };
 
-        return client.sendAsync(request, handler).thenCompose(resp -> {
+        CompletableFuture<HttpResponse<String>> send = client.sendAsync(request, handler);
+
+        ScheduledFuture<?> watchdog = SCHEDULER.scheduleWithFixedDelay(() -> {
+            long idleMs = (System.nanoTime() - lastActivity.get()) / 1_000_000;
+            if (idleMs >= SSE_IDLE_TIMEOUT.toMillis() && !result.isDone()) {
+                Constants.LOG.warn("[numen-http][{}] ✗ SSE idle {}ms (> {}s) after {} chunk(s) — cutting stream",
+                        requestId, idleMs, SSE_IDLE_TIMEOUT.toSeconds(), chunkCount.get());
+                result.completeExceptionally(new SseIdleTimeoutException(requestId, idleMs, chunkCount.get()));
+                send.cancel(true);   // tear the connection down; nothing is listening any more
+            }
+        }, WATCHDOG_PERIOD_MS, WATCHDOG_PERIOD_MS, TimeUnit.MILLISECONDS);
+        result.whenComplete((v, e) -> watchdog.cancel(false));
+
+        send.whenComplete((resp, err) -> {
             long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+            if (err != null) {
+                result.completeExceptionally(unwrap(err));
+                return;
+            }
             int status = resp.statusCode();
             if (status / 100 != 2) {
                 String body2 = resp.body() == null ? "" : resp.body();
                 Constants.LOG.warn("[numen-http][{}] ✗ {} in {}ms — body: {}",
                         requestId, status, elapsedMs, truncate(body2, 500));
-                return CompletableFuture.failedFuture(new LlmHttpException(status, body2));
+                result.completeExceptionally(
+                        new LlmHttpException(status, body2, retryAfterSeconds(resp.headers())));
+                return;
             }
             Constants.LOG.debug("[numen-http][{}] ✓ {} in {}ms, {} chunks",
                     requestId, status, elapsedMs, chunkCount.get());
-            return CompletableFuture.completedFuture((Void) null);
+            result.complete(null);
         });
+        return result;
     }
 
     // ---- internals ----
 
     private HttpRequest baseRequest(String url, String apiKey, String accept, String body) {
+        return baseRequest(url, apiKey, accept, body, REQUEST_TIMEOUT);
+    }
+
+    /** @param timeout whole-exchange deadline, or {@code null} for none (streaming — see the watchdog). */
+    private HttpRequest baseRequest(String url, String apiKey, String accept, String body, Duration timeout) {
         HttpRequest.Builder b = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(REQUEST_TIMEOUT);
+                .uri(URI.create(url));
+        if (timeout != null) b.timeout(timeout);
         extraHeaders.forEach(b::header);   // per-site headers (e.g. OpenRouter Referer / Title)
         return b.header("Authorization", "Bearer " + apiKey)
                 .header("Content-Type", "application/json; charset=utf-8")
                 .header("Accept", accept)
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
+    }
+
+    // ---- transient-failure retry ----
+
+    /**
+     * Run {@code call}, retrying transient failures with exponential backoff + jitter.
+     *
+     * @param safeToRetry re-checked before every retry — the streaming path uses it to
+     *                    refuse replay once chunks have already been delivered downstream.
+     */
+    private <T> CompletableFuture<T> retrying(String requestId, int attempt,
+                                              Supplier<CompletableFuture<T>> call,
+                                              BooleanSupplier safeToRetry) {
+        return call.get()
+                .<CompletableFuture<T>>handle((value, err) -> {
+                    if (err == null) return CompletableFuture.completedFuture(value);
+                    Throwable cause = unwrap(err);
+                    if (attempt >= MAX_ATTEMPTS || !isTransient(cause) || !safeToRetry.getAsBoolean()) {
+                        return CompletableFuture.<T>failedFuture(cause);
+                    }
+                    long delayMs = backoffMillis(attempt, cause);
+                    Constants.LOG.warn("[numen-http][{}] attempt {}/{} failed ({}) — retrying in {}ms",
+                            requestId, attempt, MAX_ATTEMPTS,
+                            cause.getClass().getSimpleName() + ": " + cause.getMessage(), delayMs);
+                    CompletableFuture<T> next = new CompletableFuture<>();
+                    // Block lambda (not an expression one) so this binds to schedule(Runnable, ..)
+                    // rather than the Callable overload.
+                    SCHEDULER.schedule(() -> {
+                        retrying(requestId, attempt + 1, call, safeToRetry)
+                                .whenComplete((v2, e2) -> {
+                                    if (e2 != null) next.completeExceptionally(unwrap(e2));
+                                    else next.complete(v2);
+                                });
+                    }, delayMs, TimeUnit.MILLISECONDS);
+                    return next;
+                })
+                .thenCompose(f -> f);
+    }
+
+    /**
+     * Transient = worth another attempt. 429 / 5xx per {@link LlmHttpException#isTransient()};
+     * every {@link IOException} (connection reset, DNS blip, TLS hiccup, request timeout, and
+     * our own {@link SseIdleTimeoutException}) counts too. Everything else — 4xx, JSON shape
+     * errors, programming bugs — would fail identically on replay.
+     */
+    private static boolean isTransient(Throwable t) {
+        if (t instanceof LlmHttpException e) return e.isTransient();
+        return t instanceof IOException;
+    }
+
+    /** Server {@code Retry-After} when offered, else exponential backoff with jitter. */
+    private static long backoffMillis(int attempt, Throwable cause) {
+        if (cause instanceof LlmHttpException e && e.hasRetryAfter()) {
+            return Math.min(e.retryAfterSeconds() * 1_000L, RETRY_MAX_DELAY_MS);
+        }
+        long exp = Math.min(RETRY_BASE_DELAY_MS << (attempt - 1), RETRY_MAX_DELAY_MS);
+        // Jitter: several companions share one backend, and lock-step retries would
+        // re-collide on exactly the rate limit that bounced them.
+        return exp + ThreadLocalRandom.current().nextLong(250L);
+    }
+
+    /** {@code Retry-After}: delta-seconds or an HTTP-date. {@link LlmHttpException#NO_RETRY_AFTER} if absent/unusable. */
+    private static long retryAfterSeconds(HttpHeaders headers) {
+        String raw = headers.firstValue("retry-after").orElse(null);
+        if (raw == null || raw.isBlank()) return LlmHttpException.NO_RETRY_AFTER;
+        String v = raw.trim();
+        try {
+            return Math.max(0L, Long.parseLong(v));
+        } catch (NumberFormatException ignored) {
+            // Not delta-seconds — try the HTTP-date form.
+        }
+        try {
+            long secs = ZonedDateTime.parse(v, DateTimeFormatter.RFC_1123_DATE_TIME).toEpochSecond()
+                    - System.currentTimeMillis() / 1000L;
+            return Math.max(0L, secs);
+        } catch (RuntimeException ignored) {
+            return LlmHttpException.NO_RETRY_AFTER;
+        }
+    }
+
+    /** Peel the {@link CompletionException} wrapper the CompletableFuture chain adds. */
+    private static Throwable unwrap(Throwable t) {
+        return (t instanceof CompletionException && t.getCause() != null) ? t.getCause() : t;
+    }
+
+    /**
+     * The SSE stream went completely silent for {@link #SSE_IDLE_TIMEOUT}. An
+     * {@link IOException} because that is what it is — a dead connection — and so the
+     * retry layer treats it as transient like any other network blip.
+     */
+    public static final class SseIdleTimeoutException extends IOException {
+        public SseIdleTimeoutException(String requestId, long idleMs, long chunks) {
+            super("SSE stream idle for " + idleMs + "ms after " + chunks
+                    + " chunk(s) (request " + requestId + ")");
+        }
     }
 
     private static CompletableFuture<JsonObject> interpretBuffered(String requestId, long t0,
@@ -204,7 +402,8 @@ public final class HttpLlmTransport {
         if (status / 100 != 2) {
             Constants.LOG.warn("[numen-http][{}] ✗ {} in {}ms — body: {}",
                     requestId, status, elapsedMs, truncate(body, 500));
-            return CompletableFuture.failedFuture(new LlmHttpException(status, body));
+            return CompletableFuture.failedFuture(
+                    new LlmHttpException(status, body, retryAfterSeconds(resp.headers())));
         }
         Constants.LOG.debug("[numen-http][{}] ✓ {} in {}ms ({} bytes)",
                 requestId, status, elapsedMs, body.length());
@@ -248,13 +447,17 @@ public final class HttpLlmTransport {
         private final String requestId;
         private final Consumer<JsonObject> handler;
         private final AtomicLong chunkCount;
+        /** Stamped (nanoTime) on every inbound line — the idle watchdog's only input. */
+        private final AtomicLong lastActivity;
         private final StringBuilder buffer = new StringBuilder();
         private Flow.Subscription subscription;
 
-        SseSubscriber(String requestId, Consumer<JsonObject> handler, AtomicLong chunkCount) {
+        SseSubscriber(String requestId, Consumer<JsonObject> handler, AtomicLong chunkCount,
+                      AtomicLong lastActivity) {
             this.requestId = requestId;
             this.handler = handler;
             this.chunkCount = chunkCount;
+            this.lastActivity = lastActivity;
         }
 
         @Override
@@ -264,7 +467,17 @@ public final class HttpLlmTransport {
         }
 
         @Override
-        public void onNext(String line) {
+        public void onNext(String rawLine) {
+            // ANY inbound line proves the connection is alive — data lines, `event:`,
+            // and `:` keep-alive comments alike. Stamp before parsing so a stream that
+            // is only sending heartbeats while the model thinks never trips the watchdog.
+            lastActivity.set(System.nanoTime());
+            // We split on "\n" (see the 4-arg fromLineSubscriber), so a CRLF gateway
+            // leaves a trailing \r on every line: "" never matches, no event ever
+            // flushes, and the whole response vanishes silently. Strip it.
+            String line = (!rawLine.isEmpty() && rawLine.charAt(rawLine.length() - 1) == '\r')
+                    ? rawLine.substring(0, rawLine.length() - 1)
+                    : rawLine;
             if (line.isEmpty()) {
                 flushEvent();
             } else if (line.startsWith("data: ")) {

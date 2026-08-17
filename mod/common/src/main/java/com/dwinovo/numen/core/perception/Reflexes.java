@@ -106,6 +106,17 @@ public final class Reflexes {
     private static final int SWING_COOLDOWN = 12;
     /** Sprint away from the attacker for at most this many ticks per flee bout, then stand (don't run off a cliff). */
     private static final int FLEE_MAX_TICKS = 60;
+    /**
+     * Flee budget: an episode sustained ONLY by a dangerous verdict (body not wounded) hands the body
+     * back after this long. A dangerous verdict alone never clears on its own, so a provoked neutral
+     * that keeps pace — an angry enderman is the case that bit us — pinned a full-health companion in
+     * permanent flight, and since every task yields while a reflex drives ({@code ownsBody}), the whole
+     * task layer stalled with it. A wounded body is never capped; that is the case the reflex is for.
+     */
+    private static final int CRITICAL_EPISODE_MAX_TICKS = 400;      // 20s
+    /** After a budget-exhausted close, hold off re-arming on a merely-dangerous verdict this long
+     *  (a fresh wound re-arms immediately) — otherwise it would reopen on the very next tick. */
+    private static final int CRITICAL_EPISODE_REARM_COOLDOWN = 200; // 10s
     /** Episode ends when the attacker has been dead / removed / unseen for this long. */
     private static final int ATTACKER_GONE_TICKS = 100;
     /** Chase hysteresis: a live episode survives ALL threats being unseen for this long before it closes.
@@ -269,9 +280,19 @@ public final class Reflexes {
         int eatBeforeFood;       // food level when the current bite's use started (detects a bite that didn't take)
         String eatLabel = "";    // display name of the food being eaten (for the note)
 
-        /** True once every L0 episode has closed, so the entry can be dropped. */
+        /**
+         * True once every L0 episode has closed AND no body-scoped memory is worth keeping, so the
+         * entry can be dropped.
+         *
+         * <p>{@code lastAirPos} has to be named here explicitly. It is recorded while BREATHING —
+         * that is, with no episode live — so a purely episode-scoped test dropped the entry on the
+         * very tick the breadcrumb was written, every time, and the drowning escape's "swim back the
+         * way I came" fallback could never once have fired. Keeping the entry alive for it costs one
+         * small record per companion, and the {@code CompanionLifecycle.onRemove} backstop still
+         * drops it when the body leaves the world.
+         */
         boolean idle() {
-            return !drowning && !heatEpisode && !eating;
+            return !drowning && !heatEpisode && !eating && lastAirPos == Long.MIN_VALUE;
         }
     }
 
@@ -540,6 +561,17 @@ public final class Reflexes {
             } else {
                 st.reflexCalmSinceTick = 0;
             }
+            // Flee budget (see CRITICAL_EPISODE_MAX_TICKS). The recover test above can never fire while
+            // the verdict stays dangerous, which is exactly what a provoked neutral produces — so cap
+            // an episode that is running on the verdict alone and give the body back to the brain.
+            if (!wounded && st.reflexEpisodeStartTick != 0
+                    && now - st.reflexEpisodeStartTick >= CRITICAL_EPISODE_MAX_TICKS) {
+                st.reflexEpisodeRearmAt = now + CRITICAL_EPISODE_REARM_COOLDOWN;
+                emit(body, "本能反应:已持续规避 " + (CRITICAL_EPISODE_MAX_TICKS / 20) + " 秒且生命值无碍,"
+                        + "解除本能接管,交还身体(威胁仍在附近,请自行判断)。");
+                endCriticalReflex(st, body);
+                return;
+            }
             actCritical(body, st, now, threat, plan);
             return;
         }
@@ -547,8 +579,11 @@ public final class Reflexes {
         // Not engaged yet. Start when the engine says the fight is not a clean win (dangerous — flee / avoid /
         // kite / cornered), or the body is already wounded. A clean ENGAGE at healthy HP is left to the brain /
         // hunt task (informs, never consults — the reflex only steps in when survival is in question).
-        if (dangerous || wounded) {
+        // A wound always re-arms immediately. A merely-dangerous verdict respects the post-budget
+        // cooldown, so a threat we just disengaged from can't re-capture the body on the next tick.
+        if (wounded || (dangerous && now >= st.reflexEpisodeRearmAt)) {
             st.reflexCriticalEpisode = true;
+            st.reflexEpisodeStartTick = now;
             st.reflexFleeUntil = 0;
             st.reflexCalmSinceTick = 0;
             // Note floor: whatever still churns episodes faster than the cooldown stays ONE story in the
@@ -630,7 +665,15 @@ public final class Reflexes {
             return;
         }
 
-        boolean fight = decision == Decision.ENGAGE || decision == Decision.CORNERED;
+        // The turtle branch just above deliberately refuses to burrow against a creeper. The melee
+        // branch below has to refuse for the same reason, and didn't: CORNERED sets fight=true, and a
+        // creeper reads CORNERED precisely when it is already point-blank — so the reflex planted its
+        // feet and swung from inside the blast radius, eating a full detonation almost every time.
+        // That directly contradicted the never-melee-trade-with-a-creeper rule stated one branch up.
+        // Keep fleeing instead: the dedicated creeper reflex owns the sprint-away, and flee() is the
+        // honest fallback once its bout is spent or the body is too hungry to sprint.
+        boolean creeperThreat = plan.limiting().contains("苦力怕") || threat instanceof Creeper;
+        boolean fight = (decision == Decision.ENGAGE || decision == Decision.CORNERED) && !creeperThreat;
         if (fight && dist <= MELEE_RANGE) {
             dropNav(body);
             fightBack(body, st, now, threat);
@@ -693,6 +736,7 @@ public final class Reflexes {
 
     private static void endCriticalEpisode(PerceptionState st, NumenPlayer body) {
         st.reflexCriticalEpisode = false;
+        st.reflexEpisodeStartTick = 0;   // the budget clock belongs to the episode that just closed
         st.reflexFleeUntil = 0;
         st.reflexCalmSinceTick = 0;
         st.reflexAttacker = null;       // don't pin a possibly-removed entity; the next hit re-arms it
